@@ -25,11 +25,8 @@
 
 本文件 = 这 4 面 + 混合触发 的回归门控.
 
-诚实性 (TDD): 上面这些面/旋钮 "尚未实现". 每个新面用-case 用
-pytest.mark.xfail(strict=False, reason="S3 face not yet implemented") 挂着:
-  * 今天 (未实现): 方法/旋钮缺失 -> AttributeError / KeyError -> 按预期失败 (XFAIL),
-    套件保持绿;
-  * 面落地后: 用例自动转 PASS (strict=False -> 转 PASS 不报错, 无需改标记);
+诚实性 (TDD): 文件初版用 xfail(strict=False, reason="尚未实现") 挂着占位;
+各面落地后标记已摘除, 现全部为普通回归 spec:
   * 若某实现偏离规格: 用例 FAIL 并暴露, 门控生效.
 既有 4 面 + C 段的回归基线 (regression) 不受本文件影响, 仍由
 test_s1b_tick_wiring.py / test_ep_2_*.py / test_ep_3_alias.py 锁住.
@@ -57,7 +54,6 @@ from _llm_host_fake import _MAIN_RUNTIME, install  # noqa: E402
 
 DECAY_JSON = json.loads((PLUGIN_DIR / "decay.json").read_text(encoding="utf-8"))
 
-_NOT_IMPL = "S3 face not yet implemented"
 
 
 # ── 复用 test_s1b_tick_wiring 的 fixture 骨架 ────────────────────────────────
@@ -158,7 +154,6 @@ def _spawn_capture(p):
 #       独立 LLM 预算 (semantic_merge_max_per_tick).
 # ═══════════════════════════════════════════════════════════════════════════
 
-@pytest.mark.xfail(strict=False, reason=_NOT_IMPL)
 def test_semantic_merge_folds_cross_shard_equivalent_rows(tmp_path, monkeypatch):
     """两条语义等价但措辞不同、分片不同 (preference vs fact) 的行 ->
     LLM 判 "same fact" -> 旧的被标 superseded, 新的保留; append-only 审计行
@@ -186,27 +181,32 @@ def test_semantic_merge_folds_cross_shard_equivalent_rows(tmp_path, monkeypatch)
     assert aud, "semantic_merge 审计行必须落盘 (reject-class 不许静默 no-op)"
 
 
-@pytest.mark.xfail(strict=False, reason=_NOT_IMPL)
 def test_semantic_merge_keeps_distinct_facts(tmp_path, monkeypatch):
     """误合并红线: 两条不同事实即便同 topic 高相似, LLM 判 same_fact=False ->
     两行都保留, 不标 superseded (宁可漏并不可错并 — 有 safety pad 但默认保守)."""
     fake, state = install(monkeypatch, replies=[{"same_fact": False, "reason": "distinct"}])
-    # 两行拉满高重叠 (venv 词表共享, Jaccard >= 0.5 才进粗筛候选池):
+    # 两行拉满高重叠 (Jaccard >= 0.5 才进粗筛; 同句式微调结尾词, 实码 0.9):
     store = _make_store(tmp_path, {
-        "fact": [_row("fact_a", "hermes venv rule: use a single shared venv path",
+        "fact": [_row("fact_a", "hermes venv rule: use a single shared venv path "
+                                 "across all plugins, never split the venv, one shared "
+                                 "venv path for the whole plugin tree",
                        mem_type="fact"),
-                 _row("fact_b", "hermes venv rule: share one venv path across plugins",
+                 _row("fact_b", "hermes venv rule: use a single shared venv path "
+                                 "across all plugins, never split the venv, one shared "
+                                 "venv path for the entire plugin tree",
                        mem_type="fact")],
     })
     p = _make_provider(tmp_path, store, _decay_copy())
     p._semantic_merge_consolidate()
+    # 防假绿: 必须证 LLM 真被咨询过这对 (粗筛没把 pair 误删) — 否则粗筛收紧
+    # 阈值时本 spec 会因 "LLM 没调 -> 两行天然不 superseded" 而碰巧 pass:
+    assert state["calls"] >= 1, "高相似 distinct pair 必须进 LLM 咨询 (calls>=1)"
     rows = {r["id"]: r for r in
             json.loads((store / "memories" / "fact.json").read_text(encoding="utf-8"))}
     assert "superseded" not in rows["fact_a"]["metadata"]
     assert "superseded" not in rows["fact_b"]["metadata"]
 
 
-@pytest.mark.xfail(strict=False, reason=_NOT_IMPL)
 def test_semantic_merge_independent_budget_and_main_runtime_gate(tmp_path, monkeypatch):
     """预算/门控 (照抄既有面骨架): 独立预算 semantic_merge_max_per_tick;
     main_runtime 缺失 -> 整面 clean skip + tick_skip 审计行, 不炸.
@@ -231,7 +231,6 @@ def test_semantic_merge_independent_budget_and_main_runtime_gate(tmp_path, monke
 #       一条 stale (等巩固重综合), 不删; 独立预算 contradiction_max_per_tick.
 # ═══════════════════════════════════════════════════════════════════════════
 
-@pytest.mark.xfail(strict=False, reason=_NOT_IMPL)
 def test_contradiction_marks_older_row_stale(tmp_path, monkeypatch):
     """两条互斥事实 (一条说用 docker, 一条说今天不用) -> LLM 判 contradiction
     -> 较旧一条标 metadata.stale=True (读侧降权), 较新一条不动; 审计行落盘."""
@@ -241,9 +240,11 @@ def test_contradiction_marks_older_row_stale(tmp_path, monkeypatch):
     ])
     # 拉满高重叠 (deployment/docker 词表共享 >= 0.5 才进粗筛候选池):
     store = _make_store(tmp_path, {
-        "fact": [_row("fact_old", "deployment env uses docker containers", mem_type="fact",
+        "fact": [_row("fact_old", "deployment env uses docker containers "
+                                   "with the standard toolchain", mem_type="fact",
                        created_at="2026-01-01T00:00:00"),
-                 _row("fact_new", "deployment env does NOT use docker containers today",
+                 _row("fact_new", "deployment env does NOT use docker containers "
+                                   "with the standard toolchain today",
                        mem_type="fact",
                        created_at="2026-10-01T00:00:00")],
     })
@@ -257,19 +258,26 @@ def test_contradiction_marks_older_row_stale(tmp_path, monkeypatch):
     assert aud
 
 
-@pytest.mark.xfail(strict=False, reason=_NOT_IMPL)
 def test_contradiction_no_false_positive_on_complementary_rows(tmp_path, monkeypatch):
     """互补 (非互斥) 的两条 -> LLM 判 contradiction=False -> 谁都不标 stale
     (避免把正常并存的 L 层不同记忆误杀). 拉满高重叠让 pair 进粗筛候选池."""
     fake, state = install(monkeypatch, replies=[{"contradiction": False, "reason": "complementary"}])
+    # 拉满高重叠 (Jaccard >= 0.5; 同句式微调一处, 实码 0.87):
     store = _make_store(tmp_path, {
-        "fact": [_row("fact_a", "venv rule: use a single shared venv path",
+        "fact": [_row("fact_a", "venv rule: use the shared venv path, the shared venv "
+                                 "path is under installs, one shared venv directory, "
+                                 "shared venv path for all plugins",
                        mem_type="fact"),
-                 _row("fact_b", "venv rule: the shared venv path is under installs",
+                 _row("fact_b", "venv rule: use the shared venv path, the shared venv "
+                                 "path lives under installs, one shared venv directory, "
+                                 "shared venv path for all plugins",
                        mem_type="fact")],
     })
     p = _make_provider(tmp_path, store, _decay_copy())
     p._contradiction_detect()
+    # 防假绿: 证 LLM 真被咨询 (pair 进粗筛) 且判 False — 否则粗筛收紧阈值时
+    # 本 spec 因 "LLM 没调 -> 两行天然不标 stale" 碰巧 pass:
+    assert state["calls"] >= 1, "互补 pair 必须进 LLM 咨询 (calls>=1)"
     rows = {r["id"]: r for r in
             json.loads((store / "memories" / "fact.json").read_text(encoding="utf-8"))}
     assert "stale" not in rows["fact_a"]["metadata"]
@@ -314,10 +322,15 @@ def test_salience_decay_is_deterministic_and_zero_llm(tmp_path):
     """规格钉死: 粗筛是确定性 (零 LLM) — 同一池两次运行结果字节一致; 允许
     可选 LLM 复核但默认关 (config 驱动, 缺省 = 纯确定性). 这条锁 "零 LLM
     也能沉底" 的回归基线, 面落地后若加了无门控的 LLM 调用会 FAIL."""
+    # 防假绿 (reviewer R6): fact_stale 打 superseded flag + 老 last_referenced
+    # -> 降权真触发 (changed>=1), 再验幂等; 否则 "两次字节一致" 是什么也没
+    # 发生时的恒真, 没真正钉住 "确定性降权 + 零 LLM 幂等":
     store = _make_store(tmp_path, {
         "fact": [_row("fact_stale", "deployment uses docker", mem_type="fact",
                        salience=0.9, reference_count=50,
-                       last_referenced="2026-01-01T00:00:00"),
+                       last_referenced="2026-01-01T00:00:00",
+                       metadata={"superseded": True,
+                                "superseded_by": "fact_fresh"}),
                  _row("fact_fresh", "deployment does NOT use docker", mem_type="fact",
                        salience=0.9, reference_count=0,
                        last_referenced="2026-10-01T00:00:00")],
@@ -325,6 +338,10 @@ def test_salience_decay_is_deterministic_and_zero_llm(tmp_path):
     p = _make_provider(tmp_path, store, _decay_copy())
     p._salience_decay_downweight()
     first = json.loads((store / "memories" / "fact.json").read_text(encoding="utf-8"))
+    # 真触发: fact_stale (superseded + 久未引用) 的 salience 必须被降 (低于 0.9):
+    first_by = {r["id"]: r for r in first}
+    assert float(first_by["fact_stale"]["salience"]) < 0.9, \
+        "superseded + 久未引用行必须被降权 (changed>=1), 非恒真"
     p._salience_decay_downweight()  # 幂等二次运行
     second = json.loads((store / "memories" / "fact.json").read_text(encoding="utf-8"))
     assert first == second, "确定性降权面必须幂等 (零 LLM 无随机性)"
@@ -338,7 +355,6 @@ def test_salience_decay_is_deterministic_and_zero_llm(tmp_path):
 #       独立预算 aggregate_max_per_tick. 大池才立项 — 但按 "全做" 决策先落地.
 # ═══════════════════════════════════════════════════════════════════════════
 
-@pytest.mark.xfail(strict=False, reason=_NOT_IMPL)
 def test_aggregate_synthesizes_topic_conclusion(tmp_path, monkeypatch):
     """同一 topic 的 3 条 L0 碎事实 -> LLM 聚合成一条 L1 结论 (observation 形态,
     supported_by 指向源 id); 源 L0 行不删 (append-only); 审计行落盘.
@@ -364,14 +380,28 @@ def test_aggregate_synthesizes_topic_conclusion(tmp_path, monkeypatch):
     ep = store / "knowledge" / "entries.json"
     if ep.exists():
         entries = json.loads(ep.read_text(encoding="utf-8"))
-    aggr = [e for e in entries if e.get("kind") == "aggregation"
-            or e.get("origin") == "llm_aggregate"]
+    # 🔴 修正: 实码聚合面经 upsert_observation 落盘, 条目 kind="observation"
+    # (origin="llm_observe"), 非占位时的 "aggregation":
+    aggr = [e for e in entries if e.get("kind") == "observation"
+            or e.get("origin") == "llm_observe"]
     assert aggr, "聚合面必须把碎事实聚成一条落盘 (knowledge/entries.json)"
     aud = [a for a in _cons_log_rows(store) if a.get("action") == "aggregate_consolidate"]
-    assert aud
+    assert aud, "聚合面必须落审计行 (不静默 no-op)"
+    # 防假绿 (reviewer R6 Point 3): 仅 "有 observation 落盘" 是弱信号 (observe
+    # 面也会写同 kind 条目)。把 聚合 LLM 结论 <-> 具体 knowledge entry <-> 具
+    # 体源 memory_ids 全串起来: 取审计行 entry_id 回查 entry, 断言其
+    # supported_by[*].id ⊆ {fact_1,fact_2,fact_3} (raw_pending 解析出的源) 且
+    # entry.content == LLM conclusion:
+    aud_id = str(aud[0].get("entry_id") or "")
+    entry = next((e for e in entries if str(e.get("id")) == aud_id), None)
+    assert entry is not None, f"审计行 entry_id={aud_id!r} 必须回查到 knowledge entry"
+    sup_ids = {str(s.get("id")) for s in (entry.get("supported_by") or [])}
+    assert {"fact_1", "fact_2", "fact_3"} <= sup_ids, \
+        f"聚合 entry 的 supported_by 必须指向 3 条源 fact (实得 {sup_ids})"
+    assert str(entry.get("content")).startswith("Hermes plugin venv rule"), \
+        f"聚合 entry 内容必须是 LLM 结论 (实得 {entry.get('content')!r})"
 
 
-@pytest.mark.xfail(strict=False, reason="S3 ④ aggregation face not yet implemented")
 def test_aggregate_keeps_source_rows_intact(tmp_path, monkeypatch):
     """聚合是 "合成上层结论", 不 DELETE 源 L0 (append-only 纪律, 同 observe):
     聚合后 3 条源 fact 行仍在 fact.json, 字节不丢.
@@ -411,7 +441,6 @@ def test_aggregate_keeps_source_rows_intact(tmp_path, monkeypatch):
 #     raw_pending 之和), 绝不每 tick 全池重算
 # ═══════════════════════════════════════════════════════════════════════════
 
-@pytest.mark.xfail(strict=False, reason=_NOT_IMPL)
 def test_water_level_override_triggers_early_above_threshold(tmp_path):
     """水位 override: 未处理增量 >= threshold 时, 即便仍在 30min 窗口内也提前
     触发一次 tick (override 定时). 增量走 O(1) 计数, 不重算全池."""
@@ -451,14 +480,16 @@ def test_water_level_below_threshold_keeps_timer_rhythm(tmp_path):
     cap = _spawn_capture(p)
 
     # (a) 窗口内 (定时器本 skip) + 水位未达 -> 0 次
-    p._water_level_counter = 1
+    # 🔴 vestigial 清理 (reviewer R6): 生产码从不消费 _water_level_counter
+    # (水位走 rescan+TTL cache), 改为 stub _s3_water_level()=1 让意图自洽:
+    p._s3_water_level = lambda: 1
     p._last_consolidation_ts = time.time()
     p._maybe_spawn_consolidation_tick()
     n_in_window = len(cap)
 
     # (b) 窗口外 (定时器本触发) + 水位未达 -> 仅定时器 1 次, override 不额外加
     cap.clear()
-    p._water_level_counter = 1
+    p._s3_water_level = lambda: 1
     p._last_consolidation_ts = time.time() - 31 * 60  # 推开 30min 窗口外
     p._maybe_spawn_consolidation_tick()
     n_out_window = len(cap)
@@ -467,7 +498,6 @@ def test_water_level_below_threshold_keeps_timer_rhythm(tmp_path):
     assert n_out_window == 1, f"(b) 窗口外仅定时器触发 1 次 (override 不额外), 实得 {n_out_window}"
 
 
-@pytest.mark.xfail(strict=False, reason=_NOT_IMPL)
 def test_water_level_cooldown_suppresses_storm(tmp_path):
     """防风暴: 一次水位触发后 cooldown_min 内, 即便水位仍高也不再被水位触发
     (你 session 里那个 10x retry-flood 就是活例子). 冷却期内的触发最多 1 次.
@@ -515,7 +545,6 @@ def test_water_level_counter_is_o1_not_full_rescan(tmp_path):
     p.knowledge_raw_pending_path.write_text(
         json.dumps([{"topic": "t", "content": "raw", "created_ts": "2026-09-28T00:00:00"}]),
         encoding="utf-8")
-    p._water_level_counter = 1
 
     p._last_consolidation_ts = time.time()  # 窗口内 -> 走 override 分支才读水位
     p._maybe_spawn_consolidation_tick()   # gate #1: rescan 填缓存
