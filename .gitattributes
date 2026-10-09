@@ -1,0 +1,16 @@
+# Normalize line endings: repo holds LF; Windows working copies may still be CRLF locally
+* text=auto eol=lf
+
+# Explicit overrides
+*.py      text eol=lf
+*.md      text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.json    text eol=lf
+*.sh      text eol=lf
+*.txt     text eol=lf
+
+# Never treat these as text
+*.png   binary
+*.jpg   binary
+*.ico   binary

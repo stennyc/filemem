@@ -1,0 +1,15 @@
+name: filemem
+version: 1.0.0
+description: File-based memory provider with semantic search and Demo integration
+author: Agnes
+license: MIT
+hooks:
+  pre_llm_call: true
+  post_llm_call: true
+provides_tools:
+- filemem_read
+- filemem_write
+- filemem_search
+- filemem_delete
+- filemem_review_drafts
+- filemem_check_promotion

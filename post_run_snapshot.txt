@@ -1,0 +1,10 @@
+-rw-r--r-- 1 root root 1396466 2026-10-05_19:27:37 /root/.hermes/filemem/consolidation_log.20261005T112737Z.jsonl
+-rw-r--r-- 1 root root 1222041 2026-10-06_01:03:26 /root/.hermes/filemem/consolidation_log.20261005T170326Z.jsonl
+-rw-r--r-- 1 root root 1193142 2026-10-06_14:14:52 /root/.hermes/filemem/consolidation_log.20261006T061452Z.jsonl
+-rw-r--r-- 1 root root 1204140 2026-10-07_02:10:55 /root/.hermes/filemem/consolidation_log.20261006T181055Z.jsonl
+-rw-r--r-- 1 root root  499730 2026-10-07_13:01:55 /root/.hermes/filemem/consolidation_log.jsonl
+-rw-r--r-- 1 root root     522 2026-10-05_18:55:55 /root/.hermes/filemem/drafts_discarded_sweep_20261005T105555Z.jsonl
+-rw-r--r-- 1 root root  182000 2026-10-07_13:00:25 /root/.hermes/filemem/memories/decision.json
+-rw-r--r-- 1 root root 1017847 2026-10-07_13:01:56 /root/.hermes/filemem/memories/fact.json
+-rw-r--r-- 1 root root  489643 2026-10-07_13:01:55 /root/.hermes/filemem/memories/preference.json
+-rw-r--r-- 1 root root 1254904 2026-10-07_13:01:39 /root/.hermes/filemem/memories/task.json

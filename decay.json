@@ -1,0 +1,138 @@
+{
+  "lambda_days": 0.05,
+  "salience_threshold": 0.5,
+  "salience_boost": 1.2,
+  "ttl_days": {
+    "L0": 30,
+    "L1": 90,
+    "L2": null
+  },
+  "search": {
+    "mode": "keyword",
+    "fallback": "keyword",
+    "bm25_k1": 1.2,
+    "bm25_b": 0.75,
+    "graph_min_overlap": 0.1,
+    "graph_temporal_window_days": 7,
+    "supersede_min_overlap": 0.5,
+    "supersede_max_candidates": 2,
+    "c3_negation_min_recall": 0.5,
+    "gate_relax_alias": false,
+    "auto_recall_max": 3
+  },
+  "memories_rotate_mb": 1,
+  "consolidation": {
+    "max_llm_per_tick": 10,
+    "supersede_max_confirms": 5,
+    "consolidation_interval_min": 30,
+    "water_level_override": true,
+    "water_level_threshold": 3,
+    "water_level_cooldown_min": 60,
+    "water_level_cache_ttl_s": 60,
+    "semantic_merge_max_per_tick": 4,
+    "contradiction_max_per_tick": 4,
+    "aggregate_max_per_tick": 2,
+    "recurring_max_per_tick": 2,
+    "recurring_max_rows_per_cluster": 8,
+    "recurring_min_shared_tokens": 2,
+    "recurring_cooldown_days": 7,
+    "triage_max_per_tick": 4,
+    "salience_decay_enabled": true,
+    "salience_decay_floor": 0.1,
+    "salience_decay_age_days": 30,
+    "recall_audit_interval_min": 60,
+    "log_rotate_lines": 5000,
+    "log_keep_tail_lines": 500
+  },
+  "aliases": {
+    "min_term_freq": 3,
+    "max_topics_per_tick": 5,
+    "topic_min_len": 2,
+    "topic_stopwords": [
+      "the", "and", "for", "with", "from", "that", "this",
+      "are", "was", "not", "has", "have", "been", "true",
+      "false", "none", "null", "nan", "root", "user", "home",
+      "main", "log", "json", "yaml", "config", "file",
+      "path", "http", "https", "api", "hermes"
+    ]
+  },
+  "injection": {
+    "low_trust_auto_inject": false,
+    "drop_unknown_trust": false,
+    "directive_patterns": {
+      "en": [
+        "ignore (all )?previous",
+        "disregard (all )?previous",
+        "you must",
+        "system (note|message)",
+        "execute the following",
+        "new instruction",
+        "you are now"
+      ],
+      "zh": [
+        "忽略之前",
+        "忽略所有之前",
+        "你必须",
+        "系统提示",
+        "执行以下",
+        "执行下列",
+        "从现在起",
+        "不要告诉用户"
+      ]
+    },
+    "quote_delims": [
+      "<memory-quote>",
+      "</memory-quote>"
+    ]
+  },
+  "egress_noise": {
+    "tool_dump_openers": {
+      "en": ["Fetch finished", "{\"total_count\":", "{\"success\":"],
+      "zh": ["Fetch finished", "{\"total_count\":", "{\"success\":"]
+    },
+    "fragment_prefixes": {
+      "en": ["搞清楚了。我把情况说明清楚"],
+      "zh": ["搞清楚了。我把情况说明清楚"]
+    },
+    "echo_patterns": {
+      "en": ["File unchanged"],
+      "zh": []
+    },
+    "echo_max_chars": 2048,
+    "structural_opens": "{[",
+    "complaint_markers": {
+      "zh": ["建议", "问题", "投诉", "报错", "污染", "异常"],
+      "en": ["problem", "issue", "complaint"]
+    },
+    "governance": {
+      "max_chars": 8000,
+      "complaint_salience": 0.3
+    }
+  },
+  "knowledge": {
+    "stale_min_overlap": 0.4,
+    "observe_max_per_tick": 3,
+    "raw_pending_ttl_days": 30,
+    "raw_pending_max_rows": 30,
+    "archive_prune_days": 90
+  },
+  "episodic": {
+    "max_age_days": 90
+  },
+  "sessions": {
+    "max_age_days": 30
+  },
+  "no_popup": {
+    "enable": true,
+    "min_chars": 40,
+    "salience_floor": 0.5,
+    "dedupe_in_session": true
+  },
+  "notice": {
+    "cross_profile_skip_hint": false
+  },
+  "memory_type": {
+    "enable": true,
+    "llm_per_session": 5
+  }
+}

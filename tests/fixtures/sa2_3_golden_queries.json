@@ -1,0 +1,123 @@
+{
+  "captured_at": "2026-10-07 (path a: re-captured from live store)",
+  "note": "baseline_top5 deduped (a duplicate episodic id can appear twice in legacy top5). Post-SA2-3 gate = RETRIEVABILITY, not top5-set-invariance: every baseline id must still be eligible in the post-RRF pool (legacy substring qualification gate is preserved verbatim, so nothing previously recallable is lost). RRF re-ranking within the eligible pool is BY DESIGN (spec SA2-3 Acceptance 1 also requires idf-based ranking improvement, which top5-set-invariance would forbid). Ranking improvement is gated separately by test_bm25_idf_rare_term_outranks_common.",
+  "queries": {
+    "en": [
+      {
+        "query": "hermes plugin decay",
+        "baseline_top5": [
+          "preference_110_1791259073",
+          "decision_27_1791246965",
+          "fact_215_1791154611",
+          "task_181_1791243926"
+        ],
+        "n_hits": 1000
+      },
+      {
+        "query": "CJS module system",
+        "baseline_top5": [
+          "preference_110_1791259073",
+          "decision_27_1791246965",
+          "fact_215_1791154611",
+          "task_181_1791243926"
+        ],
+        "n_hits": 1000
+      },
+      {
+        "query": "flock cross process lock",
+        "baseline_top5": [
+          "preference_110_1791259073",
+          "task_181_1791243926",
+          "task_130_1791196716",
+          "fact_215_1791154611"
+        ],
+        "n_hits": 1000
+      },
+      {
+        "query": "knowledge tier",
+        "baseline_top5": [
+          "preference_110_1791259073",
+          "decision_27_1791246965",
+          "fact_215_1791154611",
+          "task_163_1791235860"
+        ],
+        "n_hits": 1000
+      },
+      {
+        "query": "file_memory_search min score",
+        "baseline_top5": [
+          "preference_110_1791259073",
+          "decision_27_1791246965",
+          "fact_215_1791154611",
+          "task_163_1791235860"
+        ],
+        "n_hits": 1000
+      },
+      {
+        "query": "python pytest tests",
+        "baseline_top5": [
+          "fact_81_1790673823",
+          "fact_86_1790673824",
+          "decision_8_1790713641",
+          "fact_90_1790673824",
+          "fact_29_1790664360"
+        ],
+        "n_hits": 5
+      }
+    ],
+    "zh": [
+      {
+        "query": "测试 通过",
+        "baseline_top5": [
+          "fact_49_1790664382",
+          "fact_19_1790658946",
+          "fact_29_1790664360"
+        ],
+        "n_hits": 254
+      },
+      {
+        "query": "部署 记忆",
+        "baseline_top5": [
+          "task_6_1790664382",
+          "fact_19_1790658946",
+          "decision_8_1790713641",
+          "fact_29_1790664360",
+          "fact_83_1790673824"
+        ],
+        "n_hits": 5
+      },
+      {
+        "query": "文件 锁",
+        "baseline_top5": [
+          "fact_35_1790664360",
+          "fact_29_1790664360",
+          "fact_17_1790658946",
+          "fact_52_1790664390"
+        ],
+        "n_hits": 5
+      },
+      {
+        "query": "插件 目录",
+        "baseline_top5": [
+          "task_17_1790673824",
+          "fact_25_1790661647",
+          "decision_8_1790713641",
+          "fact_29_1790664360",
+          "fact_83_1790673824"
+        ],
+        "n_hits": 5
+      },
+      {
+        "query": "用户 偏好",
+        "baseline_top5": [
+          "fact_29_1790664360",
+          "fact_83_1790673824",
+          "fact_52_1790664390",
+          "fact_72_1790672947",
+          "fact_19_1790658946"
+        ],
+        "n_hits": 5
+      }
+    ]
+  }
+}
