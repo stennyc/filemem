@@ -129,12 +129,12 @@ def test_1_itemized_report_lists_each_draft_with_id():
     p._add_draft("keep gateway masked after 2026-09-27 migration")
     ctx = _itemized_ctx(p)
     assert "记忆报告" in ctx, ctx
-    # both drafts listed, one per line, each with an id tail
+    # both drafts listed, one per line (D-site: no ids on this face)
     assert "always run pytest before pushing to main" in ctx
     assert "keep gateway masked after 2026-09-27 migration" in ctx
-    assert "(id:" in ctx, "id tail required for partial disposition"
-    # three-key instruction present
-    assert "取消" in ctx and "确认" in ctx, ctx
+    assert "(id:" not in ctx, "ids no longer shown on the report face"
+    # clarify instruction present
+    assert "clarify" in ctx and "取消" in ctx and "确认" in ctx, ctx
 
 
 def test_2_itemized_report_includes_new_l0_row():
@@ -145,7 +145,7 @@ def test_2_itemized_report_includes_new_l0_row():
     ctx = _itemized_ctx(p)
     assert "记忆报告" in ctx, ctx
     assert "DATABASE_URL" in ctx, "new L0 row content must be listed"
-    assert "(id:" in ctx
+    assert "(id:" not in ctx, "ids no longer shown on the report face"
 
 
 def test_3_dedup_burst_lists_once():
@@ -160,7 +160,7 @@ def test_3_dedup_burst_lists_once():
     _drive(p, "keep going")  # short -> no new row this turn
     ctx = _itemized_ctx(p)
     assert "记忆报告" in ctx
-    assert ctx.count("(id:") == 1, "a deduped burst lists its one row once"
+    assert ctx.count("DATABASE_URL") == 1, "a deduped burst lists its one row once"
 
 
 # ── ④ cancel = zero side effect -> re-report next turn ──────────────────────

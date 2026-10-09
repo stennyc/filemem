@@ -1,0 +1,14 @@
+filemem D-site: pending-draft notice + memory report show CONTENT, not files/ids; clarify flow; no-target bulk sweep
+
+- [未决草稿] lists eligible pending rows as "  - [LEVEL] content…" lines
+  (cross-profile rows never listed — P1-4 filter held; no drafts_*.json,
+  no owner ids, no aggregate counts — A-site red line held)
+- [记忆报告] drops the "(id: ...)" tail; both faces unified on the
+  clarify footer (确认保存/丢弃/取消)
+- filemem_review_drafts(confirm|discard) WITHOUT target now sweeps the
+  current in-memory pool PLUS all other sessions' pending draft files
+  (eligible rows only; T3③ audit snapshots kept on both faces), so the
+  notice and the tool finally agree on what is pending
+- updated notice-related test expectations; new tests/test_notice_content_face.py
+
+Plugin-only, host zero-change.

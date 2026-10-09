@@ -62,11 +62,11 @@ def test_1_notice_injected_when_other_session_drafts_exist():
     ctx = p.prefetch("anything", session_id="s_cur")
     assert "[未决草稿]" in ctx, ctx
     # t_05679311 (A-site): internal blob filenames must NOT surface in the
-    # user-visible notice; the aggregate item count is what the model sees.
+    # user-visible notice; D-site: the model now sees the PENDING CONTENT.
     assert "drafts_s_old.json" not in ctx, ctx
     import re as _re
     assert not _re.search(r"drafts_\w+\.json", ctx), ctx
-    assert "1" in ctx, ctx
+    assert "old fact" in ctx, ctx
     assert p._pending_drafts_notified.get("s_cur") is True
 
 

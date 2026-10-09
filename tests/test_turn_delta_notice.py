@@ -137,9 +137,9 @@ def test_2_dedup_turn_lists_once():
     p.sync_turn("user turn three", "a", session_id="s_t")
     ctx = p.prefetch("next", session_id="s_t")
     assert "记忆报告" in ctx
-    # one row, listed once
-    assert ctx.count("(id:") == 1, ctx
+    # one row, listed once (D-site: content, no ids)
     assert "DATABASE_URL" in ctx
+    assert "(id:" not in ctx
 
 
 # -- 3. empty-shell draft unlink ------------------------------------------------

@@ -3477,13 +3477,15 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         logger.warning per call. Unparseable draft files and row-shape
         hiccups stay NEUTRAL (listed, fail-soft: a corrupt row never
         locks the host out of the notice).
-        Optional `notice.cross_profile_skip_hint` (decay.json, default
-        false): when true, a file's line appends "（另有 N 行跨 profile
-        不列）" naming the skipped cross-profile rows; when false the
-        output bytes are identical to the pre-P1-4 line format.
-        The one-shot gate, base line text, turn_line increment and all
-        other fail-soft semantics are UNCHANGED — only the pending-list
-        condition and count moved.
+        D-site (2026-10-09, supersedes the P1-4 line format on this face):
+        the notice now lists the ELIGIBLE ROWS' CONTENT, one
+        "  - [LEVEL] content…" line per row (80-char truncation), so the
+        user sees WHAT is pending before deciding. The optional
+        `notice.cross_profile_skip_hint` line-hint is replaced by the same
+        per-row filter (cross-profile rows simply never get a line); the
+        hint switch is ignored on this face now. The A-site red line
+        (no drafts_*.json string, no ids, no aggregate counts) still
+        holds; the footer directs the clarify flow.
         """
         # Session-keyed one-shot gate: a cached provider instance is reused
         # across sessions, so "notify once" must be per session_id, not per
@@ -3534,21 +3536,50 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                             pending.append((df.name, eligible, skipped))
             if not pending:
                 return self._join_context(recall_context, turn_line)
+            # D-site fix (2026-10-09 @user): the notice shows PENDING CONTENT,
+            # not counts or file ids. Per-file eligible rows are read from
+            # disk and listed as "  - [LEVEL] content…" (cross-profile rows
+            # never listed — P1-4 owner filter held; no drafts_*.json string
+            # ever surfaces — A-site red line held). The footer directs the
+            # clarify flow; the sweep is done by
+            # filemem_review_drafts(confirm|discard) WITHOUT target.
+            my_sp = getattr(self, "source_profile", None)
             lines = []
             for item in pending:
-                # A-site fix (t_05679311): the user-visible notice lists the
-                # aggregate item count, NEVER the internal storage filename
-                # (drafts_<owner>.json is an addressing internal, not a
-                # user-facing identifier). The cross-profile row-count hint
-                # (L2641 of the P1-4 baseline) is privacy noise on the same
-                # face — removed with the filename per the audit FINDING-1.
-                count = item[1]
-                lines.append(f"  - {count} 条待处置")
+                # item = (filename, eligible, skipped) — eligible>0 here
+                # (corrupt files enter the list as (name, 1) with no data
+                # read, so re-reading them fails -> fallback line).
+                filename = item[0]
+                df = storage_dir / filename
+                try:
+                    data = json.loads(df.read_text(encoding="utf-8"))
+                except Exception:
+                    lines.append("  - （内容不可读，待确认）")
+                    continue
+                if not isinstance(data, (list, tuple)):
+                    lines.append("  - （内容不可读，待确认）")
+                    continue
+                for row in data:
+                    row_sp = _row_source_profile(row)
+                    if my_sp in (None, ""):
+                        if row_sp is not None:
+                            continue  # identity unresolved: neutral rows only
+                    elif row_sp is not None and row_sp != my_sp:
+                        continue  # cross-profile row: never listed
+                    if not isinstance(row, dict):
+                        continue
+                    content = (row.get("content") or "").strip().replace("\n", " ")
+                    if not content:
+                        continue
+                    if len(content) > 80:
+                        content = content[:80] + "…"
+                    level = row.get("level") or "L0"
+                    lines.append(f"  - [{level}] {content}")
             notice = (
-                "\n\n[未决草稿] 有历史会话的记忆草稿待确认，请调用 "
-                'filemem_review_drafts(action="preview") 查看待处置条目：\n'
+                "\n\n[未决草稿] 以下历史会话的记忆草稿待确认，可批量处置：\n"
                 + "\n".join(lines)
-                + "\n（内部存储文件名不向用户展示；可用 filemem_review_drafts(action=\"confirm\"/\"discard\") 批量处置）"
+                + "\n请调用 clarify（确认保存/丢弃/取消），确认后调 "
+                  'filemem_review_drafts(action="confirm"/"discard") 批量处置（无需指定 target）。'
             )
             logger.info(
                 f"FileMem: pending-draft notice injected "
@@ -3651,13 +3682,12 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             if len(content) > 100:
                 content = content[:100] + "…"
             level = it.get("level", "L0")
-            lines.append(f"  {i}. [{level}] {content} (id: {it.get('id', '')})")
+            lines.append(f"  {i}. [{level}] {content}")
         return (
             "\n\n[记忆报告] 以下记忆将保存/已自动生成，可批量处置：\n"
             + "\n".join(lines)
-            + "\n批量处置：确认保存=调 filemem_review_drafts(action=confirm)，"
-              "丢弃=调 action=discard，取消=不处置（条目下轮重报）。"
-              "逐条仅在用户主动要求时按条目 id 传 memory_id 展开。"
+            + "\n请调用 clarify（确认保存/丢弃/取消），确认后调 "
+              'filemem_review_drafts(action="confirm"/"discard") 批量处置（无需指定 target）。'
         )
 
     def _draft_content_dup_in_session(
@@ -8370,64 +8400,107 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 ],
             })
 
-        if action == "confirm":
-            # Save all drafts as permanent memories
-            saved_ids = []
-            confirmed_items = []
-            for draft in drafts:
-                if not memory_id or draft.id == memory_id:
-                    item_id = self._save_memory(
-                        draft.content,
-                        level=draft.level,
-                        source="confirmed_draft"
-                    )
-                    saved_ids.append(item_id)
-                    confirmed_items.append(draft)
-
-            # T3③: audit snapshot before the clear (unbreakable chain).
-            self._audit_drafts_review(
-                "confirm", self.session_id or "default", confirmed_items,
-                f"drafts_{self.session_id}.json")
-
-            # Clear drafts (T3②: the empty persist unlinks the shell)
-            self._session_drafts[self.session_id] = []
-            self._save_session_drafts()
-            # T4①: consuming the confirm batch stops it re-reporting. A
-            # no-memory_id confirm confirms the WHOLE batch; a memory_id
-            # confirm consumes only that item (the rest re-report next turn).
-            self._consume_pending_confirm(
-                self.session_id or "default",
-                ids=[memory_id] if memory_id else None)
-
-            return json.dumps({
-                "success": True,
-                "action": "confirm",
-                "saved_ids": saved_ids,
-                "count": len(saved_ids)
-            })
-
-        elif action == "discard":
-            # T3③: snapshot every discarded draft into the audit chain,
-            # then clear (T3②: the empty persist unlinks the shell).
-            self._audit_drafts_review(
-                "discard", self.session_id or "default", list(drafts),
-                f"drafts_{self.session_id}.json")
-            # Clear all drafts
-            self._session_drafts[self.session_id] = []
-            self._save_session_drafts()
-            # T4①: consuming the discard batch stops it re-reporting (the
-            # discarded content is already snapshotted to the audit chain
-            # above — "删得掉 item、删不掉审计链"). No-memory_id discards the
-            # whole batch; a memory_id discards only that item.
-            self._consume_pending_confirm(
-                self.session_id or "default",
-                ids=[memory_id] if memory_id else None)
-
-            return json.dumps({
-                "success": True,
-                "action": "discard",
-                "discarded_count": len(drafts)
-            })
+        if action == "confirm" or action == "discard":
+            no_target = not target
+            if no_target:
+                # D-site bulk sweep: confirm/discard without a target disposes
+                # the CURRENT session's in-memory pool PLUS every other
+                # session's pending draft file on the shared storage root.
+                # Per file, only P1-4-ELIGIBLE rows are consumed —
+                # cross-profile rows are kept in place (never swept by a
+                # sibling profile). T5b lock discipline: one outer shard lock
+                # per file, same read-modify-write shape as the target path.
+                # T3③ audit chain held: BOTH faces snapshot their rows to
+                # the append-only log before the destructive write.
+                eligible_total = 0
+                saved_ids: List[str] = []
+                cur_sid = self.session_id or "default"
+                # 1) current in-memory pool (existing behavior + audit row)
+                cur_drafts = list(self._session_drafts.get(cur_sid, []))
+                if action == "confirm":
+                    kept = []
+                    confirmed_items = []
+                    for draft in cur_drafts:
+                        if not memory_id or draft.id == memory_id:
+                            item_id = self._save_memory(
+                                draft.content, level=draft.level,
+                                source="confirmed_draft")
+                            saved_ids.append(item_id)
+                            eligible_total += 1
+                            confirmed_items.append(draft)
+                        else:
+                            kept.append(draft)
+                    self._audit_drafts_review(
+                        "confirm", cur_sid, confirmed_items,
+                        f"drafts_{cur_sid}.json")
+                    self._session_drafts[cur_sid] = kept
+                    self._save_session_drafts()
+                    if not memory_id:
+                        self._consume_pending_confirm(cur_sid, ids=None)
+                else:  # discard
+                    self._audit_drafts_review(
+                        "discard", cur_sid, cur_drafts,
+                        f"drafts_{cur_sid}.json")
+                    self._session_drafts[cur_sid] = []
+                    self._save_session_drafts()
+                    if not memory_id:
+                        self._consume_pending_confirm(cur_sid, ids=None)
+                # 2) historical pending files (all other sessions)
+                storage_dir = getattr(self, "storage_dir", None)
+                cur_owner = cur_sid
+                if storage_dir and storage_dir.exists():
+                    for df in sorted(storage_dir.glob("drafts_*.json")):
+                        owner = df.stem[len("drafts_"):]
+                        if cur_owner and owner == cur_owner:
+                            continue  # current session's file handled above
+                        with self._shard_lock(df):
+                            try:
+                                raw = json.loads(df.read_text(encoding="utf-8"))
+                            except Exception:
+                                continue  # corrupt file: leave it, fail-soft
+                            if not isinstance(raw, (list, tuple)):
+                                continue
+                            rows = [MemoryItem.from_dict(d) for d in raw]
+                            kept = []
+                            disposed_items = []
+                            for draft in rows:
+                                d = draft.to_dict()
+                                sp = (d.get("metadata") or {}).get("source_profile")
+                                my_sp = getattr(self, "source_profile", None)
+                                eligible = (sp is None) or \
+                                    (my_sp in (None, "") and sp is None) or \
+                                    (my_sp not in (None, "") and sp == my_sp)
+                                # memory_id filter (applies to the sweep too)
+                                if memory_id and str(draft.id) != str(memory_id):
+                                    kept.append(draft)
+                                    continue
+                                if not eligible:
+                                    kept.append(draft)  # cross-profile: keep
+                                    continue
+                                if action == "confirm":
+                                    item_id = self._save_memory(
+                                        draft.content, level=draft.level,
+                                        source="confirmed_draft")
+                                    saved_ids.append(item_id)
+                                    eligible_total += 1
+                                # discard: nothing to write, just drop it
+                                disposed_items.append(draft)
+                            if disposed_items:
+                                # T3③: snapshot disposed rows BEFORE the
+                                # destructive write — same shape as the
+                                # target path (owner-scoped audit row).
+                                self._audit_drafts_review(
+                                    action, owner, disposed_items, df.name)
+                            self._write_draft_file(df, kept)
+                if action == "confirm":
+                    return json.dumps({
+                        "success": True, "action": "confirm",
+                        "saved_ids": saved_ids, "count": len(saved_ids),
+                    })
+                return json.dumps({
+                    "success": True, "action": "discard",
+                    "discarded_count": eligible_total,
+                })
 
         return json.dumps({"error": f"Unknown action: {action}"})
 

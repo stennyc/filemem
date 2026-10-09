@@ -66,7 +66,8 @@ _NOT_IMPL = "S3 face not yet implemented"
 def _row(rid, content, mem_type="fact", **extra):
     d = {"id": rid, "type": mem_type, "content": content, "level": "L0",
          "salience": 0.5, "reference_count": 0,
-         "created_at": "2026-09-15T00:00:00", "updated_at": "2026-09-15T00:00:00"}
+         "created_at": "2026-09-15T00:00:00", "updated_at": "2026-09-15T00:00:00",
+         "metadata": {}}
     d.update(extra)
     return d
 
@@ -166,11 +167,12 @@ def test_semantic_merge_folds_cross_shard_equivalent_rows(tmp_path, monkeypatch)
         {"same_fact": True, "keep": "fact_678", "supersede": ["preference_140"],
          "reason": "same venv rule, fact_678 is the fuller rewrite"},
     ])
+    # 跨分片 (preference vs fact) + 拉满高重叠 (venv 词表共享 >= 0.5 才进粗筛):
     store = _make_store(tmp_path, {
-        "preference": [_row("preference_140", "hermes plugin venv: single shared venv",
+        "preference": [_row("preference_140", "hermes venv rule: use a single shared venv",
                             mem_type="preference")],
-        "fact": [_row("fact_678", "Hermes plugin venv rule: use single shared venv, "
-                                  "never pip install into native venv",
+        "fact": [_row("fact_678", "hermes venv rule: use a single shared venv, "
+                                "never pip install into native venv",
                       mem_type="fact")],
     })
     p = _make_provider(tmp_path, store, _decay_copy())
@@ -189,10 +191,11 @@ def test_semantic_merge_keeps_distinct_facts(tmp_path, monkeypatch):
     """误合并红线: 两条不同事实即便同 topic 高相似, LLM 判 same_fact=False ->
     两行都保留, 不标 superseded (宁可漏并不可错并 — 有 safety pad 但默认保守)."""
     fake, state = install(monkeypatch, replies=[{"same_fact": False, "reason": "distinct"}])
+    # 两行拉满高重叠 (venv 词表共享, Jaccard >= 0.5 才进粗筛候选池):
     store = _make_store(tmp_path, {
-        "fact": [_row("fact_a", "hermes default venv path is installs/<hash>",
+        "fact": [_row("fact_a", "hermes venv rule: use a single shared venv path",
                        mem_type="fact"),
-                 _row("fact_b", "hermes plugins must not pip install into native venv",
+                 _row("fact_b", "hermes venv rule: share one venv path across plugins",
                        mem_type="fact")],
     })
     p = _make_provider(tmp_path, store, _decay_copy())
@@ -206,12 +209,15 @@ def test_semantic_merge_keeps_distinct_facts(tmp_path, monkeypatch):
 @pytest.mark.xfail(strict=False, reason=_NOT_IMPL)
 def test_semantic_merge_independent_budget_and_main_runtime_gate(tmp_path, monkeypatch):
     """预算/门控 (照抄既有面骨架): 独立预算 semantic_merge_max_per_tick;
-    main_runtime 缺失 -> 整面 clean skip + tick_skip 审计行, 不炸."""
+    main_runtime 缺失 -> 整面 clean skip + tick_skip 审计行, 不炸.
+    🔴 修正: _make_provider(main_runtime=None) 被 fixture 兜成默认 runtime,
+    显式置 p._main_runtime=None 才真走 skip 路径."""
     store = _make_store(tmp_path, {
         "fact": [_row("fact_a", "x", mem_type="fact"),
                  _row("fact_b", "x y", mem_type="fact")],
     })
-    p = _make_provider(tmp_path, store, _decay_copy(), main_runtime=None)
+    p = _make_provider(tmp_path, store, _decay_copy())
+    p._main_runtime = None  # fixture 兜底后强制置 None, 走 skip 门控路径
     p._semantic_merge_consolidate()  # must not raise
     skips = [r for r in _cons_log_rows(store)
              if r.get("action") == "tick_skip" and "main_runtime" in str(r.get("reason"))]
@@ -233,10 +239,12 @@ def test_contradiction_marks_older_row_stale(tmp_path, monkeypatch):
         {"contradiction": True, "stale_id": "fact_old",
          "reason": "new fact negates the old one"},
     ])
+    # 拉满高重叠 (deployment/docker 词表共享 >= 0.5 才进粗筛候选池):
     store = _make_store(tmp_path, {
-        "fact": [_row("fact_old", "deployment uses docker", mem_type="fact",
+        "fact": [_row("fact_old", "deployment env uses docker containers", mem_type="fact",
                        created_at="2026-01-01T00:00:00"),
-                 _row("fact_new", "deployment does NOT use docker today", mem_type="fact",
+                 _row("fact_new", "deployment env does NOT use docker containers today",
+                       mem_type="fact",
                        created_at="2026-10-01T00:00:00")],
     })
     p = _make_provider(tmp_path, store, _decay_copy())
@@ -252,18 +260,20 @@ def test_contradiction_marks_older_row_stale(tmp_path, monkeypatch):
 @pytest.mark.xfail(strict=False, reason=_NOT_IMPL)
 def test_contradiction_no_false_positive_on_complementary_rows(tmp_path, monkeypatch):
     """互补 (非互斥) 的两条 -> LLM 判 contradiction=False -> 谁都不标 stale
-    (避免把正常并存的 L 层不同记忆误杀)."""
+    (避免把正常并存的 L 层不同记忆误杀). 拉满高重叠让 pair 进粗筛候选池."""
     fake, state = install(monkeypatch, replies=[{"contradiction": False, "reason": "complementary"}])
     store = _make_store(tmp_path, {
-        "fact": [_row("fact_a", "path is installs/<hash>/environments/<id>", mem_type="fact"),
-                 _row("fact_b", "never pip install into native venv", mem_type="fact")],
+        "fact": [_row("fact_a", "venv rule: use a single shared venv path",
+                       mem_type="fact"),
+                 _row("fact_b", "venv rule: the shared venv path is under installs",
+                       mem_type="fact")],
     })
     p = _make_provider(tmp_path, store, _decay_copy())
     p._contradiction_detect()
     rows = {r["id"]: r for r in
             json.loads((store / "memories" / "fact.json").read_text(encoding="utf-8"))}
-    assert rows["fact_a"]["metadata"].get("stale") is not True
-    assert rows["fact_b"]["metadata"].get("stale") is not True
+    assert "stale" not in rows["fact_a"]["metadata"]
+    assert "stale" not in rows["fact_b"]["metadata"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -274,7 +284,6 @@ def test_contradiction_no_false_positive_on_complementary_rows(tmp_path, monkeyp
 #       确定性粗筛 (零 LLM) + 可选 LLM 复核; 只改 salience 值, 不删行.
 # ═══════════════════════════════════════════════════════════════════════════
 
-@pytest.mark.xfail(strict=False, reason="S3 ③ fixture missing superseded marker")
 def test_salience_decay_downweights_stale_unrefined_row(tmp_path, monkeypatch):
     """一条 reference_count 高但被新事实反证 (metadata.superseded) + 长期未引用
     的行 -> salience 被降权 (低于原值), 更新 last_referenced 逻辑不动; 降权是
@@ -301,7 +310,6 @@ def test_salience_decay_downweights_stale_unrefined_row(tmp_path, monkeypatch):
     assert aud
 
 
-@pytest.mark.xfail(strict=False, reason=_NOT_IMPL)
 def test_salience_decay_is_deterministic_and_zero_llm(tmp_path):
     """规格钉死: 粗筛是确定性 (零 LLM) — 同一池两次运行结果字节一致; 允许
     可选 LLM 复核但默认关 (config 驱动, 缺省 = 纯确定性). 这条锁 "零 LLM
@@ -333,9 +341,10 @@ def test_salience_decay_is_deterministic_and_zero_llm(tmp_path):
 @pytest.mark.xfail(strict=False, reason=_NOT_IMPL)
 def test_aggregate_synthesizes_topic_conclusion(tmp_path, monkeypatch):
     """同一 topic 的 3 条 L0 碎事实 -> LLM 聚合成一条 L1 结论 (observation 形态,
-    supported_by 指向源 id); 源 L0 行不删 (append-only); 审计行落盘."""
+    supported_by 指向源 id); 源 L0 行不删 (append-only); 审计行落盘.
+    🔴 修正: 实码 llm.aggregate 返回键是 "conclusion" (非占位时的 "observation")."""
     fake, state = install(monkeypatch, replies=[
-        {"observation": "Hermes plugin venv rule: use single shared venv, never "
+        {"conclusion": "Hermes plugin venv rule: use single shared venv, never "
                         "pip install into native venv",
          "supported": ["fact_1", "fact_2", "fact_3"], "value": "high"},
     ])
@@ -369,7 +378,7 @@ def test_aggregate_keeps_source_rows_intact(tmp_path, monkeypatch):
     🔴 修正: 之前靠 "默认不删" 兜 -> XPASS 假绿; 现在聚合成功后 显式重读
     源行, 断言 3 条字节全在 (若聚合面某次误删/改写源行, 这条真 FAIL)."""
     fake, state = install(monkeypatch, replies=[
-        {"observation": "venv rule", "supported": ["fact_1", "fact_2", "fact_3"],
+        {"conclusion": "venv rule", "supported": ["fact_1", "fact_2", "fact_3"],
          "value": "medium"},
     ])
     rp = ([{"topic": "venv", "content": f"f{i}", "memory_ids": [f"fact_{i}"],
@@ -414,8 +423,9 @@ def test_water_level_override_triggers_early_above_threshold(tmp_path):
     decay["consolidation"]["water_level_cooldown_min"] = 0         # 关冷却便于隔离测
     p = _make_provider(tmp_path, store, decay)
     cap = _spawn_capture(p)
-    # 模拟: 上一 tick 后攒了 3 条未处理活 (超过 threshold=3)
-    p._water_level_counter = 3
+    # 🔴 修正: 实码水位走 rescan+TTL cache (self._s3_water_level), 非占位时的
+    # _water_level_counter 属性 -> stub 方法本身返 3 (超 threshold=3):
+    p._s3_water_level = lambda: 3
     p._last_consolidation_ts = time.time()   # 仍在 30min 窗口内 (定时本会跳过)
     p._maybe_spawn_consolidation_tick()
     assert len(cap) == 1, "水位达阈值必须 override 定时提前触发"
@@ -426,7 +436,6 @@ def test_water_level_override_triggers_early_above_threshold(tmp_path):
 # (定时器本会触发), 断言 override 未达阈值时 "不额外提前" (仍走定时器 1 次);
 # 再把 _last_consolidation_ts 拉回窗口内 (定时器本 skip), 断言未达阈值 -> 0 次
 # (若 override 误触发逻辑写反, 这里才会暴露)。
-@pytest.mark.xfail(strict=False, reason="S3 trigger: two-direction override pin")
 def test_water_level_below_threshold_keeps_timer_rhythm(tmp_path):
     """水位未达阈值: override 不得额外触发, 行为完全退回纯定时 —
     (a) 窗口内: 定时器 skip + override 不介入 -> 0 次;
@@ -461,7 +470,9 @@ def test_water_level_below_threshold_keeps_timer_rhythm(tmp_path):
 @pytest.mark.xfail(strict=False, reason=_NOT_IMPL)
 def test_water_level_cooldown_suppresses_storm(tmp_path):
     """防风暴: 一次水位触发后 cooldown_min 内, 即便水位仍高也不再被水位触发
-    (你 session 里那个 10x retry-flood 就是活例子). 冷却期内的触发最多 1 次."""
+    (你 session 里那个 10x retry-flood 就是活例子). 冷却期内的触发最多 1 次.
+    🔴 修正 (实码语义): 实码冷却窗内完全抑制水位重触发 (防风暴), 非"保留 1 次";
+    且水位走 rescan+TTL cache -> stub _s3_water_level 返 5 (非占位的 _water_level_counter)."""
     store = _make_store(tmp_path, {})
     decay = _decay_copy()
     decay["consolidation"]["consolidation_interval_min"] = 30
@@ -470,17 +481,17 @@ def test_water_level_cooldown_suppresses_storm(tmp_path):
     decay["consolidation"]["water_level_cooldown_min"] = 60      # 1h 冷却
     p = _make_provider(tmp_path, store, decay)
     cap = _spawn_capture(p)
-    p._water_level_counter = 5
+    p._s3_water_level = lambda: 5
     p._last_consolidation_ts = time.time()
-    p._maybe_spawn_consolidation_tick()        # 第 1 次: 触发 + 打冷却
+    p._maybe_spawn_consolidation_tick()        # 第 1 次: 触发 + 打冷却锚
     n1 = len(cap)
-    p._last_consolidation_ts = time.time()      # 伪装仍在窗口内
-    p._water_level_counter = 5
-    p._maybe_spawn_consolidation_tick()        # 第 2 次: 冷却期内, 不再触发
-    assert n1 == 1 and len(cap) == 1, "冷却期内水位不得重复触发 (防风暴)"
+    cap.clear()
+    p._last_consolidation_ts = time.time()      # 伪装仍在窗口内 (定时器本 skip)
+    p._maybe_spawn_consolidation_tick()        # 第 2 次: 冷却期内, 水位不再触发
+    assert n1 == 1 and len(cap) == 0, \
+        f"第 1 次触发后冷却窗内水位不得重触发 (防风暴), n1={n1} 第 2 次={len(cap)}"
 
 
-@pytest.mark.xfail(strict=False, reason="S3 trigger: O(1) counter pin (rescan-count)")
 def test_water_level_counter_is_o1_not_full_rescan(tmp_path):
     """水位必须 O(1) 可缓存: gate 期间的 "全池重算" 次数必须被 TTL 缓存 bound.
     规格钉法 (🔴 修正: 旧版 `or "water_level" in src` 宽松分支恒真, 门控失效):

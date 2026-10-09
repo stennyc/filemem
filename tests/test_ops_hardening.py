@@ -47,8 +47,12 @@ def test_3_no_duplicate_dirs_when_clean():
 def test_4_notice_text_has_no_relay_obligation():
     """t_05679311 (C-site): the per-item relay menu is REMOVED. The notice
     must not oblige the model to report a file list or run a clarify menu,
-    and must not surface internal draft filenames — it points at the
-    read-only preview path instead."""
+    and must not surface internal draft filenames.
+
+    D-site (2026-10-09 @user supersedes the C-site preview pointer): the
+    notice now lists the pending CONTENT lines and directs the clarify
+    flow (确认保存/丢弃/取消) + the no-target bulk sweep; the read-only
+    preview path is no longer the notice's instruction."""
     p = FileMemProvider.__new__(FileMemProvider)
     import inspect, re
     src = inspect.getsource(p._pending_draft_notice)
@@ -56,5 +60,6 @@ def test_4_notice_text_has_no_relay_obligation():
     assert "文件清单" not in src, "file-list reporting must be absent"
     assert not re.search(r"drafts_[A-Za-z0-9_]+\.json", src), \
         "internal draft filenames must not be user-visible in the notice"
-    assert "preview" in src, "notice must point at the read-only preview path"
+    assert "clarify" in src, \
+        "D-site: the notice must direct the clarify flow"
 

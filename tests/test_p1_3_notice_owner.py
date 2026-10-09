@@ -124,9 +124,10 @@ def test_04_mixed_file_per_row_count():
     ctx = p.prefetch("anything", session_id="s_cur")
     assert "[未决草稿]" in ctx, ctx
     assert "drafts_s_mixed.json" not in ctx, ctx
-    # P1-4: count is the ELIGIBLE row count, not the file's total row count
-    assert "1 条" in ctx, ctx
-    assert "3 条" not in ctx, ctx
+    # P1-4: cross-profile rows are never listed (owner filter held);
+    # D-site: the eligible row's CONTENT is what is listed
+    assert "mine" in ctx, ctx
+    assert "other's" not in ctx, ctx
     # hint OFF (default): no skip hint text on the line
     assert "跨 profile" not in ctx, ctx
 
@@ -148,6 +149,9 @@ def test_05_row_corrupt_fail_soft_listed():
     _write(tmp, "drafts_s_shapes.json", [42, None, {"metadata": "not-a-dict"}])
     ctx2 = p2.prefetch("anything", session_id="s_cur")
     assert "[未决草稿]" in ctx2, ctx2
+    # D-site: malformed rows have no content -> an honest unreadable line,
+    # never a crash and never fabricated content
+    assert "不可读" in ctx2, ctx2
     assert "drafts_s_shapes.json" not in ctx2, ctx2
 
 
@@ -179,9 +183,9 @@ def test_07_identity_unresolved_neutral_rows_only(caplog):
     # stamped file (every row ownership-stamped, no identity to match) ->
     # 0 eligible rows -> the whole file is NOT listed
     assert "drafts_s_stamped.json" not in ctx, ctx
-    # unstamped file -> neutral rows listed
+    # unstamped file -> neutral rows listed (D-site: by CONTENT, not count)
     assert "drafts_s_unstamped.json" not in ctx, ctx
-    assert "1 条" in ctx, ctx
+    assert "neutral row" in ctx, ctx
     # auditable rule-change warning, grep-able in the log
     assert any(
         "filemem: pending-draft notice: provider profile identity unresolved"
@@ -201,6 +205,9 @@ def test_08_empty_draft_file_not_listed():
 # P1-4 ⑨ hint switch: decay.json notice.cross_profile_skip_hint=true ->
 #    listed lines name the skipped cross-profile rows; false (default) ->
 #    byte-identical base format (asserted in test_04 via "跨 profile" absent).
+# D-site (2026-10-09): the hint switch is IGNORED on this face now — the
+# per-row owner filter already hides cross-profile rows; the content face
+# is byte-identical whether the hint is on or off.
 def test_09_hint_on_names_skipped_cross_profile_rows():
     tmp = pathlib.Path(tempfile.mkdtemp())
     p = _make_provider(tmp, "s_cur", "test")
@@ -212,7 +219,8 @@ def test_09_hint_on_names_skipped_cross_profile_rows():
     ])
     ctx = p.prefetch("anything", session_id="s_cur")
     assert "drafts_s_mixed.json" not in ctx, ctx
-    assert "1 条" in ctx, ctx
+    assert "mine" in ctx, ctx
+    assert "other's" not in ctx, ctx
     assert "（另有 2 行跨 profile 不列）" not in ctx, ctx
 
 
@@ -225,7 +233,7 @@ def test_10_hint_off_default_is_byte_identical_base_format():
         _row("mine", source_profile="test"),
     ])
     ctx = p.prefetch("anything", session_id="s_cur")
-    # t_05679311: the notice line no longer carries the internal
-    # filename — filter on the aggregate item line instead.
-    line = [l for l in ctx.splitlines() if "条待处置" in l]
-    assert line == ["  - 1 条待处置"], ctx
+    # D-site: the content face is identical regardless of the hint switch —
+    # the eligible row's content line, cross-profile rows never listed.
+    line = [l for l in ctx.splitlines() if "条待处置" in l or "mine" in l]
+    assert line == ["  - [L0] mine"], ctx
