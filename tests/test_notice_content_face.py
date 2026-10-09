@@ -241,3 +241,45 @@ def test_9_memory_id_filter_still_works_on_the_sweep():
     old = json.loads((tmp / "drafts_s_old.json").read_text(encoding="utf-8")) \
         if (tmp / "drafts_s_old.json").exists() else []
     assert [r.get("content") for r in old] == ["keep me"], old
+
+
+# ── reviewer 10-09 P1/P2 regression guards ─────────────────────────────
+
+def test_10_sweep_survives_malformed_rows_no_crash():
+    """P1: malformed rows (42 / None / shape-less dict) in a historical
+    file must not crash the whole tool call (no JSON return). They are
+    kept VERBATIM in place; well-formed rows around them still sweep."""
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    p = _make_provider(tmp, "s_cur", "test")
+    _write(tmp, "drafts_s_bad.json", [
+        42, None, {"metadata": "not-a-dict"},
+        _row("good row", source_profile="test"),
+    ])
+    out = json.loads(p._tool_review_drafts({"action": "discard"}))
+    assert out["success"] is True, out
+    # file still exists: malformed rows kept verbatim, good row consumed
+    raw = json.loads((tmp / "drafts_s_bad.json").read_text(encoding="utf-8"))
+    assert 42 in raw and None in raw and {"metadata": "not-a-dict"} in raw, raw
+    assert "good row" not in [r.get("content") for r in raw if isinstance(r, dict)], raw
+
+
+def test_11_partial_disposal_consumes_only_touched_pending_confirm():
+    """P2: a memory_id-scoped confirm/discard consumes ONLY that item's
+    pending-confirm queue entry; un-touched items re-report next turn."""
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    p = _make_provider(tmp, "s_cur", "test")
+    p._session_drafts["s_cur"] = [
+        MemoryItem(id="c1", type="fact", content="fact one"),
+        MemoryItem(id="c2", type="fact", content="fact two"),
+    ]
+    p._pending_confirm = {"s_cur": [
+        {"id": "c1", "level": "L0", "content": "fact one"},
+        {"id": "c2", "level": "L0", "content": "fact two"},
+    ]}
+    out = json.loads(p._tool_review_drafts(
+        {"action": "confirm", "memory_id": "c1"}))
+    assert out["success"] is True, out
+    assert out["count"] == 1, out
+    # c1 consumed; c2 still pending -> re-reports
+    pc = p._pending_confirm.get("s_cur", [])
+    assert [e["id"] for e in pc] == ["c2"], pc

@@ -8435,16 +8435,20 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         f"drafts_{cur_sid}.json")
                     self._session_drafts[cur_sid] = kept
                     self._save_session_drafts()
-                    if not memory_id:
-                        self._consume_pending_confirm(cur_sid, ids=None)
+                    # P2 (reviewer 10-09): a partial (memory_id) confirm
+                    # consumes ONLY the touched pending-confirm items, so
+                    # the rest keep re-reporting next turn (unchanged
+                    # T4① semantics); a no-memory_id confirm clears all.
+                    self._consume_pending_confirm(
+                        cur_sid, ids=[memory_id] if memory_id else None)
                 else:  # discard
                     self._audit_drafts_review(
                         "discard", cur_sid, cur_drafts,
                         f"drafts_{cur_sid}.json")
                     self._session_drafts[cur_sid] = []
                     self._save_session_drafts()
-                    if not memory_id:
-                        self._consume_pending_confirm(cur_sid, ids=None)
+                    self._consume_pending_confirm(
+                        cur_sid, ids=[memory_id] if memory_id else None)
                 # 2) historical pending files (all other sessions)
                 storage_dir = getattr(self, "storage_dir", None)
                 cur_owner = cur_sid
@@ -8460,10 +8464,27 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                                 continue  # corrupt file: leave it, fail-soft
                             if not isinstance(raw, (list, tuple)):
                                 continue
-                            rows = [MemoryItem.from_dict(d) for d in raw]
+                            # P1 (reviewer 10-09): a draft file's rows may be
+                            # malformed (42 / None / a dict missing id) — a
+                            # bare from_dict() on such a row raises and would
+                            # crash the WHOLE tool call (no JSON return).
+                            # Well-formed rows become MemoryItems (consumable);
+                            # malformed rows are kept VERBATIM in place
+                            # (fail-soft: never consumed, never lost, never
+                            # block the sweep of the rows around them).
+                            items: List[Any] = []
+                            for _raw_row in raw:
+                                try:
+                                    items.append(MemoryItem.from_dict(_raw_row))
+                                except Exception:
+                                    items.append(_raw_row)  # keep as-is
                             kept = []
                             disposed_items = []
-                            for draft in rows:
+                            for draft in items:
+                                # malformed row: not a MemoryItem -> keep verbatim
+                                if not isinstance(draft, MemoryItem):
+                                    kept.append(draft)
+                                    continue
                                 d = draft.to_dict()
                                 sp = (d.get("metadata") or {}).get("source_profile")
                                 my_sp = getattr(self, "source_profile", None)
@@ -8521,8 +8542,14 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         if not drafts:
             tfile.unlink()
             return
+        # P1 (reviewer 10-09): a row may be a VERBATIM malformed entry (kept
+        # in place by the no-target sweep) — serialize MemoryItems via
+        # to_dict(), everything else as-is (json handles 42/None/dict).
         with open(tfile, "w", encoding="utf-8") as f:
-            json.dump([d.to_dict() for d in drafts], f, ensure_ascii=False, indent=2)
+            json.dump(
+                [d.to_dict() if isinstance(d, MemoryItem) else d
+                 for d in drafts],
+                f, ensure_ascii=False, indent=2)
 
     def _append_consolidation_event(self, event: Dict[str, Any]) -> None:
         """Append one audit row to storage/consolidation_log.jsonl (fail-soft).
