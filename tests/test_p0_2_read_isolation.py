@@ -105,10 +105,15 @@ def _make_provider(tmpdir: Path, source_profile: str = "default") -> FileMemProv
     return p
 
 
-def _row(row_id: str, content: str, source_profile=None, mem_type: str = "fact") -> dict:
+def _row(row_id: str, content: str, source_profile=None, mem_type: str = "fact",
+         confirmed: bool = True) -> dict:
     """A minimal L2 memory row (no TTL -> never expires). source_profile=None
     means the key is ABSENT (a neutral legacy row); pass "" for an explicitly
-    empty legacy value."""
+    empty legacy value.
+
+    V2: the auto face now applies a confirmed gate, so test rows that are
+    expected to survive the auto face carry confirmed=True by default.
+    Pass confirmed=False to test the unconfirmed-fold path."""
     d = {
         "id": row_id,
         "type": mem_type,
@@ -121,6 +126,8 @@ def _row(row_id: str, content: str, source_profile=None, mem_type: str = "fact")
     }
     if source_profile is not None:
         d["source_profile"] = source_profile
+    if confirmed:
+        d["metadata"] = {"confirmed": True}
     return d
 
 

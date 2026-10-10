@@ -112,6 +112,10 @@ def _row(rid: str, content: str, source_profile="default", mem_type: str = "fact
     meta = {
         "origin": {"kind": "user", "trust": "high"},
         "source_profile": source_profile,
+        # V2 confirmed gate: auto-face fixtures carry confirmed=True so
+        # pre-V2 tests (profile/O1/egress/audit) keep their rows on the
+        # auto face. Pass confirmed=False in extra_meta to test the fold-out.
+        "confirmed": True,
     }
     if extra_meta:
         meta.update(extra_meta)
@@ -352,10 +356,12 @@ def test_o1_fold_out_of_auto_predicate(tmp_path=None):
 # ── 4. ① 谱系折叠: superseded + lapsed rows leave the AUTO-inject face ──────
 
 def test_prefetch_fold_superseded_row(tmp_path=None):
-    """End-to-end docker 反例 through the AUTO face: after the tool supersedes
-    the old row, prefetch's injection context shows ONLY the new (active)
-    row — the superseded old row is folded out entirely (no backfill, no tail
-    note). The new row is injectable (user/high + same profile)."""
+    """End-to-end docker 反例 through the AUTO face, under the V2 confirmed
+    gate: after filemem_supersede writes a candidate correction (not yet
+    EP-2 confirmed), BOTH the superseded old row and the unconfirmed
+    candidate new row are folded out of the auto face — the auto face
+    skeleton is confirmed-only. After the EP-2 confirm chain flips the
+    candidate to confirmed, it enters the auto face."""
     tmp = pathlib.Path(tempfile.mkdtemp())
     p = _make_provider(tmp, source_profile="default")
     old_content, new_content, query = _docker_overlap_is_below_ep1_gate()
@@ -364,14 +370,28 @@ def test_prefetch_fold_superseded_row(tmp_path=None):
         "old_id": "fact_0", "new_content": new_content,
         "reason": "today we do not use docker"}))
     new_id = out["new_id"]
-    # drive the AUTO-inject face (the pre_llm_call pipeline). The query carries
-    # the distinctive shared anchor "deployrail" so BOTH rows would match the
-    # keyword gate; the fold is what keeps the superseded old row out of the
-    # injected context.
+    # The candidate new row is NOT yet confirmed (supersede_state=candidate,
+    # metadata.confirmed absent) -> the V2 confirmed gate folds it out of the
+    # auto face along with the superseded old row.
     ctx = p.prefetch(query, session_id="s-o1", confidence=0.5)
-    assert new_content in ctx, f"new correcting row must be injected, got: {ctx!r}"
     assert old_content not in ctx, \
         f"superseded old row must be folded out of the auto face, got: {ctx!r}"
+    assert new_content not in ctx, \
+        f"unconfirmed candidate row must NOT inject on the auto face (V2 " \
+        f"confirmed gate), got: {ctx!r}"
+    # After the EP-2 confirm chain flips the candidate to confirmed=True,
+    # it enters the auto face skeleton.
+    shard = tmp / "memories" / "fact.json"
+    items = json.loads(shard.read_text(encoding="utf-8"))
+    for item in items:
+        if item.get("id") == new_id:
+            item.setdefault("metadata", {})["confirmed"] = True
+            item["metadata"]["supersede_state"] = "confirmed"
+    shard.write_text(json.dumps(items, ensure_ascii=False, indent=2))
+    ctx2 = p.prefetch(query, session_id="s-o1", confidence=0.5)
+    assert new_content in ctx2, \
+        f"confirmed correction row must inject after EP-2 confirm, got: {ctx2!r}"
+    assert old_content not in ctx2
 
 
 def test_prefetch_fold_lapsed_row(tmp_path=None):

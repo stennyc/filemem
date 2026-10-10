@@ -61,6 +61,7 @@ def _make_provider(tmpdir: pathlib.Path, session_id: str = "s_cur",
     p._turn_self_test = False
     p._turn_canary = False
     p._decay = {}
+    p._pending_confirm = {}
     p.search_memories = lambda *a, **k: []  # 0-hit path -> notice face
     return p
 

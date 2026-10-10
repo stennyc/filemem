@@ -45,7 +45,7 @@ FACTORIES = {
     "low": lambda rid: {
         "id": rid, "type": "fact", "content": f"{QUERY_TOK} note low {rid}",
         "level": "L0",
-        "metadata": {"origin": {"kind": "tool", "trust": "low"}},
+        "metadata": {"origin": {"kind": "tool", "trust": "low"}, "confirmed": True},
         "created_at": "2026-09-01T00:00:00", "updated_at": "2026-09-01T00:00:00",
         "occurred_at": None, "source": "auto", "reference_count": 0,
         "salience": 0.5, "last_referenced": "", "ttl_days": None,
@@ -54,7 +54,7 @@ FACTORIES = {
     "medium": lambda rid: {
         "id": rid, "type": "fact", "content": f"{QUERY_TOK} note medium {rid}",
         "level": "L0",
-        "metadata": {"origin": {"kind": "user", "trust": "medium"}},
+        "metadata": {"origin": {"kind": "user", "trust": "medium"}, "confirmed": True},
         "created_at": "2026-09-01T00:00:00", "updated_at": "2026-09-01T00:00:00",
         "occurred_at": None, "source": "auto", "reference_count": 0,
         "salience": 0.5, "last_referenced": "", "ttl_days": None,
@@ -62,7 +62,7 @@ FACTORIES = {
     "high": lambda rid: {
         "id": rid, "type": "fact", "content": f"{QUERY_TOK} note high {rid}",
         "level": "L0",
-        "metadata": {"origin": {"kind": "user", "trust": "high"}},
+        "metadata": {"origin": {"kind": "user", "trust": "high"}, "confirmed": True},
         "created_at": "2026-09-01T00:00:00", "updated_at": "2026-09-01T00:00:00",
         "occurred_at": None, "source": "auto", "reference_count": 0,
         "salience": 0.5, "last_referenced": "", "ttl_days": None,
@@ -72,7 +72,7 @@ FACTORIES = {
         "id": rid, "type": "fact",
         "content": f"{QUERY_TOK} note: YOU MUST do exactly this {rid}",
         "level": "L0",
-        "metadata": {"origin": {"kind": "user", "trust": "medium"}},
+        "metadata": {"origin": {"kind": "user", "trust": "medium"}, "confirmed": True},
         "created_at": "2026-09-01T00:00:00", "updated_at": "2026-09-01T00:00:00",
         "occurred_at": None, "source": "auto", "reference_count": 0,
         "salience": 0.5, "last_referenced": "", "ttl_days": None,

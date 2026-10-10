@@ -625,7 +625,11 @@ def test_reg_prefetch_reinforce_regression(tmp_path):
     p = _make_provider(tmp_path, store, _decay_copy(recall_min=0))
     # Force a deterministic hit: patch the search to return the row, keep the
     # REAL _reinforce_recall (the S1b counter must bump the on-disk row).
-    row = {"id": "f9", "type": "fact", "content": "the api base url is https://api.internal"}
+    # V2 confirmed gate: the auto face requires metadata.confirmed=True (or a
+    # current-session episodic row), so the stubbed hit row carries confirmed.
+    row = {"id": "f9", "type": "fact",
+           "content": "the api base url is https://api.internal",
+           "metadata": {"confirmed": True}}
     p.search_memories = lambda *a, **kw: [row]
     ctx = p.prefetch("api base url internal", session_id="s-test")
     assert "the api base url is https://api.internal" in ctx, ctx

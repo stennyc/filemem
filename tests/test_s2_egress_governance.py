@@ -72,7 +72,15 @@ DEFAULTS_SNAPSHOT = json.loads(json.dumps(DECAY_DEFAULTS))
 def _row(rid, content, mem_type="fact", **extra):
     d = {"id": rid, "type": mem_type, "content": content, "level": "L0",
          "salience": 0.5, "reference_count": 0}
+    # V2 confirmed gate: auto-face fixtures carry confirmed=True so pre-V2
+    # egress/isolation tests keep their rows on the auto face. Pass
+    # confirmed=False in extra to test the fold-out path.
+    meta = {"confirmed": True}
     d.update(extra)
+    if "metadata" not in d:
+        d["metadata"] = meta
+    elif isinstance(d.get("metadata"), dict):
+        d["metadata"].setdefault("confirmed", True)
     return d
 
 

@@ -173,11 +173,28 @@ def test_a_explicit_supersede_folds_old_row_out_of_auto_face(tmp_path):
     assert _o1_fold_out_of_auto(rows["fact_docker"]) is True
     assert _o1_fold_out_of_auto(rows[new_id]) is False
 
-    # AUTO face: new row injected, superseded old row folded out entirely
+    # AUTO face (V2 confirmed gate): the candidate new row (supersede_state=
+    # "candidate", not yet confirmed) is folded out of the auto face just like
+    # the superseded old row. After the EP-2 confirm chain flips it to
+    # confirmed=True, the new row enters the auto face.
     ctx = p.prefetch(DOCKER_QUERY, session_id="s-regress", confidence=0.5)
-    assert DOCKER_NEW in ctx, f"new active row must be injected, got: {ctx!r}"
     assert DOCKER_OLD not in ctx, \
         f"superseded old row must be folded out of the auto face, got: {ctx!r}"
+    assert DOCKER_NEW not in ctx, \
+        f"unconfirmed candidate row must NOT inject on the auto face (V2 " \
+        f"confirmed gate), got: {ctx!r}"
+    # After EP-2 confirm: the new row (confirmed=True) enters the auto face.
+    shard = tmp_path / "memories" / "fact.json"
+    items = json.loads(shard.read_text(encoding="utf-8"))
+    for item in items:
+        if item.get("id") == new_id:
+            item.setdefault("metadata", {})["confirmed"] = True
+            item["metadata"]["supersede_state"] = "confirmed"
+    shard.write_text(json.dumps(items, ensure_ascii=False, indent=2))
+    ctx_confirmed = p.prefetch(DOCKER_QUERY, session_id="s-regress", confidence=0.5)
+    assert DOCKER_NEW in ctx_confirmed, \
+        f"confirmed new row must inject after EP-2 confirm, got: {ctx_confirmed!r}"
+    assert DOCKER_OLD not in ctx_confirmed
 
     # EXPLICIT face: both rows stay readable (EP-1 out-pool / audit)
     ids = {r.get("id") for r in p.search_memories(

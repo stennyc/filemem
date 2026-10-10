@@ -137,7 +137,7 @@ def test_prefetch_drops_selftest_keeps_ordinary():
                    created_at="2026-09-25T00:00:00").to_dict(),
         MemoryItem(id="fact_1", type="fact",
                    content="port 8080 endpoint healthy", level="L0",
-                   metadata={"source_profile": "test"},
+                   metadata={"source_profile": "test", "confirmed": True},
                    created_at="2026-09-25T00:00:00").to_dict(),
     ]
     with open(tmp / "memories" / "fact.json", "w") as f:
