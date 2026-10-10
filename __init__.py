@@ -394,6 +394,16 @@ def _normalize_profile_stamp(value: Optional[str]) -> Optional[str]:
     return value or None
 
 
+# C (owner 2026-10-11): the BRINGBACK footer is offered ONLY when the previous
+# session's close stamp is FRESH — within this window of now. A stale
+# closed_ts (an old session whose provider was rebuilt, NOT a real /new just
+# after a close) falls outside the window, so the footer stays off. 30 min is
+# the chosen default: wide enough to survive a gateway cold-start + a short
+# user pause, narrow enough that a session that closed hours ago is NOT
+# re-offered as "the one you just finished". Pure data side, zero host dep.
+_BRINGBACK_FRESH_WINDOW_S = 1800.0
+
+
 def _resolve_session_profile(fallback_profile: Optional[str] = None) -> Optional[str]:
     """P0-2: the CURRENT session's owning profile, provided by the HOST.
 
@@ -11168,6 +11178,32 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
             return
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
+            # D (owner 2026-10-11): idempotent — on_session_end can fire MORE
+            # THAN ONCE for the same session (a cached provider is rebuilt per
+            # gateway cold-start, and each rebuild re-runs the end-flow, so a
+            # live OLD session stamps last_closed repeatedly — 0.2s apart in
+            # the live store). Without this guard the last_closed ledger
+            # accumulates N rows for one session and the "most recent closed"
+            # read (by closed_ts) drifts. If this session id already has a
+            # row, skip the append (keep the FIRST close stamp as canonical).
+            existing: set = set()
+            if p.exists():
+                try:
+                    with open(p, "r", encoding="utf-8") as rf:
+                        for line in rf:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                r = json.loads(line)
+                            except Exception:
+                                continue  # P1-3 fail-soft: corrupt line skipped
+                            if isinstance(r, dict) and r.get("session_id"):
+                                existing.add(r.get("session_id"))
+                except Exception:
+                    pass  # a read hiccup degrades to "append" (old behavior)
+            if session_id in existing:
+                return  # D: already stamped this session — do not duplicate
             with self._shard_lock(p):
                 with open(p, "a", encoding="utf-8") as f:
                     f.write(json.dumps({
@@ -11183,6 +11219,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
 
     def _last_closed_session_for_profile(self,
                                          exclude_session_id: Optional[str] = None,
+                                         max_age_s: Optional[float] = None,
                                          ) -> Optional[str]:
         """P1 read: the most-recent CLOSED session id for THIS profile,
         excluding the current one (a just-started session must not bring back
@@ -11194,7 +11231,19 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         write-side None / read-side "" never mismatch. A None-stamp (neutral)
         row matches a None current profile (neutral stays visible to neutral,
         NOT to a named profile — owner: 不串 profile); a stamped foreign row
-        (e.g. 'coder') is cut by a 'default' reader."""
+        (e.g. 'coder') is cut by a 'default' reader.
+
+        C (owner 2026-10-11): ``max_age_s`` — when the caller passes a window
+        (seconds), ONLY a closed row whose ``closed_ts`` is WITHIN that window
+        of now counts as a bring-back target. A stamp older than the window
+        means the "previous session" closed a long time ago (a reviving OLD
+        session, NOT a just-`/new`-opened one) -> returns None -> footer off.
+        This is the pure-data-side fix for "an old session's provider rebuild
+        re-fires the bring-back question": the window makes a stale closed_ts
+        un-offerable, so only a FRESH close (a real new-session-just-after)
+        triggers the footer. When max_age_s is None the legacy unbounded
+        behavior is preserved (fail-soft: an unparseable closed_ts simply
+        never matches the window, degrading to 'no target', not raising)."""
         p = self._last_closed_stamp_path()
         if p is None:
             return None
@@ -11223,6 +11272,25 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                     row_sp = _normalize_profile_stamp(row.get("source_profile"))
                     if row_sp != cur_sp:
                         continue  # per-profile: only this profile's closed sessions
+                    # C (owner 2026-10-11): optional time-window gate. When a
+                    # max_age_s window is requested, this row only counts if its
+                    # closed_ts is within the window of now (a FRESH close). An
+                    # unparseable / missing closed_ts is skipped (fail-soft ->
+                    # no target), never raised. Window comparison is a plain
+                    # datetime parse; zero host dependency (pure data side).
+                    if max_age_s is not None:
+                        ok_age = False
+                        cts = row.get("closed_ts")
+                        if isinstance(cts, str) and cts:
+                            try:
+                                from datetime import datetime as _dt
+                                closed_dt = _dt.fromisoformat(cts)
+                                now_dt = _utcnow()
+                                ok_age = 0 <= (now_dt - closed_dt).total_seconds() <= max_age_s
+                            except Exception:
+                                ok_age = False  # unparseable -> not within window
+                        if not ok_age:
+                            continue
                     if best is None or (row.get("closed_ts") or "") > (best.get("closed_ts") or ""):
                         best = row
             if best is None:
@@ -11409,7 +11477,14 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         if self._has_bringback_choice(sid):
             return ""  # user already answered THIS session (any of 3 choices;
                       # answered state, one-shot held)
-        prev_sid = self._last_closed_session_for_profile(exclude_session_id=sid)
+        prev_sid = self._last_closed_session_for_profile(
+            exclude_session_id=sid,
+            # C (owner 2026-10-11): only offer the bring-back question when the
+            # previous close stamp is FRESH (within the 30-min window). A stale
+            # stamp — e.g. an OLD session whose provider was rebuilt, not a
+            # real /new just after a close — yields None -> footer stays off.
+            max_age_s=_BRINGBACK_FRESH_WINDOW_S,
+        )
         if prev_sid is None:
             return ""  # no per-profile last_closed stamp -> nothing to bring back
         st[sid] = True  # mark asked NOW so a re-fetch this turn does not re-fire

@@ -68,6 +68,8 @@ from __init__ import (  # noqa: E402
     FileMemProvider,
     _auto_inject_eligible,
     _normalize_profile_stamp,
+    _utcnow,
+    _BRINGBACK_FRESH_WINDOW_S,
 )
 
 
@@ -244,6 +246,73 @@ def test_p1_no_cross_profile_recover(tmp_path):
 def test_p1_no_stamp_degrades_to_none(tmp_path):
     p = _make_provider(tmp_path, sid="s_cur", profile="default")
     assert p._last_closed_session_for_profile(exclude_session_id="s_cur") is None
+
+
+def test_d_last_closed_is_idempotent_per_session(tmp_path):
+    """D (owner 2026-10-11): on_session_end fires more than once for the same
+    session (a cached provider is rebuilt per gateway cold-start, each rebuild
+    re-running the end-flow). _record_last_closed_session must be IDEMPOTENT:
+    the same session id appends exactly ONE row (the first close stamp stays
+    canonical); a DIFFERENT session still appends. Without this guard the
+    live store accumulated 3 rows for one session 0.2s apart and the
+    'most-recent closed' read drifted."""
+    import json
+    p = _make_provider(tmp_path, sid="s_cur", profile="default")
+    # Simulate the same session's provider being rebuilt 3x (each re-fires
+    # on_session_end -> _record_last_closed_session for the same id).
+    for _ in range(3):
+        p.session_id = "s_x"
+        p._record_last_closed_session("s_x")
+    # A different session still stamps independently.
+    p.session_id = "s_y"
+    p._record_last_closed_session("s_y")
+    lines = [json.loads(l) for l in p._last_closed_stamp_path().read_text().splitlines() if l.strip()]
+    sids = [l["session_id"] for l in lines]
+    assert sids.count("s_x") == 1, f"D: s_x stamped {sids.count('s_x')}x, expected 1"
+    assert sids.count("s_y") == 1, "D: s_y missing"
+    assert sids == ["s_x", "s_y"]
+
+
+def test_c_stale_closed_stamp_is_not_offered(tmp_path):
+    """C (owner 2026-10-11): the footer is offered ONLY when the previous
+    close stamp is FRESH (within _BRINGBACK_FRESH_WINDOW_S = 30min). A stale
+    closed_ts — an OLD session whose provider was rebuilt, NOT a real /new
+    just after a close — must yield no footer. This is the pure-data-side
+    fix for 'an old session's provider rebuild re-fires the bring-back
+    question': the window makes a stale closed_ts un-offerable."""
+    import json
+    from datetime import timedelta
+    p = _make_provider(tmp_path, sid="s_cur", profile="default")
+    p.session_id = "s_prev"
+    p._record_last_closed_session("s_prev")
+    # Rewrite its closed_ts to 3 hours ago to simulate a stale close.
+    path = p._last_closed_stamp_path()
+    lines = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    for l in lines:
+        if l["session_id"] == "s_prev":
+            l["closed_ts"] = (_utcnow() - timedelta(hours=3)).isoformat()
+    with open(path, "w") as f:
+        for l in lines:
+            f.write(json.dumps(l) + "\n")
+    # The stale stamp must NOT be offered as a bring-back target:
+    assert p._last_closed_session_for_profile(
+        exclude_session_id="s_cur",
+        max_age_s=_BRINGBACK_FRESH_WINDOW_S) is None
+    assert p._bringback_clarify_footer("s_cur") == ""
+
+
+def test_c_fresh_closed_stamp_is_offered(tmp_path):
+    """C: a just-now closed stamp (0s old, within the 30min window) IS
+    offered — the footer fires for a real 'new session just after a close'."""
+    p = _make_provider(tmp_path, sid="s_cur", profile="default")
+    p.session_id = "s_prev"
+    p._record_last_closed_session("s_prev")  # fresh (now)
+    assert p._last_closed_session_for_profile(
+        exclude_session_id="s_cur",
+        max_age_s=_BRINGBACK_FRESH_WINDOW_S) == "s_prev"
+    foot = p._bringback_clarify_footer("s_cur")
+    assert "带回" in foot and "clarify" in foot
+
 
 
 # ── (3) P3 one-shot clarify footer (+ B1 not frozen into the snapshot) ─────────
