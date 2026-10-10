@@ -286,6 +286,26 @@ def test_p3_footer_lists_three_choices_including_fresh(tmp_path):
     assert "confirmed_global_only" not in foot
 
 
+def test_a_footer_hard_directive_to_emit_clarify_tool(tmp_path):
+    """A (owner 2026-10-11): the footer must HARD-direct the model to call the
+    clarify TOOL (native single-select card, keyboard ↑↓ + Enter), not
+    paraphrase the three options as plain chat text. Pin the directive so a
+    future rewrite that softens it back to '请用 clarify 问用户一次' (which
+    let the model re-state options in prose → text box, not native card) is
+    caught. (The plugin only INSTRUCTS; model compliance is an LLM behavior,
+    but the hard '必须/不要' wording is the part we can lock in a test.)"""
+    p = _provider_with_prev_closed(tmp_path)
+    foot = p._bringback_clarify_footer("s_cur")
+    # The native-window directive is present:
+    assert "必须调用 clarify 工具" in foot
+    # The soft old wording is gone:
+    assert "请用 clarify 问用户" not in foot
+    # Explicitly forbids prose paraphrase:
+    assert "不要用纯文字" in foot
+    # The 3 options are still listed for the clarify choices array:
+    assert "bring_back" in foot and "clean_start" in foot and "fresh" in foot
+
+
 def test_b1_footer_not_frozen_into_p3_snapshot(tmp_path):
     """B1 regression sentinel: the P3 cold-start snapshot file written at the
     end of a live prefetch must hold the recall block WITHOUT the bring-back

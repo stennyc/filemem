@@ -11413,13 +11413,27 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         if prev_sid is None:
             return ""  # no per-profile last_closed stamp -> nothing to bring back
         st[sid] = True  # mark asked NOW so a re-fetch this turn does not re-fire
+        # A (owner 2026-10-11): the footer is text that DIRECTS the model to
+        # resolve the choice — it must emit the clarify TOOL (the native
+        # single-select card, keyboard ↑↓ + Enter), NOT paraphrase the three
+        # options as plain chat text. The prior wording ("请用 clarify 问用户
+        # 一次") was too soft: a model that merely wants to be terse re-states
+        # the options in prose, and the user gets a text box instead of a
+        # native select card. The instruction below is a hard directive
+        # ("必须/不要"), so the native window actually shows up. (Plugin-side
+        # limit: the footer only INSTRUCTS; whether the model obeys is an LLM
+        # behavior we cannot guarantee in code — if it still paraphrases, that
+        # is an A-limitation, not a bug in this patch.)
         return (
             "\n\n---\n🔁 [带回账本] 上一个 session（"
-            f"{prev_sid}）已关闭。本次 session 的自动注入面如何处理？"
-            "请用 clarify 问用户一次（三个选项）：\n"
+            f"{prev_sid}）已关闭。本次 session 的自动注入面如何处理？\n"
+            "【指令：必须调用 clarify 工具（原生单选卡，用户可键盘 ↑↓ 选择）问用户"
+            "一次，把下列 3 个选项作为 clarify 的 choices 传入；"
+            "不要用纯文字把人话转述这几个选项。】\n"
+            "clarify 选项（3 个，按顺序传入 choices）：\n"
             "  1) 带回 — 接着刚才干，把上一个 session 确认过（confirmed）的摘要"
             "【置顶】本次自动注入（只改排序、不新增行；收行仍是 V2 两腿）\n"
-            "     → 用 filemem_set_bringback(choice=\"bring_back\", "
+            "     → 用户选它后用 filemem_set_bringback(choice=\"bring_back\", "
             "session_id=...) 落选\n"
             "  2) 干净开局 — 不接着刚才，只留全局确认骨架 + 当前 session 行"
             "（= V2 现状）\n"
