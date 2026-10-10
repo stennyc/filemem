@@ -473,16 +473,67 @@ def _auto_recall_filter(pool: List[Dict[str, Any]], session_sp: Optional[str]) -
     isolation. `session_sp` None = fail-open (no isolation, every row kept);
     else keep rows whose effective source_profile equals `session_sp` or is
     neutral. Never mutates the caller's list, never raises on a bad row
-    (a filter bug degrades to the full pool — it must not drop recall)."""
+    (a filter bug degrades to the full pool — it must not drop recall).
+
+    P0-4 (2026-10-10): also fold out superseded / settled rows.
+    `_o1_fold_out_of_auto` (L1537-1544) already treats both as "折出 auto-inject";
+    the recall leg was漏了 this gate, causing already-resolved diagnostics
+    to re-appear every turn. Zero-native-code: only touches filemem's own dir.
+    """
     if session_sp is None:
         return list(pool)
     try:
         return [
             r for r in pool
-            if isinstance(r, dict) and _auto_recall_eligible(_row_source_profile(r), session_sp)
+            if isinstance(r, dict)
+            and _auto_recall_eligible(_row_source_profile(r), session_sp)
+            and not ((r.get("metadata") or {}).get("superseded"))
+            and not ((r.get("metadata") or {}).get("settled"))
         ]
     except Exception:
         return list(pool)
+
+
+def _auto_inject_eligible(row: Any, session_sp: Optional[str],
+                          cur_session_id: Optional[str]) -> bool:
+    """SESSION_ISOLATION_V2: auto-inject 面骨架谓词（owner 2026-10-10 定稿）。
+
+    三面共用（prefetch / P3 回放 / egress）：
+      (1) profile 隔离   _auto_recall_eligible(row_sp, session_sp)  # P0-2 不变
+      (2) O1 折出        not _o1_fold_out_of_auto(row)             # 不变
+      (3) confirmed 门（C-b）:
+            row 带 session_id == cur_session_id   -> 收（当前 session 全收，
+                仅 episodic 池行有 session_id；memories 池行无此字段）
+            row.metadata.confirmed is True        -> 收（per-profile 全局骨架）
+            其他（无 session_id 的 memories 旧行、未确认行）-> 折出
+      session_sp=None → (1) fail-open 全收；(3) 不收紧（同 P0-2 不变式）。
+      cur_session_id=None → (3) 只剩 confirmed 腿。
+    纯 dict 读、fail-soft，永不 raise。
+
+    BRINGBACK 注（owner 2026-10-10 复盘）：此谓词曾有过第 4 参 bringback_session_id
+    （"带回腿"），被证伪为 0 边际死代码后删除（B2 路 A）——"上一 session 的
+    confirmed 行"已被 confirmed 全局腿（L526）无条件覆盖，再叠一条"上 session +
+    confirmed"腿不新增任何行（no-margin，实证 no-margin across all row shapes）。
+    "带回"的真实价值因此改落在【排序】而非【收行谓词】：P4 选 bring_back 时，
+    prefetch 把"上一 session 的 confirmed 行"在 auto 面结果里【置顶】（见
+    _bringback_reorder_key），而不是新增一条收行腿。收行语义不变（V2 两腿）。"""
+    try:
+        if not isinstance(row, dict):
+            return False
+        if session_sp is not None:
+            if not _auto_recall_eligible(_row_source_profile(row), session_sp):
+                return False
+        if _o1_fold_out_of_auto(row):
+            return False
+        # (3) confirmed 门（C-b）：当前 session 行（episodic 带 session_id）
+        # 或 confirmed 全局行，二者 OR；memories 旧行（无 session_id）
+        # 只认 confirmed。
+        sid = row.get("session_id")
+        if sid is not None and sid == cur_session_id and cur_session_id:
+            return True
+        return bool(((row.get("metadata") or {}).get("confirmed")))
+    except Exception:
+        return False
 
 
 def _noise_table_hit(s: str, decay_cfg: Optional[Dict[str, Any]]) -> bool:
@@ -2205,9 +2256,10 @@ class FileMemProvider(MemoryProvider):
         # local_semantic layer (never auto-written into a per-profile skill).
         self.local_semantic_dir = self.storage_dir / "local_semantic"
         self.local_semantic_dir.mkdir(parents=True, exist_ok=True)
-        # M6 queue: consolidated/pending_upgrades.jsonl (append-only event log)
-        self.pending_queue_path = self.storage_dir / "consolidated" / "pending_upgrades.jsonl"
-        self.pending_queue_path.parent.mkdir(parents=True, exist_ok=True)
+        # M6 promotion queue retired in slice 3 (2026-10-10): no read/write
+        # site remains — the attribute and its filesystem side-effects are
+        # removed together (the on-disk consolidated/ dir is still used by the
+        # rate-limited queue + LLM-rescore event log, so keep the dir).
 
         # Load config
         self._load_config(kwargs)
@@ -2252,14 +2304,25 @@ class FileMemProvider(MemoryProvider):
         logger.info(f"FileMem: initialized for session {session_id}")
 
     @staticmethod
-    def _resolve_profile_name(hermes_home: Path) -> str:
-        """Derive the owning profile from a profile-scoped home path."""
+    def _resolve_profile_name(hermes_home: Path) -> Optional[str]:
+        """Derive the owning profile from a profile-scoped home path.
+
+        SESSION-ISOLATION FIX (owner 2026-10-10, Fix 2): a home WITH a
+        ``profiles/<name>`` segment resolves to ``<name>``. A home WITHOUT that
+        segment (the base/default home, e.g. ``~/.hermes`` or
+        ``<HERMES_HOME>`` with no profiles/ subdir) is the NEUTRAL profile and
+        resolves to **None** — the write faces then stamp NEUTRAL rows (no
+        ``source_profile`` key) instead of the string ``"default"``. The old
+        ``"default"`` string stamp made launch-profile rows invisible to every
+        other profile's P0-2 isolated auto face (a cross-profile row by
+        construction); None keeps them neutral and visible to ALL profiles.
+        """
         parts = [p for p in hermes_home.parts if p]
         if "profiles" in parts:
             idx = parts.index("profiles")
             if idx + 1 < len(parts):
                 return parts[idx + 1]
-        return "default"
+        return None
 
     def _warn_duplicate_plugin_dirs(self) -> List[Path]:
         """117 incident 2026-09-27 ops guard (researcher invariant: stale paths
@@ -2343,6 +2406,12 @@ class FileMemProvider(MemoryProvider):
         # draft flow below stays drafts-gated (a draft-less session has
         # nothing to summarize). Locked order: spawn, then episodic.
         self._spawn_llm_consolidation()
+
+        # BRINGBACK P1: record this session as closed for the current profile,
+        # UNCONDITIONALLY (zero-draft sessions are the common production case
+        # and still close — a later session's bring-back leg points at this id).
+        # Fail-soft: never raises into the end-flow; runs BEFORE the drafts gate.
+        self._record_last_closed_session(session_id)
 
         if not drafts:
             return None
@@ -2633,7 +2702,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         mem_type = self._detect_type(content)    # deterministic, zero LLM (red line: don't modify)
         mem_file = self.memories_dir / f"{mem_type}.json"
         fp = self._drain_fingerprint(content)    # D3: normalized content fingerprint
-        sp = getattr(self, "source_profile", "default")
+        sp = getattr(self, "source_profile", None)
         with self._lock:
             with self._shard_lock(mem_file):
                 items = self._read_memories_file(mem_file)
@@ -2976,7 +3045,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     "level": "L2",
                     "metadata": {
                         "content_hash": chash,
-                        "source_profile": getattr(self, "source_profile", "default"),
+                        "source_profile": getattr(self, "source_profile", None),
                         "origin": {"kind": "factory", "trust": "high"},
                         "confirmed": True,
                     },
@@ -3056,9 +3125,44 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             self._p3_replay_armed = True
             _snap = self._load_injected_snapshot(session_id, query)
             if _snap:
-                logger.info(f"FileMem: P3 cold-start replay for session={session_id} "
-                            f"({len(_snap)} chars frozen block; skipping re-prefetch)")
-                return self._pending_draft_notice(_snap, session_id=session_id)
+                # Session-isolation fix (owner 2026-10-10, Fix 1): the frozen
+                # block must re-pass the P0-2 auto-face predicate at replay
+                # time — a cross-profile row that entered the pool before the
+                # freeze (or a row since superseded / settled / lapsed) must
+                # NOT keep re-injecting verbatim. The filter is fail-open
+                # (unreadable pool / unrecognizable line shape keeps the line).
+                _snap = self._filter_replayed_snapshot(_snap)
+                if _snap:
+                    # Re-freeze the trimmed block so later turns replay the
+                    # isolation-correct content (the stale cross-profile lines
+                    # never come back). Fail-soft: a write hiccup keeps the
+                    # trimmed in-memory block for THIS turn only.
+                    try:
+                        self._save_injected_snapshot(session_id, _snap)
+                    except Exception:
+                        pass
+                    logger.info(
+                        f"FileMem: P3 cold-start replay for session={session_id} "
+                        f"({len(_snap)} chars isolation-gated block)")
+                    return self._pending_draft_notice(_snap, session_id=session_id)
+                # Every line cut by isolation: fall through to a live
+                # re-prefetch (0-hit or a freshly-scoped pool), which re-freezes
+                # a correct block at the tail. The stale frozen block is
+                # dropped NOW (txt + .tokens) so a 0-hit tail (which skips the
+                # tail snapshot save) can never leave the stale block re-armed
+                # for the next cold start.
+                logger.info(
+                    f"FileMem: P3 cold-start block fully cut by P0-2 isolation "
+                    f"for session={session_id}; re-prefetching live")
+                try:
+                    p = self._injected_snapshot_path(session_id)
+                    if p is not None and p.exists():
+                        p.unlink()
+                    _tok = p.with_suffix(".tokens") if p is not None else None
+                    if _tok is not None and _tok.exists():
+                        _tok.unlink()
+                except Exception:
+                    pass
 
         # ── P0-2 read-side hard isolation + denoise (AUTO face ONLY) ───────
         # The explicit filemem_search face never runs this code. The auto face:
@@ -3114,7 +3218,57 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 logger.info(
                     f"FileMem: O1 auto-face fold cut {_o1_folded} item(s) "
                     f"(superseded / validity-lapsed)")
-                results = _o1_kept
+            results = _o1_kept
+        # SESSION_ISOLATION_V2 A: confirmed-gate on the auto-inject face.
+        # Runs UNCONDITIONALLY after the O1 fold (not nested under
+        # `if results:`) so it fires even when O1 emptied the pool — an
+        # empty pool passes through as empty, but any surviving row is
+        # additionally restricted to the C-b skeleton: per-profile global
+        # memory (metadata.confirmed=True) plus the current session's own
+        # rows (episodic-pool rows carrying session_id == self.session_id).
+        # Unconfirmed legacy rows from OTHER sessions are folded out here —
+        # they are what was polluting the injection. session_sp=None
+        # (unresolvable) fails open at the profile gate inside the
+        # predicate; the confirmed gate is NOT tightened (same invariant as
+        # P0-2) — it falls back to the confirmed-or-own-session OR, so an
+        # unresolvable session still injects the legitimate global
+        # skeleton rather than nothing.
+        # BRINGBACK P4 'fresh' gate: if the user chose a fully-FRESH session,
+        # fold the ENTIRE auto-inject face to empty for this session — even the
+        # confirmed global skeleton is not auto-pumped. The SEARCH face
+        # (filemem_search / M4) is UNAFFECTED (fresh ≠ unretrievable; owner
+        # 2026-10-10). Runs before the confirmed gate; a fresh session has no
+        # auto-inject value to keep, so we short-circuit the pool here.
+        _bb_choice = self._get_bringback_choice(getattr(self, "session_id", None))
+        if _bb_choice == "fresh" and results:
+            results = []
+        if results:
+            _c_pre = len(results)
+            results = [
+                r for r in results
+                if _auto_inject_eligible(r, _session_sp,
+                                         getattr(self, "session_id", None))
+            ]
+            _c_folded = _c_pre - len(results)
+            # BRINGBACK P4 'bring_back' (B2-A): reorder, NOT collect. Pin the
+            # previous closed session's confirmed rows to the top of the
+            # surviving set (continuity context first). The row set is
+            # UNCHANGED — a confirmed previous-session row is already kept by
+            # the confirmed-global leg; this only surfaces it ahead of newer /
+            # less-confirmed rows. pin=None (not chosen / no stamp) -> stable
+            # order (== clean_start). Search face is untouched either way.
+            if _bb_choice == "bring_back" and len(results) > 1:
+                _pin_sid = self._resolve_bringback_session_id(
+                    getattr(self, "session_id", None))
+                if _pin_sid is not None:
+                    results = sorted(
+                        results,
+                        key=lambda r: self._bringback_reorder_key(r, _pin_sid))
+            if _c_folded:
+                logger.info(
+                    f"FileMem: SESSION_ISOLATION_V2 confirmed-gate cut "
+                    f"{_c_folded} item(s) (unconfirmed cross-session rows "
+                    f"folded out of the auto-inject face)")
         # P0-conf: wide pool (limit=8, the formula ceiling) fetched in ONE
         # search, then post-truncated by top-1 relevance. RRF-scale top-1
         # (score_kind="rrf", bounded after knowledge-boost *1.5 / B3 model
@@ -3234,7 +3388,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         "reason": "low-trust origin auto-inject disabled",
                         "origin": ((r.get("metadata") or {}).get("origin") or {}),
                         "session_id": session_id or getattr(self, "session_id", None) or "default",
-                        "source_profile": getattr(self, "source_profile", "default"),
+                        "source_profile": getattr(self, "source_profile", None),
                     })
                     continue
                 if _mk == "directive-quote":
@@ -3250,7 +3404,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         "reason": "instruction-grammar hit; rendered as quote block",
                         "origin": ((r.get("metadata") or {}).get("origin") or {}),
                         "session_id": session_id or getattr(self, "session_id", None) or "default",
-                        "source_profile": getattr(self, "source_profile", "default"),
+                        "source_profile": getattr(self, "source_profile", None),
                     })
                 _kept.append(r)
             results = _kept
@@ -3364,10 +3518,23 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         context = "\n".join(parts)
         self._last_recall = RecallStatus("filemem", len(results))
 
+        # P3: freeze this turn's recall block for cold-start replay (re-init).
+        # B1 fix (owner 2026-10-10): the FROZEN snapshot must be the recall
+        # block WITHOUT the bring-back footer. A frozen footer would re-fire on
+        # every cold-start replay of this session (the footer is a one-shot
+        # question; re-injecting it verbatim is a real regression). So the
+        # snapshot is written from `context` BEFORE the footer is appended;
+        # the footer is then layered onto the RETURN string only (visible
+        # face), never persisted into the P3 replay block.
+        _recall_block = context
         logger.debug(f"FileMem: prefetch returned {len(results)} items (confidence={confidence:.2f})")
-        # P3: freeze this turn's block so a later cold-start (re-init) can replay it.
-        if session_id and context:
-            self._save_injected_snapshot(session_id, context)
+        if session_id and _recall_block:
+            self._save_injected_snapshot(session_id, _recall_block)
+        # BRINGBACK P3: one-shot clarify footer (the three continuity choices).
+        # Rides the return face only — appended AFTER the snapshot freeze so it
+        # never leaks into a cold-start replay block. Fail-soft: '' when no
+        # target / already-asked / no storage_dir (context unchanged).
+        context = context + self._bringback_clarify_footer(session_id)
         return self._pending_draft_notice(context, session_id=session_id)
 
     # ── P3 cache-stability: last-injection snapshot ─────────────────────────────
@@ -3440,6 +3607,133 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             p.with_suffix(".tokens").write_text(fp, encoding="utf-8")
         except Exception:
             pass  # fail-soft: snapshot write hiccup must never block recall
+
+    def _filter_replayed_snapshot(self, block: Optional[str]) -> str:
+        """Session-isolation fix (owner 2026-10-10, Fix 1): re-gate a P3
+        cold-start replay block through the P0-2 auto-face predicate BEFORE it
+        is returned to the host.
+
+        The P3 replay branch used to return the frozen block VERBATIM, bypassing
+        the P0-2 hard-isolation path that runs later in prefetch(). Two real
+        defects followed: (a) a cross-profile row that entered the pool (or was
+        neutral back then) and was later re-stamped / superseded / settled /
+        lapsed stayed frozen-injected for the whole session lifetime; (b) the
+        replay branch skipped _save_injected_snapshot, so the frozen block was
+        never refreshed.
+
+        This method loads the current pool (same-profile + neutral rows only,
+        no superseded / settled / lapsed rows — the exact O1 auto-face fold
+        out), matches each `[type] content` line of the block against the pool
+        by content, and returns only the surviving lines. If EVERY line is cut,
+        returns "" (the caller falls through to a live re-prefetch, which
+        re-freezes a correct block or records 0-hit). Fail-open: any hiccup
+        (unreadable pool, bad block shape) returns the original block
+        unchanged — a filter bug must never drop recall.
+
+        Line shape: ``[<type>] <content>`` (type in the 4 MEMORY_TYPES or
+        "episodic"). A line whose content is NOT in the pool is kept
+        (neutral/unstamped rows may have been drained or deduped; we cannot
+        tell, so fail-open keeps them). A line whose content IS in the pool
+        gets the pool row's P0-2 predicate applied (cross-profile /
+        superseded / settled / lapsed -> cut; own / neutral -> kept)."""
+        if not block:
+            return ""
+        lines = block.split("\n")
+        if len(lines) <= 1 and not block.strip().startswith("["):
+            # Not a [type] line format — not a recall block; fail-open keep.
+            return block
+        # Load the FULL pool (unscoped) so a block line whose content maps to
+        # a cross-profile row is CUT, not fail-open-kept (the fail-open keep
+        # only applies when the content is ABSENT from the pool entirely —
+        # drained / deduped / never-pooled). Per-line predicate = the P0-2
+        # eligibility + the O1 auto-face fold (superseded / settled / lapsed).
+        #
+        # KNOWN LIMITATION (SESSION_ISOLATION_V2, reviewer-flagged): this replay
+        # filter loads ONLY the 4 memories shards (MEMORY_TYPES), NOT the
+        # episodic pool (episodic/yyyy/mm/*.jsonl). An episodic line present in
+        # a frozen snapshot therefore maps to by_content=None and is
+        # fail-open-KEPT here even if it belongs to another session. This is
+        # currently inert: P3 snapshots are stored PER SESSION
+        # (_injected_snapshot_path -> storage/sid/last_injected.txt) and the P3
+        # Jaccard gate only replays on a high-similarity query, so a snapshot
+        # is only ever re-gated by a provider instance that owns that same
+        # session (multiplexed gateway gives each session its own instance,
+        # L10934 _provider_cache[session_id]). A cross-session replay of a
+        # foreign session's episodic line would require provider-instance
+        # reuse across sessions — which the architecture does not do. If that
+        # ever changes, extend the pool_rows load below to also read
+        # self._load_episodic_pool() so the current-session all-in leg applies
+        # on the replay face too.
+        session_sp = getattr(self, "source_profile", None)
+        pool_rows: List[Dict[str, Any]] = []
+        try:
+            for shard_type in MEMORY_TYPES:
+                f = self.memories_dir / f"{shard_type}.json"
+                if not f.exists():
+                    continue
+                with self._shard_lock(f):
+                    items = self._read_memories_file(f)
+                pool_rows.extend(
+                    item for item in items
+                    if isinstance(item, dict) and not MemoryItem.from_dict(item).is_expired())
+        except Exception:
+            return block  # fail-open: unreadable pool -> keep original block
+        if not pool_rows:
+            # Empty pool: cannot tell which lines are cut; fail-open keep all.
+            return block
+        # Index: content -> row (first hit wins; duplicate-content rows across
+        # types are indistinguishable by content alone, keep the most
+        # conservative (any row kept -> keep, else cut)).
+        by_content: Dict[str, List[Dict[str, Any]]] = {}
+        for row in pool_rows:
+            c = str(row.get("content") or "").strip()
+            if c:
+                by_content.setdefault(c, []).append(row)
+        kept_lines: List[str] = []
+        for line in lines:
+            s = line.strip()
+            if not s:
+                continue
+            # Parse `[<type>] <content>` — the exact shape the render face
+            # produces. A line not in that shape is not a recall line (e.g. a
+            # [未决草稿] notice riding the same return); keep it.
+            m = re.match(r"^\[(\w+)\]\s(.+)$", s)
+            if not m:
+                kept_lines.append(line)
+                continue
+            content_key = m.group(2).strip()
+            rows_for_content = by_content.get(content_key)
+            if rows_for_content is None:
+                # Content not in the pool (drained / deduped / new since
+                # freeze): fail-open keep the line.
+                kept_lines.append(line)
+                continue
+            # Apply the SESSION_ISOLATION_V2 auto-inject face predicate
+            # (P0-2 profile isolation + O1 auto-face fold + the C-b
+            # confirmed gate) per matching row. The old two-leg check
+            # (O1 fold + P0-2 only) let unconfirmed cross-session rows
+            # keep replaying verbatim; the unified predicate now folds
+            # them out the same way the live prefetch face does, so a
+            # re-freeze here converges to the same skeleton the live
+            # path would have produced. cur_sid = self.session_id: the
+            # "current session all-in" leg only matters for episodic
+            # rows (which carry session_id); memories-pool rows fall
+            # through to the confirmed leg. session_sp=None (line 3595)
+            # fails open at the profile leg; the confirmed leg still
+            # applies (owner C-b invariant: only the profile gate
+            # loosens on unresolvable session, the confirmed gate does
+            # not) — an unresolvable session still replays the
+            # confirmed global skeleton rather than an empty block.
+            any_row_kept = False
+            for row in rows_for_content:
+                if _auto_inject_eligible(row, session_sp,
+                                          getattr(self, "session_id", None)):
+                    any_row_kept = True
+                    break
+            if any_row_kept:
+                kept_lines.append(line)
+            # else: every matching pool row is cut -> drop this line
+        return "\n".join(kept_lines) if kept_lines else ""
 
     def _pending_draft_notice(self, recall_context: str, session_id: Optional[str] = None) -> str:
         """D2①: close the draft-confirmation loop on the ONLY user-visible
@@ -3526,14 +3820,24 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         # profile may see (own-stamp or neutral); skipped
                         # cross-profile rows feed the optional hint.
                         eligible, skipped = self._draft_eligible_rows(data)
-                        if eligible == 0 and not isinstance(data, (list, tuple)):
+                        if eligible > 0:
+                            pending.append((df.name, eligible, skipped))
+                        elif isinstance(data, (list, tuple)) and \
+                                not all(isinstance(r, dict) for r in data):
+                            # P1-3 5b fail-soft: a parseable LIST mixing
+                            # malformed (non-dict) rows -> NEUTRAL-listed
+                            # (count 1). A file whose rows are ALL cross-
+                            # profile DICTS is the legitimate "owner filter
+                            # is the point" case (test_01): NOT listed.
+                            # An unshapeable (non-list) payload keeps its
+                            # own fail-soft listing.
+                            pending.append((df.name, 1, max(skipped, 0)))
+                        elif not isinstance(data, (list, tuple)):
                             # unshapeable-but-parseable payload -> NEUTRAL
                             # (listed at count 1), P1-3 5b fail-soft
                             # preserved — a shape hiccup never locks the
                             # host out of its own notice.
-                            eligible, skipped = 1, 0
-                        if eligible:
-                            pending.append((df.name, eligible, skipped))
+                            pending.append((df.name, 1, 0))
             if not pending:
                 return self._join_context(recall_context, turn_line)
             # D-site fix (2026-10-09 @user): the notice shows PENDING CONTENT,
@@ -3560,13 +3864,24 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     lines.append("  - （内容不可读，待确认）")
                     continue
                 for row in data:
+                    if not isinstance(row, dict):
+                        lines.append("  - （内容不可读，待确认）")
+                        continue
                     row_sp = _row_source_profile(row)
                     if my_sp in (None, ""):
                         if row_sp is not None:
                             continue  # identity unresolved: neutral rows only
                     elif row_sp is not None and row_sp != my_sp:
                         continue  # cross-profile row: never listed
-                    if not isinstance(row, dict):
+                    _meta = row.get("metadata")
+                    if not isinstance(_meta, dict):
+                        _meta = {}
+                    # Session-isolation fix 4 (owner 2026-10-10): settled /
+                    # superseded draft rows are lifecycle-done — they are NOT
+                    # pending anymore and must not re-appear in the notice
+                    # (same O1 fold-out predicate as the auto-inject face; the
+                    # pending-draft notice is a user-visible auto surface).
+                    if _meta.get("superseded") or _meta.get("settled"):
                         continue
                     content = (row.get("content") or "").strip().replace("\n", " ")
                     if not content:
@@ -3575,11 +3890,19 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         content = content[:80] + "…"
                     level = row.get("level") or "L0"
                     lines.append(f"  - [{level}] {content}")
+                # P1-3 5b companion: a file listed as pending (the zero-
+                # eligible LIST path) whose rows are ALL unrenderable (not
+                # dicts) must still surface ONE fallback line — otherwise
+                # the notice would claim a pending file with an empty body.
+                # Cross-profile-only files legitimately render zero lines
+                # (the owner filter is the point) — no fallback for those.
+                if not lines and any(not isinstance(r, dict) for r in data):
+                    lines.append("  - （内容不可读，待确认）")
             notice = (
                 "\n\n[未决草稿] 以下历史会话的记忆草稿待确认，可批量处置：\n"
                 + "\n".join(lines)
                 + "\n请调用 clarify（确认保存/丢弃/取消），确认后调 "
-                  'filemem_review_drafts(action="confirm"/"discard") 批量处置（无需指定 target）。'
+                  'filemem_review_drafts(action="confirm"/"discard") 批量处置。'
             )
             logger.info(
                 f"FileMem: pending-draft notice injected "
@@ -3687,7 +4010,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             "\n\n[记忆报告] 以下记忆将保存/已自动生成，可批量处置：\n"
             + "\n".join(lines)
             + "\n请调用 clarify（确认保存/丢弃/取消），确认后调 "
-              'filemem_review_drafts(action="confirm"/"discard") 批量处置（无需指定 target）。'
+              'filemem_review_drafts(action="confirm"/"discard") 批量处置。'
         )
 
     def _draft_content_dup_in_session(
@@ -3799,7 +4122,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             "session_id": (getattr(self, "_turn_active_sid", None)
                            or getattr(self, "session_id", None)
                            or "default"),
-            "source_profile": getattr(self, "source_profile", "default"),
+            "source_profile": getattr(self, "source_profile", None),
         }
         if dedupe_hit:
             # P3-2b: add the dedupe marker to the EXISTING audit schema
@@ -4168,6 +4491,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         "ts": _utcnow().isoformat(),
                         "role": "user", "content": (user_content or "")[:4000],
                         "assistant": (assistant_content or "")[:4000],
+                        "source_profile": getattr(self, "source_profile", None),
                     }
                 # Negative-example v1: optional append-only `failure` key doubles
                 # as the audit trace (no separate failures jsonl — no consumer).
@@ -4355,6 +4679,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     "action": "corrupt_memories_healed",
                     "type": mem_file.stem,
                     "renamed_to": corrupted.name,
+                    "source_profile": getattr(self, "source_profile", None),
                 })
             except Exception:  # _append_consolidation_event is fail-soft itself
                 pass
@@ -4535,7 +4860,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             return
         self._recurring_scanning = True
         try:
-            if not getattr(self, "_main_runtime", None):
+            if not self._live_main_runtime():
                 self._audit_tick_skip("main_runtime missing")
                 return
             scfg = (self._decay.get("consolidation") or {})
@@ -4567,7 +4892,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             dismissed = self._recurring_dismissed_anchors(cooldown_days)
             llm = _load_llm_caller()
             log_path = self.storage_dir / "consolidation_log.jsonl"
-            sp = getattr(self, "source_profile", "default")
+            sp = getattr(self, "source_profile", None)
             sid = self.session_id or "default"
             pc = getattr(self, "_pending_confirm", None)
             pushed = 0
@@ -4905,6 +5230,25 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 f"FileMem: P0-1 ingress gate @ _save_memory rejected "
                 f"{content.strip()[:30]!r} (quarantined, not written to pool)")
             return ""
+        # SESSION_ISOLATION_V2 D: write-side promotion gate (防再涨). Only
+        # user-confirmed rows may land at L1/L2 — the durable layer is
+        # reserved for the confirmed global skeleton (metadata.confirmed=True,
+        # the owner decision ②). Every other origin (auto-catch / auto-extract
+        # / rate-limited queue re-entry, i.e. source not in {"manual",
+        # "confirmed_draft"}) is clamped to L0: an unconfirmed temporary row
+        # must NOT grow into L1/L2. manual / confirmed_draft callers
+        # re-stamp origin with user/high trust (SEC-1-1) so their L1/L2 rows
+        # survive the gate. Clamps the variable `level` ONCE at the top so
+        # BOTH the new-item branch and the dedup-upsert branch (which writes
+        # items[i]["level"]) use the clamped value — one choke point, zero
+        # regression for confirmed rows.
+        if level in ("L1", "L2") and source not in ("manual", "confirmed_draft"):
+            logger.info(
+                f"FileMem: SESSION_ISOLATION_V2 D write-side gate clamped "
+                f"L{level[-1]} -> L0 (source={source!r} not user-confirmed; "
+                f"unconfirmed temp rows stay L0, durable layer is reserved "
+                f"for confirmed rows)")
+            level = "L0"
         # Rate limit: queue if too frequent instead of silently dropping
         now = _utcnow().timestamp()
         if not _force_write and source == "auto" and (now - self._last_save_time) < self._save_interval:
@@ -4963,7 +5307,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         "action": "queue_overflow",
                         "discarded": overflowed,
                         "cap": self._rate_limited_queue_cap,
-                        "source_profile": getattr(self, "source_profile", "default"),
+                        "source_profile": getattr(self, "source_profile", None),
                     })
                 except Exception as e:
                     logger.warning(f"FileMem: queue_overflow audit write failed: {e}")
@@ -5054,14 +5398,15 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                                 getattr(self, "session_id", None) or "default",
                                 {"ts": _utcnow().isoformat(), "action": "dedup_upsert",
                                  "type": mem_type, "id": dup_id, "hash": _chash,
-                                 "source": source, "level": level}
+                                 "source": source, "level": level,
+                                 "source_profile": getattr(self, "source_profile", None)}
                             )
                             return dup_id
 
                 # Create new item
                 _item_meta = self._failure_meta_for(
                     self.session_id or "default",
-                    {"source_profile": getattr(self, "source_profile", "default")},
+                    {"source_profile": getattr(self, "source_profile", None)},
                 )
                 # v2: room meta turn stamp (ingress half of the self-test cut)
                 _item_meta = self._self_test_meta(_item_meta)
@@ -5306,7 +5651,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 "origin": origin or "ingress_reject",
                 "session_id": (getattr(self, "_turn_active_sid", None)
                                 or getattr(self, "session_id", None) or "default"),
-                "source_profile": getattr(self, "source_profile", "default"),
+                "source_profile": getattr(self, "source_profile", None),
             })
         except Exception as e:
             logger.warning(f"FileMem: ingress-reject audit write failed: {e}")
@@ -5385,7 +5730,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     return mem_type
         return "fact"
 
-    def _add_draft(self, content: str, level: str = "L1") -> str:
+    def _add_draft(self, content: str, level: str = "L0") -> str:
         """Add a memory draft to current session."""
         # P0-1 ingress gate @ _add_draft (mirror of the _save_memory gate): a
         # host/cron instruction block, raw tool output, or whole task prompt
@@ -5418,7 +5763,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         if self.session_id not in self._session_drafts:
             self._session_drafts[self.session_id] = []
 
-        meta = {"source_profile": getattr(self, "source_profile", "default")}
+        meta = {"source_profile": getattr(self, "source_profile", None)}
         meta = self._failure_meta_for(self.session_id or "default", meta)
         # v2: room meta turn stamp on drafts too (the self-test cut covers
         # drafts, which promote into the same pool at review time)
@@ -5625,7 +5970,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
            path — no new queue, no new thread (engine's serialized write
            worker already runs sync_turn; a second writer would race).
         """
-        main_runtime = getattr(self, "_main_runtime", None)
+        main_runtime = self._live_main_runtime()
         if not main_runtime:
             return  # standalone usage (no host main_runtime) — skip, not an error
         sid = session_id or getattr(self, "session_id", None) or "default"
@@ -5694,7 +6039,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         limit = getattr(self, "_type_classify_limit", 5)
         if not isinstance(limit, int) or limit <= 0:
             limit = 0
-        main_runtime = getattr(self, "_main_runtime", None)
+        main_runtime = self._live_main_runtime()
         if not main_runtime:
             return None  # standalone / non-host: regex verdict stands, zero call
         budget = getattr(self, "_type_classify_budget", None)
@@ -5787,7 +6132,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     # keeps foreign authors out) or no source at all ->
                     # unknown/low fail-safe.
                     _mem_meta = self._self_test_meta(
-                        {"source_profile": getattr(self, "source_profile", "default")}
+                        {"source_profile": getattr(self, "source_profile", None)}
                     )
                     _stamp_origin_in_meta(_mem_meta, mem.get("source", ""))
                     item = MemoryItem(
@@ -6801,7 +7146,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # non-None gate becomes the main_runtime non-empty gate (identical
         # standalone-skip semantics).
         mode = (self._decay.get("search") or {}).get("mode", "keyword")
-        if ranking == "decay" and mode == "model" and getattr(self, "_main_runtime", None) and scored:
+        if ranking == "decay" and mode == "model" and self._live_main_runtime() and scored:
             try:
                 llm = _load_llm_caller()
                 for item in scored[: min(limit * 2, 10)]:
@@ -7224,7 +7569,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         },
                         "profile": {
                             "type": "string",
-                            "description": "P0-2: three-valued profile scope. Omit/None = the session's owning profile first, with a global-pool fallback ONLY when it 0-hits (cascade). 'ALL' = direct global recall (no cascade, no session scoping). Any other value is rejected with an error. The envelope-level recall_scope reports which pool actually hit."
+                            "description": "SESSION_ISOLATION_V2 B: three-valued profile scope, aligned with the auto face. Omit/None = this profile's own pool ONLY (no global cascade — a 0-hit scoped result is returned empty, not cross-profile). 'ALL' = explicit direct global recall (no cascade, no session scoping), reference-only. Any other value is rejected with an error. The envelope-level recall_scope reports which pool actually hit."
                         },
                         "raw": {
                             "type": "boolean",
@@ -7342,6 +7687,33 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     },
                     "required": ["action"]
                 }
+            },
+            {
+                "name": "filemem_set_bringback",
+                "description": ("Set THIS session's cross-session continuity choice (BRINGBACK P3/P4). "
+                    "Call it ONCE after the session's first turn when the bring-back footer asked. "
+                    "choice='bring_back' pins the previous closed session's CONFIRMED summaries to the "
+                    "TOP of this session's auto-inject face (reorder only — no new rows; a confirmed "
+                    "prev-session row is already kept by the confirmed-global leg). "
+                    "'clean_start' = V2 default (confirmed global skeleton + this session's own rows). "
+                    "'fresh' = this session injects NOTHING on the auto face (even the confirmed "
+                    "skeleton is folded out); a truly clean start. "
+                    "The search face (filemem_search) ALWAYS recalls across sessions regardless — any "
+                    "choice (incl. 'fresh') never makes an old session unretrievable (全新 ≠ 失联). "
+                    "Per-session: a fresh session re-asks."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "choice": {
+                            "type": "string",
+                            "enum": ["bring_back", "clean_start", "fresh"],
+                            "description": "bring_back=pin previous session's confirmed summaries to top of auto-inject; "
+                                           "clean_start=V2 default (confirmed skeleton + current session rows, no pinning); "
+                                           "fresh=nothing auto-injected this session (search face still fully available)."
+                        }
+                    },
+                    "required": ["choice"]
+                }
             }
         ]
 
@@ -7360,6 +7732,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 return self._tool_supersede(args)
             elif tool_name == "filemem_review_drafts":
                 return self._tool_review_drafts(args)
+            elif tool_name == "filemem_set_bringback":
+                return self._tool_set_bringback(args)
             else:
                 return json.dumps({"error": f"Unknown tool: {tool_name}"})
         except Exception as e:
@@ -7503,21 +7877,32 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         mem_type = args.get("type", "all")  # 统一召回、分类做成参数: type slice of the pool
         raw = args.get("raw", False)  # 人工排查: skip egress (no-op in explicit mode)
         # P0-2: three-valued profile semantics — absent/None = the
-        # session's owned profile first, global-pool fallback ONLY on
-        # 0-hits (cascade); "ALL" = direct global recall (no cascade);
-        # anything else = error.
+        # session's owned profile pool ONLY (no global cascade, SESSION_ISOLATION_V2
+        # design point 3: the tool face is privacy-aligned with the auto face, so
+        # 0-hits in the scoped pool do NOT fall back to the global pool);
+        # "ALL" = explicit direct global recall (no cascade, no session
+        # scoping, reference-only); anything else = error.
         profile = args.get("profile")
         if profile is None:
             profile_scope = _resolve_session_profile(
                 getattr(self, "source_profile", None))
-            cascade = True
+            # SESSION_ISOLATION_V2 B: the explicit face's default scope no
+            # longer cascades to the global pool on 0-hits (privacy
+            # alignment with the auto face; the owner decision is
+            # "the tool face default = this profile's pool only").
+            # A 0-hit scoped result is returned as empty, not as a
+            # cross-profile recall. "ALL" below is the ONLY explicit
+            # full-pool path and is marked reference-only in the envelope.
+            cascade = False
         elif profile == "ALL":
             profile_scope = None
             cascade = False
         else:
             return json.dumps({
                 "error": (f"invalid profile {profile!r}; "
-                          f"use None (session→global cascade) or 'ALL'")})
+                          f"use None (this profile's pool only, no "
+                          f"global cascade) or 'ALL' (explicit global "
+                          f"recall, reference-only)")})
 
         results, hit_pool = self._recall_and_format(
             query, limit, min_score, profile_scope,
@@ -7602,7 +7987,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                             "ts": _utcnow().isoformat(),
                             "action": "memory_delete",
                             "id": mem_id,
-                            "source_profile": getattr(self, "source_profile", "default"),
+                            "source_profile": getattr(self, "source_profile", None),
                             "snapshot": [
                                 {"id": g.get("id"), "type": g.get("type"),
                                  "level": g.get("level"),
@@ -7743,7 +8128,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                             "source_event": source_event,
                             "shard": mem_type,
                             "revived": hit,
-                            "source_profile": getattr(self, "source_profile", "default"),
+                            "source_profile": getattr(self, "source_profile", None),
                         })
                     except Exception:
                         pass
@@ -7976,7 +8361,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             "reason": reason,
             "validity_scope": scope,
             "valid_until": new_meta.get("valid_until"),
-            "source_profile": getattr(self, "source_profile", "default"),
+            "source_profile": getattr(self, "source_profile", None),
         }
         if cross_override:
             # O1 1D: a user-confirmed cross-profile override is audited on the
@@ -8095,7 +8480,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         "action": "status_triage_derive_failed",
                         "memory_id": str(memory_id),
                         "error": str(_derive_exc),
-                        "source_profile": getattr(self, "source_profile", "default"),
+                        "source_profile": getattr(self, "source_profile", None),
                     })
                     return json.dumps({
                         "success": False,
@@ -8112,7 +8497,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 "memory_id": memory_id,
                 "status": triage_status,
                 "decided_by": "user",
-                "source_profile": getattr(self, "source_profile", "default"),
+                "source_profile": getattr(self, "source_profile", None),
             })
             # Consume the pending panel entry so it stops re-reporting.
             sid = self.session_id or "default"
@@ -8170,7 +8555,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                               f"found in pending queue (already consumed or "
                               f"expired — no write, no audit)",
                 })
-            sp = getattr(self, "source_profile", "default")
+            sp = getattr(self, "source_profile", None)
             new_iso = _utcnow().isoformat()
             if verdict == "sediment":
                 # Build the sediment row's content: the authoritative row's
@@ -8480,6 +8865,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                                     items.append(_raw_row)  # keep as-is
                             kept = []
                             disposed_items = []
+                            my_sp = getattr(self, "source_profile", None)
                             for draft in items:
                                 # malformed row: not a MemoryItem -> keep verbatim
                                 if not isinstance(draft, MemoryItem):
@@ -8487,16 +8873,31 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                                     continue
                                 d = draft.to_dict()
                                 sp = (d.get("metadata") or {}).get("source_profile")
-                                my_sp = getattr(self, "source_profile", None)
-                                eligible = (sp is None) or \
-                                    (my_sp in (None, "") and sp is None) or \
+                                # Session-isolation fix 3 (owner 2026-10-10): a
+                                # NEUTRAL (unstamped) row is NOT eligible for
+                                # this profile's sweep — a neutral row is
+                                # CLAIMED by the profile that confirms it:
+                                # _save_memory stamps the promoting row with
+                                # that profile's source_profile, so the row's
+                                # ownership drifts to the confirmer and the
+                                # sibling profiles lose their shared row.
+                                # Neutral rows therefore stay in place (their
+                                # confirm is the claim; a discard of a neutral
+                                # row is only valid when NO profile can
+                                # claim it — i.e. this is a single-profile
+                                # store, signaled by an UNRESOLVED provider
+                                # identity (my_sp None/"") which tightens to
+                                # neutral-rows-only, the P1-3 rule).
+                                eligible = (my_sp in (None, "") and sp is None) or \
                                     (my_sp not in (None, "") and sp == my_sp)
                                 # memory_id filter (applies to the sweep too)
                                 if memory_id and str(draft.id) != str(memory_id):
                                     kept.append(draft)
                                     continue
                                 if not eligible:
-                                    kept.append(draft)  # cross-profile: keep
+                                    kept.append(draft)  # cross-profile or
+                                                         # neutral-but-resolved:
+                                                         # keep in place
                                     continue
                                 if action == "confirm":
                                     item_id = self._save_memory(
@@ -8524,6 +8925,65 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 })
 
         return json.dumps({"error": f"Unknown action: {action}"})
+
+    def _tool_set_bringback(self, args: Dict) -> str:
+        """BRINGBACK P4: the model-driven write for this session's continuity
+        choice. The bring-back footer (P3) is injected on the first non-trivial
+        prefetch; the model resolves the user's choice (via clarify) and calls
+        this tool exactly ONCE to persist it.
+
+        THREE choices (owner 2026-10-10, B2-A + fresh):
+          - 'bring_back'  — pin the previous closed session's confirmed rows to
+            the TOP of this session's auto-inject face (reorder only; the row
+            set is unchanged from V2 — a confirmed prev-session row is already
+            kept by the confirmed-global leg, so bring_back adds no rows, it
+            only surfaces the continuity context first).
+          - 'clean_start' — V2 default: confirmed global skeleton + the current
+            session's own rows; no pinning.
+          - 'fresh'       — this session injects NOTHING on the auto face (even
+            the confirmed global skeleton is folded out); a truly clean start.
+
+        Per-session: the choice file is keyed by session_id; a fresh session
+        re-asks. Fail-soft: an unreadable session_id degrades to 'unknown
+        session' (no crash); the choice ALWAYS lands so the footer's one-shot
+        gate can mark it asked.
+
+        NOTE: this choice only gates the AUTO-INJECT face. The SEARCH face
+        (filemem_search / M4) recalls across sessions unconditionally — any
+        choice (including 'fresh') NEVER makes an old session unretrievable
+        (owner invariant: 全新 ≠ 失联)."""
+        sid = args.get("session_id") or getattr(self, "session_id", None)
+        choice = args.get("choice", "clean_start")
+        valid = ("bring_back", "clean_start", "fresh")
+        if choice not in valid:
+            return json.dumps({"success": False,
+                              "error": f"choice must be one of {list(valid)}"})
+        if not sid:
+            return json.dumps({"success": False,
+                              "error": "unknown session_id (bring-back choice not recorded)"})
+        self._set_bringback_choice(sid, choice)
+        # Mark the footer one-shot gate so it does not re-ask this session.
+        self._mark_bringback_footer_asked(sid)
+        # For bring_back, confirm the pin target actually exists (per-profile
+        # last_closed stamp). If no target, the pin is a no-op — report it
+        # honestly. fresh/clean_start carry no pin target.
+        pin_target = (self._resolve_bringback_session_id(sid)
+                      if choice == "bring_back" else None)
+        return json.dumps({
+            "success": True,
+            "session_id": sid,
+            "choice": choice,
+            "bring_back_active": (choice == "bring_back"),
+            "fresh": (choice == "fresh"),
+            "pin_target": pin_target,  # previous closed session id, or None
+            "note": ("auto-inject face updated ("
+                      + ("fresh: nothing auto-injected this session"
+                         if choice == "fresh"
+                         else "bring-back pinning "
+                              + (pin_target or "none (no previous closed session)")
+                              + (")" if choice == "bring_back" else ""))
+                      + "); search face (filemem_search) is always unaffected."),
+        })
 
     def _write_draft_file(self, tfile, drafts: List[MemoryItem]) -> None:
         """Persist a draft list to a named draft file.
@@ -8637,6 +9097,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 "target_session": target_session,
                 "count": len(items),
                 "snapshot": [d.to_dict() for d in items],
+                "source_profile": getattr(self, "source_profile", None),
             })
         except Exception as e:
             logger.debug(f"FileMemory: drafts_review audit write failed: {e}")
@@ -8747,7 +9208,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         snapshot (provider._main_runtime, epic card 1) — the old _llm_ctx-None
         gate becomes the main_runtime-missing gate, and the audit row's reason
         label follows the face that was cut."""
-        if not getattr(self, "_main_runtime", None):
+        if not self._live_main_runtime():
             # S1b F4: the LLM-FACE skip is now a self-provable audit event
             # (throttled by _last_skip_audit_ts / consolidation_interval_min —
             # one row per window, never a per-tick flood). Standalone stays
@@ -8773,7 +9234,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
             rpath = self._rescore_events_path()
             rpath.parent.mkdir(parents=True, exist_ok=True)
             log_path = self.storage_dir / "consolidation_log.jsonl"
-            sp = getattr(self, "source_profile", "default")
+            sp = getattr(self, "source_profile", None)
             done = 0
             with open(rpath, "a", encoding="utf-8") as rf, open(log_path, "a", encoding="utf-8") as lf:
                 for c in cands:
@@ -8820,7 +9281,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         snapshot = standalone skip, not an error. Writes (new-row state flip + every
         superseded target row's superseded_confirmed=True) go through the
         same cross-process _shard_lock RMW as the save door."""
-        if not getattr(self, "_main_runtime", None):
+        if not self._live_main_runtime():
             return  # standalone usage (no host main_runtime) — skip, not an error
         if getattr(self, "_supersede_confirming", False):
             logger.debug("FileMem: supersede confirm already in flight, skipping this spawn")
@@ -8987,7 +9448,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         only per topic (existing topics are preserved verbatim). aliases.json
         is a pure new file — the live memories/ and episodic/ trees are
         never written by this face."""
-        if not getattr(self, "_main_runtime", None):
+        if not self._live_main_runtime():
             return  # standalone usage (no host main_runtime) — skip, not an error
         if getattr(self, "_alias_mining_in_flight", False):
             logger.debug("FileMem: alias mining already in flight, skipping this spawn")
@@ -9055,7 +9516,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                                 "ts": ts, "action": "alias_mine", "topic": topic,
                                 "aliases_count": len(entry["aliases"]),
                                 "model_used": res.get("model_used", False),
-                                "source_profile": getattr(self, "source_profile", "default"),
+                                "source_profile": getattr(self, "source_profile", None),
                             }, ensure_ascii=False) + "\n")
                         except Exception as e:
                             # 3. Single-topic failure never breaks the batch —
@@ -9105,7 +9566,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         raw_pending, 留痕); a single topic's exception never breaks the
         batch; a whole-tick exception leaves every existing observation on
         disk intact (the RMW region commits per topic or not at all)."""
-        if not getattr(self, "_main_runtime", None):
+        if not self._live_main_runtime():
             return  # standalone usage (no host main_runtime) — skip, not an error
         if getattr(self, "_observing_in_flight", False):
             logger.debug("FileMem: observe consolidation already in flight, skipping this spawn")
@@ -9181,7 +9642,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
             # search pool down-weights the old entry; observe() then rebuilds
             # the topic and upsert_observation's I1 supersedes the stale one.
             log_path = self.storage_dir / "consolidation_log.jsonl"
-            sp = getattr(self, "source_profile", "default")
+            sp = getattr(self, "source_profile", None)
             successes: List[Dict] = []
             for t in jobs:
                 try:
@@ -9466,7 +9927,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         ANY exception (model down / bad reference / torn write) leaves the pair
         unmerged — 不吞脏, 不静默; a bad verdict is NEVER auto-applied.
         """
-        if not getattr(self, "_main_runtime", None):
+        if not self._live_main_runtime():
             self._audit_tick_skip("main_runtime missing")
             return
         if getattr(self, "_semantic_merging", False):
@@ -9483,7 +9944,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                 return
             llm = _load_llm_caller()
             log_path = self.storage_dir / "consolidation_log.jsonl"
-            sp = getattr(self, "source_profile", "default")
+            sp = getattr(self, "source_profile", None)
             # 🟡 cross-face guard: a FRESH per-tick set so the contradiction
             # face (same tick, runs after merge) only skips pairs folded THIS
             # tick — folds from a previous tick already left the live pool
@@ -9583,7 +10044,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         leaves both rows intact (never mark stale on a broken call — a
         false-positive stale is worse than a missed one); 不吞脏.
         """
-        if not getattr(self, "_main_runtime", None):
+        if not self._live_main_runtime():
             self._audit_tick_skip("main_runtime missing")
             return
         if getattr(self, "_contradiction_scanning", False):
@@ -9600,7 +10061,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                 return
             llm = _load_llm_caller()
             log_path = self.storage_dir / "consolidation_log.jsonl"
-            sp = getattr(self, "source_profile", "default")
+            sp = getattr(self, "source_profile", None)
             marked = 0
             # 🟡 cross-face guard: skip any pair the merge face ALREADY folded
             # this tick (its loser is superseded + out of the live pool) — a
@@ -9703,7 +10164,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
             except (TypeError, ValueError):
                 age_days = 30.0
             log_path = self.storage_dir / "consolidation_log.jsonl"
-            sp = getattr(self, "source_profile", "default")
+            sp = getattr(self, "source_profile", None)
             changed = 0
             with open(log_path, "a", encoding="utf-8") as lf:
                 for mem_type in MEMORY_TYPES:
@@ -9772,7 +10233,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         expensive face, smallest budget). Fail-soft: ANY exception writes
         nothing; fragments stay in raw_pending, retry next tick (不吞脏).
         """
-        if not getattr(self, "_main_runtime", None):
+        if not self._live_main_runtime():
             self._audit_tick_skip("main_runtime missing")
             return
         if getattr(self, "_aggregating", False):
@@ -9804,7 +10265,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                 return
             llm = _load_llm_caller()
             log_path = self.storage_dir / "consolidation_log.jsonl"
-            sp = getattr(self, "source_profile", "default")
+            sp = getattr(self, "source_profile", None)
             known_ids = self._memory_id_set()
             made = 0
             for t in jobs:
@@ -9944,7 +10405,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                                 "options": ["completed", "stale", "pending"],
                                 "model_used": False,
                                 "source_profile": getattr(
-                                    self, "source_profile", "default"),
+                                    self, "source_profile", None),
                             }, ensure_ascii=False) + "\n")
                         except Exception as e:
                             logger.warning(
@@ -10004,7 +10465,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                 "reason_trivial": bool(reason_trivial),
                 "durable_hits": int(durable_hits) if durable_hits is not None else int(stats.get("durable_hits", 0)),
                 "session_id": getattr(self, "session_id", None) or "default",
-                "source_profile": getattr(self, "source_profile", "default"),
+                "source_profile": getattr(self, "source_profile", None),
             })
         except Exception as e:
             # audit hiccup must never change the recall outcome (fail-soft)
@@ -10040,7 +10501,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                 "raw_pending_overflow_count": int(raw_pending_overflow_count),
                 "miss_case_secondary_latency_ms": int(miss_case_secondary_latency_ms),
                 "session_id": getattr(self, "session_id", None) or "default",
-                "source_profile": getattr(self, "source_profile", "default"),
+                "source_profile": getattr(self, "source_profile", None),
                 "trace_id": trace_id,
             })
         except Exception as e:
@@ -10091,11 +10552,52 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                 "action": "tick_skip",
                 "reason": reason,
                 "session_id": getattr(self, "session_id", None) or "default",
-                "source_profile": getattr(self, "source_profile", "default"),
+                "source_profile": getattr(self, "source_profile", None),
             })
         except Exception as e:
             # audit hiccup must never break the tick path that scheduled it
             logger.debug(f"FileMem: tick_skip audit write failed: {e}")
+
+    def _live_main_runtime(self):
+        """Live-resolve the host main_runtime at LLM-face execution time.
+
+        Ladder (no hardcoded model names, zero custom provider config):
+          a. current self._main_runtime (no-clobber fast path);
+          b. live contextvar read via the host helper (_normalize_main_runtime);
+          c. module-level _HOST_MAIN_RUNTIME captured at register() — this is
+             the key fix: register() runs in a pre-turn moment where the
+             contextvar is empty, so the boot capture stays None forever on
+             gateway-driven profiles. By reading it NOW (at LLM-face exec
+             time, inside a live host turn where the contextvar IS published)
+             we populate it once, and every subsequent face in this process
+             hits the no-clobber fast path. This is what makes 100% hold.
+          d. None — the only legitimate skip (standalone / no host).
+
+        The resolved value is written back to self._main_runtime so every
+        downstream llm.X(self._main_runtime, ...) call in the same face body
+        sees it without re-resolving.
+        """
+        current = getattr(self, "_main_runtime", None)
+        if current:
+            return current  # no-clobber fast path (a)
+        global _HOST_MAIN_RUNTIME
+        if _normalize_main_runtime is not None:
+            try:
+                got = _normalize_main_runtime(None)
+                if got:
+                    self._main_runtime = got
+                    _HOST_MAIN_RUNTIME = got  # persist: binder success benefits all
+                    return got
+            except Exception:
+                pass
+        # (c) module fallback — on a live gateway turn this is the published
+        # runtime (set_runtime_main leaks it into the module-level contextvar
+        # via _publish_runtime_main_mirrors on the executor thread, visible to
+        # any thread that reads _RUNTIME_MAIN_CONTEXT after the publish).
+        if _HOST_MAIN_RUNTIME:
+            self._main_runtime = _HOST_MAIN_RUNTIME
+            return _HOST_MAIN_RUNTIME
+        return None
 
     def _rebind_main_runtime(self) -> None:
         """Per-tick live rebind of the host main_runtime snapshot (4d LLM 面 fix).
@@ -10183,7 +10685,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                     "action": "main_runtime_rebind",
                     "source": source,
                     "session_id": getattr(self, "session_id", None) or "default",
-                    "source_profile": getattr(self, "source_profile", "default"),
+                    "source_profile": getattr(self, "source_profile", None),
                 }
                 if resolved is not None:
                     row["provider"] = resolved.get("provider") or None
@@ -10571,7 +11073,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                 # PROPAGATE this field — it cannot probe or hardcode it). This is
                 # the field each profile's consumer hook filters on to consume only
                 # its own pending upgrades.
-                "source_profile": getattr(self, "source_profile", "default"),
+                "source_profile": getattr(self, "source_profile", None),
                 # SEC-1-1: episodic rows are session-end summaries of THIS
                 # session's user-turn drafts (G2 skips foreign authors, the G
                 # ingress gate rejects tool-dumps at capture) -> auto-catch
@@ -10594,6 +11096,292 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
             logger.info(f"FileMem: episodic entry written for {session_id} ({len(drafts)} drafts, status={entry['status']})")
         except Exception as e:
             logger.warning(f"FileMem: episodic write failed: {e}")
+
+    # ── BRINGBACK P1: last-closed-session stamp (per-profile, central store) ──
+    # 中央池 + 逻辑戳模型（owner 2026-10-10 定稿）：不拆 per-profile 目录，戳落在
+    # 单一 last_closed_sessions.jsonl（append-only），行级 source_profile 戳 + 读时按
+    # profile 过滤 = "per-profile" 语义，跨 profile 永不带回（A 方案，防串 profile）。
+    # 纯 on_session_end 事件驱动，零 cron/timer（owner 红线）。
+
+    def _last_closed_stamp_path(self) -> Optional[Path]:
+        """Central last-closed stamp file. None when no storage_dir (never
+        initialize()'d / fixture shell) — the bring-back face degrades to
+        'no leg' and must never raise into the session-end path."""
+        sd = getattr(self, "storage_dir", None)
+        if sd is None:
+            return None
+        try:
+            sd = Path(sd)
+        except Exception:
+            return None
+        return sd / "last_closed_sessions.jsonl"
+
+    def _record_last_closed_session(self, session_id: str) -> None:
+        """P1: append one {session_id, closed_ts, source_profile} line at
+        session end. Runs UNCONDITIONALLY (zero-draft sessions close too —
+        they are the common production case, and their closed-session id is
+        exactly what a later bring-back wants to point at). Fail-soft: a disk
+        hiccup must never break on_session_end (the rest of the end-flow,
+        incl. the consolidation spawn, already ran)."""
+        p = self._last_closed_stamp_path()
+        if p is None or not session_id:
+            return
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with self._shard_lock(p):
+                with open(p, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "session_id": session_id,
+                        "closed_ts": _utcnow().isoformat(),
+                        "source_profile": getattr(self, "source_profile", None),
+                    }, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.warning(f"FileMem: last_closed_session stamp write failed: {e}")
+
+    def _last_closed_session_for_profile(self,
+                                         exclude_session_id: Optional[str] = None,
+                                         ) -> Optional[str]:
+        """P1 read: the most-recent CLOSED session id for THIS profile,
+        excluding the current one (a just-started session must not bring back
+        itself). Returns None (bring-back leg degrades to off) when: no
+        storage_dir, unreadable file, no profile-matching row, or the only
+        match is the excluded current session. Per-profile filter = the row's
+        source_profile must equal the current provider's source_profile; a
+        None-stamp (neutral) row only matches a None current profile, so a
+        stamped profile never pulls in another profile's closed session
+        (A: 保持不串 profile)."""
+        p = self._last_closed_stamp_path()
+        if p is None:
+            return None
+        if not p.exists():
+            return None
+        cur_sp = getattr(self, "source_profile", None)
+        try:
+            best: Optional[Dict[str, Any]] = None
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue  # P1-3 fail-soft: a corrupt line is skipped, not fatal
+                    if not isinstance(row, dict):
+                        continue
+                    if row.get("session_id") in (None, exclude_session_id):
+                        continue
+                    if row.get("source_profile") != cur_sp:
+                        continue  # per-profile: only this profile's closed sessions
+                    if best is None or (row.get("closed_ts") or "") > (best.get("closed_ts") or ""):
+                        best = row
+            if best is None:
+                return None
+            return best.get("session_id")
+        except Exception as e:
+            logger.warning(f"FileMem: last_closed_session read failed: {e}")
+            return None
+
+    # ── BRINGBACK P2/P3/P4: bring-back selector + resolve ─────────────────────
+    # Selector persistence (P4): per-session choice, NOT cross-session — a fresh
+    # session re-asks (owner: user-choose is per-session). "clean start" and
+    # "confirmed-global-only" both land on G3 (leg off); only "bring back" (G2)
+    # turns the leg on.
+
+    def _bringback_choice_path(self, session_id: str) -> Optional[Path]:
+        """storage_dir/bringback_{sid}.json — per-session bring-back choice."""
+        sd = getattr(self, "storage_dir", None)
+        if sd is None or not session_id:
+            return None
+        try:
+            sd = Path(sd)
+        except Exception:
+            return None
+        return sd / f"bringback_{session_id}.json"
+
+    def _set_bringback_choice(self, session_id: str, choice: str) -> None:
+        """P4: persist the user's bring-back choice for THIS session only.
+        3-value choice (owner 2026-10-10, B2-A): 'bring_back' (pin the previous
+        session's confirmed rows to the TOP of the auto face), 'clean_start'
+        (V2 default: confirmed global skeleton + current-session rows), or
+        'fresh' (this session injects NOTHING on the auto face — even the
+        confirmed global skeleton is folded out; the SEARCH face is unaffected).
+        Any unrecognized value degrades to 'clean_start' (fail-soft to V2)."""
+        valid = ("bring_back", "clean_start", "fresh")
+        if choice not in valid:
+            choice = "clean_start"
+        p = self._bringback_choice_path(session_id)
+        if p is None:
+            return
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"session_id": session_id, "choice": choice,
+                           "ts": _utcnow().isoformat()}, f, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"FileMem: bringback choice write failed: {e}")
+
+    def _get_bringback_choice(self, session_id: Optional[str]) -> str:
+        """P4 read: default 'clean_start' (== V2 two-leg behavior) when the file
+        is absent/unreadable, the session is unresolvable, or the file carries
+        an unrecognized value — fail-soft toward the default, never a crash,
+        never 'fresh' (a missing choice must not silently empty the auto face)."""
+        p = self._bringback_choice_path(session_id or "")
+        if p is None:
+            return "clean_start"
+        try:
+            if not p.exists():
+                return "clean_start"
+            data = json.loads(p.read_text(encoding="utf-8"))
+            choice = data.get("choice")
+            if choice in ("bring_back", "clean_start", "fresh"):
+                return choice
+            # Back-compat: pre-3-value files stored boolean bring_back.
+            if isinstance(data.get("bring_back"), bool):
+                return "bring_back" if data["bring_back"] else "clean_start"
+            return "clean_start"
+        except Exception:
+            return "clean_start"
+
+    def _has_bringback_choice(self, session_id: str) -> bool:
+        """P4: True when ANY choice was recorded for this session (the choice
+        file exists) — used to suppress the one-shot footer AFTER the user has
+        answered (any of the three; all are an answered state)."""
+        p = self._bringback_choice_path(session_id)
+        if p is None:
+            return False
+        try:
+            return p.exists()
+        except Exception:
+            return False
+
+    def _bringback_fresh(self, session_id: Optional[str]) -> bool:
+        """P4 'fresh' selector: True when this session was explicitly chosen
+        'fresh' — the auto-inject face is folded to EMPTY for the session
+        (even the confirmed global skeleton is not auto-injected). The SEARCH
+        face (filemem_search / M4) is UNAFFECTED — 'fresh' means 'don't
+        auto-pump', never 'unretrievable' (owner: 全新 ≠ 失联)."""
+        sid = session_id or getattr(self, "session_id", None)
+        if not sid:
+            return False
+        return self._get_bringback_choice(sid) == "fresh"
+
+    def _bringback_reorder_key(self, row: Any,
+                               pin_session_id: Optional[str]) -> int:
+        """B2-A: when the user chose 'bring_back', pin the previous session's
+        confirmed rows to the TOP of the auto-inject result (sort key 0), all
+        other surviving rows below (sort key 1). This is a REORDERING, not a
+        collection predicate — the row set is unchanged from V2 (a confirmed
+        previous-session row is already kept by the confirmed-global leg, so
+        this adds no rows and removes none; it only surfaces the continuity
+        context first). pin_session_id=None -> every row keys to 1 (no
+        reorder, == clean_start ordering)."""
+        try:
+            if pin_session_id is not None \
+                    and isinstance(row, dict) \
+                    and row.get("session_id") == pin_session_id \
+                    and ((row.get("metadata") or {}).get("confirmed")):
+                return 0
+        except Exception:
+            pass
+        return 1
+
+    def _resolve_bringback_session_id(self,
+                                       session_id: Optional[str]) -> Optional[str]:
+        """P2: the bring-back leg's target — the previous closed session's id,
+        ONLY when (a) the user chose 'bring back' THIS session AND (b) a
+        per-profile last_closed_session stamp exists (excluding the current
+        session). Otherwise None -> leg off -> behavior == V2 two-leg (no
+        regression). The profile isolation is inherited from P1's
+        _last_closed_session_for_profile (row's source_profile must match), so
+        a stamped profile never pulls another profile's closed session
+        (owner A: 保持不串 profile)."""
+        sid = session_id or getattr(self, "session_id", None)
+        if not sid:
+            return None
+        # Only the 'bring_back' choice pins a previous session; 'clean_start'
+        # and 'fresh' both leave the reorder off (return None -> no pin).
+        if self._get_bringback_choice(sid) != "bring_back":
+            return None
+        return self._last_closed_session_for_profile(exclude_session_id=sid)
+
+    # ── BRINGBACK P3: one-shot clarify footer (rides the live auto face) ──────
+    # The provider CANNOT synchronously call `clarify` (the engine drops
+    # on_session_end / post_llm_call returns; the model is the clarify caller).
+    # So the footer is text appended to the FIRST non-trivial prefetch of a
+    # session, directing the model to resolve the user's choice via clarify and
+    # then persist it with filemem_set_bringback (P4). One-shot per session via
+    # a session-keyed gate (mirrors _pending_drafts_notified). Fail-soft: no
+    # bring-back target or already-asked or no storage_dir => "" (context
+    # untouched) — a foot-degradation must never raise into the prefetch face.
+
+    def _bringback_footer_state(self) -> Dict[str, bool]:
+        """Session-keyed one-shot gate for the bring-back footer (in-memory).
+        A cached provider is reused across sessions, so 'asked once' must be
+        keyed by session_id, not by instance."""
+        st = getattr(self, "_bringback_footer_asked", None)
+        if not isinstance(st, dict):
+            st = {}
+            self._bringback_footer_asked = st
+        return st
+
+    def _mark_bringback_footer_asked(self, session_id: str) -> None:
+        st = self._bringback_footer_state()
+        sid = session_id or getattr(self, "session_id", None)
+        if sid:
+            st[sid] = True
+
+    def _bringback_clarify_footer(self, session_id: str) -> str:
+        """Return the one-shot bring-back footer for THIS session's first
+        non-trivial prefetch, or '' when: already asked (one-shot gate), a
+        bring-back choice was already recorded for this session (idempotent —
+        never re-ask), or no per-profile last_closed stamp to offer.
+
+        THREE choices (owner 2026-10-10, B2-A + fresh option), mapped to
+        filemem_set_bringback choice values:
+          1) bring_back   — 接着刚才干：把上一个 session 的 confirmed 摘要【置顶】
+                            本次 auto 面（排序，不新增行；收行仍 V2 两腿）
+          2) clean_start  — 不接着刚才：只留全局确认骨架 + 当前 session 行（V2 现状）
+          3) fresh        — 全新：本 session 彻底不自动注入（连 confirmed 骨架也
+                            折出）；检索面不受影响（全新 ≠ 失联，search 仍能全捞）
+
+        NOTE (B1): the footer rides the RETURN string of the live prefetch
+        face, and MUST NOT be part of the P3 snapshot that gets frozen for
+        cold-start replay — a frozen footer would re-fire on every cold start.
+        The snapshot is written BEFORE the footer is appended (see prefetch).
+        """
+        sid = session_id or getattr(self, "session_id", None)
+        if not sid:
+            return ""
+        st = self._bringback_footer_state()
+        if st.get(sid, False):
+            return ""  # already asked this session (one-shot held)
+        if self._has_bringback_choice(sid):
+            return ""  # user already answered THIS session (any of 3 choices;
+                      # answered state, one-shot held)
+        prev_sid = self._last_closed_session_for_profile(exclude_session_id=sid)
+        if prev_sid is None:
+            return ""  # no per-profile last_closed stamp -> nothing to bring back
+        st[sid] = True  # mark asked NOW so a re-fetch this turn does not re-fire
+        return (
+            "\n\n---\n🔁 [带回账本] 上一个 session（"
+            f"{prev_sid}）已关闭。本次 session 的自动注入面如何处理？"
+            "请用 clarify 问用户一次（三个选项）：\n"
+            "  1) 带回 — 接着刚才干，把上一个 session 确认过（confirmed）的摘要"
+            "【置顶】本次自动注入（只改排序、不新增行；收行仍是 V2 两腿）\n"
+            "     → 用 filemem_set_bringback(choice=\"bring_back\", "
+            "session_id=...) 落选\n"
+            "  2) 干净开局 — 不接着刚才，只留全局确认骨架 + 当前 session 行"
+            "（= V2 现状）\n"
+            "     → 用 filemem_set_bringback(choice=\"clean_start\", "
+            "session_id=...) 落选\n"
+            "  3) 全新 — 本 session 彻底不自动注入（连全局确认骨架也不带）；"
+            "检索面（filemem_search）仍全捞，全新 ≠ 失联\n"
+            "     → 用 filemem_set_bringback(choice=\"fresh\", session_id=...) 落选\n"
+            "不变式：检索面始终能跨 session 全捞，本选择只控制“要不要自动灌/带什么”，"
+            "不控制“能不能拿到”。\n"
+            "用户不答时按 fail-soft 默认“干净开局”（= V2 现状，不置顶、不折骨架）。"
+        )
 
 
 # ── Auto-Retrieve Hook ───────────────────────────────────────────────────────────
@@ -10697,6 +11485,27 @@ def filemem_auto_catch(session_id: str, user_message: str, assistant_response: s
     try:
         # Use cached provider instance (solution 2)
         provider = _get_cached_provider(session_id)
+        # LLM 100% 绑定: post_llm_call runs on the live turn thread AFTER
+        # build_turn_context published the main runtime into the contextvar.
+        # register() captured too early (~100ms before publish -> empty
+        # contextvar), so _HOST_MAIN_RUNTIME stayed None and the
+        # consolidation tick thread's LLM faces kept dead-skipping.
+        # Live-read NOW (post-turn moment) + write back to the module
+        # variable: every tick thread that calls _live_main_runtime()
+        # hits the module fallback (level c) 100%.
+        global _HOST_MAIN_RUNTIME
+        if _normalize_main_runtime is not None:
+            try:
+                live_rt = _normalize_main_runtime(None)
+                if live_rt:
+                    _HOST_MAIN_RUNTIME = live_rt
+                    provider._main_runtime = live_rt
+                    logger.info(
+                        "FileMem: captured host main_runtime from post_llm_call "
+                        f"(provider={live_rt.get('provider')!r}, "
+                        f"model={live_rt.get('model')!r})")
+            except Exception:
+                pass  # fail-soft: a hiccup never breaks the post_llm_call face
         _refresh_provider_llm_ctx(provider)  # S1b F3
 
         # Use last few messages for catch
@@ -10763,21 +11572,27 @@ def register(ctx) -> None:
     # today's exact _llm_ctx-None skip semantics; nothing errors), and an
     # absent host helper (older build) is a no-op.
     global _HOST_MAIN_RUNTIME
-    _HOST_MAIN_RUNTIME = None
-    if _normalize_main_runtime is not None:
-        try:
-            _HOST_MAIN_RUNTIME = _normalize_main_runtime(None) or None
-            if _HOST_MAIN_RUNTIME is not None:
-                logger.info(
-                    "FileMem: captured host main_runtime snapshot "
-                    f"(provider={_HOST_MAIN_RUNTIME.get('provider')!r}, "
-                    f"model={_HOST_MAIN_RUNTIME.get('model')!r})")
-            else:
-                logger.info("FileMem: no host main_runtime snapshot "
-                            "(standalone / pre-turn) -> LLM faces keep "
-                            "skip semantics")
-        except Exception as e:
-            logger.warning(f"FileMem: main_runtime snapshot failed: {e}")
+    # no-clobber: register() runs every LLM turn (~100ms BEFORE
+    # build_turn_context publishes the runtime into the contextvar), so an
+    # unconditional `_HOST_MAIN_RUNTIME = None` would erase what the
+    # post_llm_call hook just successfully wrote back. Use
+    # _live_main_runtime() (4-level ladder: current -> live-read -> module
+    # -> None): in a live gateway the module-level var is populated by
+    # post_llm_call on the previous turn, so this returns non-None and the
+    # `no-snapshot` log stops firing. Standalone (no module value, no live
+    # contextvar) still falls through to None -> the log fires once.
+    resolved = provider._live_main_runtime()
+    if resolved is not None:
+        _HOST_MAIN_RUNTIME = resolved
+        provider._main_runtime = resolved
+        logger.info(
+            "FileMem: captured host main_runtime snapshot "
+            f"(provider={resolved.get('provider')!r}, "
+            f"model={resolved.get('model')!r})")
+    else:
+        logger.info("FileMem: no host main_runtime snapshot "
+                    "(standalone / pre-turn) -> LLM faces keep "
+                    "skip semantics")
 
     # Mirror the B3 _llm_ctx binding: the 'default' instance may have been
     # created/cached BEFORE the snapshot (e.g. an earlier hook face in this
