@@ -67,6 +67,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from __init__ import (  # noqa: E402
     FileMemProvider,
     _auto_inject_eligible,
+    _normalize_profile_stamp,
 )
 
 
@@ -513,3 +514,98 @@ def test_fresh_end_to_end_prefetch_empties_auto_face_keeps_search(tmp_path):
     assert any(r.get("content") == "confirmed core fact" for r in found), (
         "fresh choice must not touch the search face: the row stays "
         f"retrievable via search_memories (got {len(found)} rows)")
+
+
+# ── (7) G1: P3 replay path ALSO fires the one-shot footer (owner 2026-10-11,
+#       reviewer round-3 gap) ─────────────────────────────────────────────────
+
+
+def test_g1_p3_replay_path_fires_footer_end_to_end(tmp_path):
+    """END-TO-END P3 cold-start replay + bring-back footer.
+
+    A re-initialized provider (fresh instance, _p3_replay_armed=False) for a
+    session that already has a frozen snapshot + matching .tokens + a
+    per-profile last_closed stamp: prefetch() takes the P3 replay branch
+    (L3147) and, per the B1-sister fix, MUST surface the one-shot footer on
+    the RETURN face while the frozen snapshot bytes stay footer-free.
+
+    One-shot proof: the FIRST prefetch's footer is re-fired exactly once — a
+    SECOND prefetch (ordinary path, snapshot now re-armed) does NOT re-ask
+    (session-keyed gate held). Without the replay-branch footer fix, a session
+    that cold-starts through P3 replay would NEVER surface the bring-back
+    question (the footer was only appended on the ordinary-prefetch tail).
+    """
+    p = _make_provider(tmp_path, sid="s_replay", profile="default")
+    # A real prior closed session for THIS profile (the bring-back target).
+    p_prev = _make_provider(tmp_path, sid="s_prev", profile="default")
+    p_prev.session_id = "s_prev"
+    p_prev._record_last_closed_session("s_prev")
+
+    # Pre-freeze a P3 snapshot WITHOUT footer (B1 ordering) + a .tokens that
+    # matches the upcoming query so the Jaccard gate lets the replay through.
+    p._last_recall_query = "replay fact"
+    p._save_injected_snapshot("s_replay", "[fact] replay fact content")
+    snap_path = p._injected_snapshot_path("s_replay")
+    # Confirm the snapshot file itself carries no footer opener (B1).
+    assert snap_path is not None and "带回账本" not in snap_path.read_text(encoding="utf-8")
+    # A fresh provider shell -> _p3_replay_armed is unset (False) -> replay
+    # branch is live. The query must Jaccard-match the frozen .tokens.
+    ctx1 = p.prefetch("replay fact", session_id="s_replay")
+    # G1 assertion ①: the replay path's return face surfaces the footer:
+    assert "带回账本" in ctx1, (
+        f"P3 replay path must fire the bring-back footer on the return face; "
+        f"got: {ctx1!r}")
+    # B1 invariant: the on-disk snapshot was re-frozen WITHOUT the footer
+    # (the footer only rides the return face, never the frozen block).
+    assert "带回账本" not in snap_path.read_text(encoding="utf-8")
+    # G1 assertion ②: one-shot — a SECOND prefetch for the same session does
+    # NOT re-fire the footer (session-keyed gate held by the first call).
+    ctx2 = p.prefetch("replay fact", session_id="s_replay")
+    assert "带回账本" not in ctx2, (
+        "footer must be one-shot per session: second prefetch must not "
+        f"re-ask; got: {ctx2!r}")
+
+
+def test_g1_replay_footer_absent_without_last_closed_stamp(tmp_path):
+    """P3 replay with NO per-profile last_closed stamp: the replay path's
+    return face must NOT carry the footer (no target -> footer '' -> plain
+    replay block). The P3 replay branch still returns the frozen snapshot
+    (the snapshot bytes themselves never contain the footer)."""
+    p = _make_provider(tmp_path, sid="s_replay", profile="default")
+    # No _record_last_closed_session call anywhere -> no target.
+    p._last_recall_query = "replay fact"
+    p._save_injected_snapshot("s_replay", "[fact] replay fact content")
+    ctx = p.prefetch("replay fact", session_id="s_replay")
+    assert "replay fact" in ctx            # the recall block itself replays
+    assert "带回账本" not in ctx            # but no footer (no target)
+
+
+# ── (8) G2: _normalize_profile_stamp unit (owner 2026-10-11, reviewer round-3)
+#       — pin '不抬 None 成 default / 不跨 profile' ─────────────────────────
+
+
+def test_g2_normalize_falsy_to_neutral_none():
+    """None and "" both normalize to the single NEUTRAL sentinel None (they are
+    the same 'no named profile' condition) — this is the write/read asymmetry
+    the owner asked to eliminate."""
+    assert _normalize_profile_stamp(None) is None
+    assert _normalize_profile_stamp("") is None
+    assert _normalize_profile_stamp("   ") is None   # whitespace-only = falsy
+
+
+def test_g2_normalize_never_promotes_to_default():
+    """NEUTRAL (None / "") must NEVER be promoted to a named 'default' —
+    owner red-line: 不抬成 default, 守不串 profile."""
+    assert _normalize_profile_stamp(None) != "default"
+    assert _normalize_profile_stamp("") != "default"
+    assert _normalize_profile_stamp(None) is None
+
+
+def test_g2_normalize_named_profiles_preserved():
+    """Named profile values pass through unchanged (no 串, no case-mangling)."""
+    assert _normalize_profile_stamp("coder") == "coder"
+    assert _normalize_profile_stamp("default") == "default"
+    assert _normalize_profile_stamp("orchestrator") == "orchestrator"
+    # A named value is NOT collapsed to None:
+    assert _normalize_profile_stamp("coder") is not None
+    assert _normalize_profile_stamp("default") is not None

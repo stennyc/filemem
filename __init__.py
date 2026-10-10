@@ -368,6 +368,32 @@ def ingress_reject_class(content: Optional[str],
 # lock the host.
 
 
+def _normalize_profile_stamp(value: Optional[str]) -> Optional[str]:
+    """Owner 2026-10-10: unify the write/read profile-stamp asymmetry for the
+    last-closed-session stamp (BRINGBACK P1). The write side persists
+    ``self.source_profile`` (which can be None when the host passes a base
+    home that ``_resolve_profile_name`` cannot resolve to a named profile),
+    while the read side compares against the CURRENT provider's
+    ``source_profile``. A strict ``None != "default"`` mismatch (when one side
+    is None and the other is a named value) would fold a legitimate same-
+    profile stamp out and the bring-back footer would never fire.
+
+    Normalization collapses FALSY values (None / "") to the single neutral
+    sentinel ``None`` (kept as None, NOT promoted to a named "default") so the
+    write and read sides share one comparison base. NEUTRAL (None) stays
+    distinct from any NAMED profile: this mirrors the V2 Fix-2 invariant that
+    a neutral row is cross-profile-visible, and a stamped foreign profile
+    (e.g. 'coder' vs current 'default') is still cut — the neutral relaxation
+    NEVER promotes None to a named value (owner: 不抬成 default, 守不串 profile).
+
+    Pure function, zero I/O, zero side effects.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
 def _resolve_session_profile(fallback_profile: Optional[str] = None) -> Optional[str]:
     """P0-2: the CURRENT session's owning profile, provided by the HOST.
 
@@ -3144,7 +3170,21 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     logger.info(
                         f"FileMem: P3 cold-start replay for session={session_id} "
                         f"({len(_snap)} chars isolation-gated block)")
-                    return self._pending_draft_notice(_snap, session_id=session_id)
+                    # BRINGBACK P3 (B1-sister fix, owner 2026-10-10): the
+                    # one-shot clarify footer MUST also ride this replay path's
+                    # return face. The snapshot was already re-frozen at
+                    # L3141 (footer stays OUT of the frozen block — B1), so
+                    # appending it here is safe: it only reaches the visible
+                    # face, never re-enters a cold-start replay. Idempotent via
+                    # the session-keyed one-shot gate (already-asked / answered
+                    # / no-target all yield ''), so a later ordinary prefetch
+                    # for the same session does NOT re-fire. Without this, the
+                    # footer was only appended on the ordinary-prefetch tail
+                    # (L3537), and a session that cold-starts through the P3
+                    # replay branch would NEVER surface the bring-back question.
+                    return self._pending_draft_notice(
+                        _snap + self._bringback_clarify_footer(session_id),
+                        session_id=session_id)
                 # Every line cut by isolation: fall through to a live
                 # re-prefetch (0-hit or a freshly-scoped pool), which re-freezes
                 # a correct block at the tail. The stale frozen block is
@@ -11133,7 +11173,10 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                     f.write(json.dumps({
                         "session_id": session_id,
                         "closed_ts": _utcnow().isoformat(),
-                        "source_profile": getattr(self, "source_profile", None),
+                        # ② 归一化（owner 2026-10-10）：存归一后的中性值（None 而非
+                        # ""），与读侧 _normalize_profile_stamp 共用同一比较基准。
+                        "source_profile": _normalize_profile_stamp(
+                            getattr(self, "source_profile", None)),
                     }, ensure_ascii=False) + "\n")
         except Exception as e:
             logger.warning(f"FileMem: last_closed_session stamp write failed: {e}")
@@ -11146,16 +11189,18 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         itself). Returns None (bring-back leg degrades to off) when: no
         storage_dir, unreadable file, no profile-matching row, or the only
         match is the excluded current session. Per-profile filter = the row's
-        source_profile must equal the current provider's source_profile; a
-        None-stamp (neutral) row only matches a None current profile, so a
-        stamped profile never pulls in another profile's closed session
-        (A: 保持不串 profile)."""
+        source_profile (归一化) must equal the current provider's source_profile
+        (归一化) — both sides run through _normalize_profile_stamp so a
+        write-side None / read-side "" never mismatch. A None-stamp (neutral)
+        row matches a None current profile (neutral stays visible to neutral,
+        NOT to a named profile — owner: 不串 profile); a stamped foreign row
+        (e.g. 'coder') is cut by a 'default' reader."""
         p = self._last_closed_stamp_path()
         if p is None:
             return None
         if not p.exists():
             return None
-        cur_sp = getattr(self, "source_profile", None)
+        cur_sp = _normalize_profile_stamp(getattr(self, "source_profile", None))
         try:
             best: Optional[Dict[str, Any]] = None
             with open(p, "r", encoding="utf-8") as f:
@@ -11171,7 +11216,12 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                         continue
                     if row.get("session_id") in (None, exclude_session_id):
                         continue
-                    if row.get("source_profile") != cur_sp:
+                    # ② 归一化读侧：行级 source_profile 与当前 provider 的 source_profile
+                    # 都过 _normalize_profile_stamp 后比较，消除写/读两侧 falsy 不一致
+                    # （None vs ""）。NEUTRAL（None）行只对 NEUTRAL 当前 profile 可见，
+                    # 具名 profile（coder/default）仍严格 per-profile（守不串 profile）。
+                    row_sp = _normalize_profile_stamp(row.get("source_profile"))
+                    if row_sp != cur_sp:
                         continue  # per-profile: only this profile's closed sessions
                     if best is None or (row.get("closed_ts") or "") > (best.get("closed_ts") or ""):
                         best = row
