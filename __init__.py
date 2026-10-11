@@ -11679,6 +11679,70 @@ def filemem_kanban_unsettle(task_id: str = None, **kw: Any) -> None:
         logger.debug(f"FileMem: kanban unsettle no-op/failed: {e}")
 
 
+def _ensure_memory_toolset() -> None:
+    """Self-heal: ensure the built-in ``memory`` toolset is present in every
+    SAVED ``platform_toolsets.<platform>`` list of the active profile.
+
+    Host mechanics (verified 2026-10-11): filemem's tools are injected via
+    the MemoryProvider protocol (``get_tool_schemas``), and the host's
+    injection gate (``agent/memory_manager.py``
+    ``memory_provider_tools_enabled``) is bound to the BUILT-IN ``memory``
+    toolset — not to any ``filemem`` toolset key (``resolve_toolset('filemem')
+    -> []``, the key does not exist in the host toolset namespace). A profile
+    whose saved ``platform_toolsets`` list omits ``memory`` therefore withholds
+    ALL filemem provider tools for that platform (log line: "the 'memory'
+    toolset is gated off ... provider tools and system-prompt block are both
+    withheld").
+
+    Runs at register() time (plugin enabled). Idempotent + host-guarded:
+    - only platforms with a SAVED list are touched (no-saved-list platforms
+      already expose toolsets by default; seeding one would replace the core
+      composite — same guard as the host ``_toggle_plugin_toolset``);
+    - writes only when something was actually appended;
+    - goes through the host ``load_config``/``save_config`` (config lock +
+      atomic write), so it never races other config writers.
+    Fail-soft: any host-module absence (standalone interpreter), permission
+    failure (managed install) or parse error logs a warning and returns —
+    register() must never crash on this.
+    """
+    try:
+        from hermes_cli.config import load_config, save_config
+        from hermes_cli.toolset_validation import parse_platform_toolsets_value
+    except Exception as e:
+        logger.warning("FileMem: memory-toolset self-heal skipped (host config API unavailable): %s", e)
+        return
+    try:
+        config = load_config()
+        platform_toolsets = config.get("platform_toolsets")
+        if not isinstance(platform_toolsets, dict):
+            return  # no saved selection anywhere: default composite, nothing to heal
+        # Mutate -> save -> log; a FAILED save rolls the in-memory dict back so
+        # it never claims what the disk does not have (fail-soft, no crash).
+        plan = []
+        for platform, raw in list(platform_toolsets.items()):
+            ts_list = parse_platform_toolsets_value(raw)
+            if ts_list is not None and "memory" not in ts_list:
+                plan.append((platform, ts_list))
+        if not plan:
+            return
+        for platform, ts_list in plan:
+            ts_list.append("memory")
+            platform_toolsets[platform] = ts_list
+        try:
+            save_config(config)
+        except Exception:
+            for platform, ts_list in plan:
+                ts_list.remove("memory")
+                platform_toolsets[platform] = ts_list
+            raise
+        for platform, _ts in plan:
+            logger.info(
+                "FileMem: added built-in 'memory' toolset to platform_toolsets.%s "
+                "(provider tool injection gate)", platform)
+    except Exception as e:
+        logger.warning("FileMem: memory-toolset self-heal failed (left config untouched): %s", e)
+
+
 def register(ctx) -> None:
     """Register filemem as a memory provider with hooks."""
     global _HOST_LLM_CTX
@@ -11747,6 +11811,12 @@ def register(ctx) -> None:
     # Register as memory provider
     ctx.register_memory_provider(provider)
     logger.info("FileMem: registered memory provider")
+
+    # Memory-toolset self-heal (2026-10-11): the host gates external-provider
+    # tool injection on the BUILT-IN 'memory' toolset being present in the
+    # platform's saved platform_toolsets list. Append it idempotently so a
+    # profile lacking it never withholds filemem's tools (fail-soft).
+    _ensure_memory_toolset()
 
     # Register hooks
     ctx.register_hook("pre_llm_call", filemem_auto_retrieve)
