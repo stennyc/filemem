@@ -412,6 +412,95 @@ def test_import_audit_build_graph():
     assert not bad2, f"search_index.py gained non-stdlib imports: {bad2}"
 
 
+# ── graph_status: read-only freshness verdict (missing/fresh/stale) ──────
+def test_graph_status_missing_fresh_stale(tmp_path):
+    """graph_status (the --check backend) reports the three states and is
+    read-only (never writes graph.json nor a .bak)."""
+    rows = [
+        _mem("m1", "alpha beta gamma", "2026-09-28T10:00:00"),
+        _mem("m2", "alpha delta epsilon", "2026-09-29T10:00:00"),
+    ]
+    root = _write_root(tmp_path / "r", rows)
+
+    # missing: no graph.json yet
+    v = bg.graph_status(root)
+    assert v["status"] == "missing"
+    assert v["stored"] is None
+    assert isinstance(v["current"]["node_count"], int)
+    assert not (root / "graph.json").exists()
+    assert not (root / "graph.json.bak").exists()  # read-only, never a .bak
+
+    # build -> now fresh (fingerprint matches)
+    bg.build_and_write(root)
+    v = bg.graph_status(root)
+    assert v["status"] == "fresh", v
+    assert v["stored"]["fingerprint"] == v["current"]["fingerprint"]
+
+    # mutate corpus -> stale
+    more = root / "memories" / "fact.json"
+    data = json.loads(more.read_text(encoding="utf-8"))
+    data.append(_mem("m3", "zulu yankee xray", "2026-09-30T10:00:00"))
+    more.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    v = bg.graph_status(root)
+    assert v["status"] == "stale", v
+    assert v["current"]["node_count"] > v["stored"]["node_count"]
+    assert v["current"]["fingerprint"] != v["stored"]["fingerprint"]
+
+
+def test_graph_status_corrupt_treated_as_missing(tmp_path):
+    """A corrupt graph.json (bad JSON) degrades to 'missing' (fail-soft),
+    matching the search face's two-axis reading."""
+    root = _write_root(tmp_path / "r",
+                       [_mem("m1", "alpha beta gamma", "2026-09-28T10:00:00")])
+    (root / "graph.json").write_text("{corrupt", encoding="utf-8")
+    v = bg.graph_status(root)
+    assert v["status"] == "missing"
+    assert v["stored"] is None
+
+
+# ── provider _graph_freshness: O(1) mtime verdict (hot-path probe) ───────
+def test_provider_graph_freshness_mtime(tmp_path):
+    """_graph_freshness is a pure mtime probe: missing / fresh / stale, and
+    it NEVER triggers a rebuild (hint-only, owner rule: no auto-trigger)."""
+    p = _provider_over(_write_root(tmp_path / "r", [
+        _mem("m1", "alpha beta gamma", "2026-09-28T10:00:00")]))
+
+    # no graph.json -> missing
+    assert p._graph_freshness() == {"status": "missing"}
+
+    # build a graph now -> graph mtime >= corpus mtime -> fresh
+    bg.build_and_write(p.storage_dir)
+    assert p._graph_freshness()["status"] == "fresh"
+
+    # touch a memory file NEWER than the graph -> stale (corpus drifted)
+    import os
+    graph_path = p.storage_dir / "graph.json"
+    g_mt = graph_path.stat().st_mtime
+    mem = p.storage_dir / "memories" / "fact.json"
+    os.utime(mem, (g_mt + 5, g_mt + 5))
+    assert p._graph_freshness()["status"] == "stale"
+    # the graph.json on disk is UNTOUCHED by the probe (read-only)
+    assert p._load_graph() is not None
+
+
+def test_search_envelope_carries_graph_field(tmp_path):
+    """filemem_search's return envelope now carries a `graph` key. Fresh ->
+    no hint line (silent); stale -> one-line hint pointing at build_graph."""
+    p = _provider_over(_write_root(tmp_path / "r", [
+        _mem("m1", "alpha beta gamma", "2026-09-28T10:00:00")]))
+
+    # missing graph: envelope has graph.status=missing + a hint
+    env = json.loads(p._tool_search({"query": "alpha"}))
+    assert env["graph"]["status"] == "missing"
+    assert "build_graph" in env["graph"].get("hint", "")
+
+    # fresh graph: silent (no hint key)
+    bg.build_and_write(p.storage_dir)
+    env = json.loads(p._tool_search({"query": "alpha"}))
+    assert env["graph"]["status"] == "fresh"
+    assert "hint" not in env["graph"]
+
+
 if __name__ == "__main__":
     for fn in (test_fixture_temporal_edge, test_fixture_semantic_edge,
                test_fixture_cooccurrence_edge,
@@ -419,6 +508,10 @@ if __name__ == "__main__":
                test_graph_axis_empty_and_corrupt_fail_soft,
                test_indirect_association_recall_via_1hop,
                test_no_graph_equals_two_axis_behavior,
-               test_guardrail_caps, test_config_keys_synced):
+               test_guardrail_caps, test_config_keys_synced,
+               test_graph_status_missing_fresh_stale,
+               test_graph_status_corrupt_treated_as_missing,
+               test_provider_graph_freshness_mtime,
+               test_search_envelope_carries_graph_field):
         fn()
         print("ok", fn.__name__)

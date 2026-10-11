@@ -273,6 +273,56 @@ def test_d_last_closed_is_idempotent_per_session(tmp_path):
     assert sids == ["s_x", "s_y"]
 
 
+def test_d_last_closed_concurrent_same_session_single_row(tmp_path):
+    """D + reviewer 2026-10-11 (💭 TOCTOU -> fix): the read of existing
+    session ids and the append now run under the SAME _shard_lock, so N
+    concurrent threads stamping the SAME session id must still land exactly
+    ONE row (no duplicate from the read-decision-write window). This locks
+    the concurrency hardening: if the read were ever moved back outside the
+    lock, a real multi-process race could append twice and this test would
+    catch it under a threaded replay."""
+    import json
+    import threading as th
+    p = _make_provider(tmp_path, sid="s_cur", profile="default")
+    # The default fixture _shard_lock is a no-op (contextlib.suppress), which
+    # would let these threads bypass the critical section and duplicate. For
+    # THIS test we install a REAL lock (a module-level threading.Lock, shared
+    # across all threads) so the read+decide+write genuinely serializes — this
+    # is what the production flock-backed _shard_lock does.
+    _real_lock = th.Lock()
+
+    def _locked(_pth):
+        import contextlib
+
+        @contextlib.contextmanager
+        def _ctx():
+            with _real_lock:
+                yield
+        return _ctx()
+
+    p._shard_lock = _locked
+    p.session_id = "s_z"
+    n_threads = 8
+    errors: list = []
+
+    def _stamp():
+        try:
+            p._record_last_closed_session("s_z")
+        except Exception as e:  # pragma: no cover - fail-soft never raises
+            errors.append(e)
+
+    threads = [th.Thread(target=_stamp) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, f"D concurrent raised: {errors}"
+    lines = [json.loads(l) for l in p._last_closed_stamp_path().read_text().splitlines() if l.strip()]
+    sids = [l["session_id"] for l in lines]
+    assert sids.count("s_z") == 1, f"D concurrent: s_z stamped {sids.count('s_z')}x, expected 1"
+
+
+
 def test_c_stale_closed_stamp_is_not_offered(tmp_path):
     """C (owner 2026-10-11): the footer is offered ONLY when the previous
     close stamp is FRESH (within _BRINGBACK_FRESH_WINDOW_S = 30min). A stale

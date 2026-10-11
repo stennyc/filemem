@@ -394,6 +394,50 @@ def build_and_write(storage_root: Path, dry_run: bool = False) -> dict:
     return result
 
 
+def graph_status(storage_root: Path) -> dict:
+    """Read-only freshness verdict for a live store (no writes, not even
+    .bak). Rebuilds the corpus in memory (same cost as --dry-run, a few
+    hundred ms at ~700-node scale — ops-only, never a hot-path probe) and
+    compares the recomputed fingerprint against the stored graph.json.
+
+    Returns:
+        {"root", "status": "missing"|"fresh"|"stale",
+         "stored": {"fingerprint", "node_count", "edge_count"} | None,
+         "current": {"fingerprint", "node_count", "edge_count"}}
+
+    - status "missing": no graph.json / corrupt JSON on disk (the search
+      face is running two-axis right now).
+    - status "fresh":   stored fingerprint == recomputed -> zero drift, a
+      re-run would write nothing (idempotent).
+    - status "stale":   stored fingerprint != recomputed -> corpus changed
+      since the last build; a rebuild IS warranted.
+    """
+    storage_root = Path(storage_root)
+    current = build_graph(storage_root)
+    out = storage_root / GRAPH_NAME
+    stored = None
+    if out.is_file():
+        try:
+            prev = json.loads(out.read_text(encoding="utf-8"))
+            if isinstance(prev, dict):
+                stored = {"fingerprint": prev.get("fingerprint"),
+                          "node_count": prev.get("node_count"),
+                          "edge_count": prev.get("edge_count")}
+        except (json.JSONDecodeError, OSError):
+            stored = None  # corrupt == missing (fail-soft, search is two-axis)
+    if stored is None:
+        status = "missing"
+    elif stored.get("fingerprint") == current["fingerprint"]:
+        status = "fresh"
+    else:
+        status = "stale"
+    return {"root": str(storage_root), "status": status,
+            "stored": stored,
+            "current": {"fingerprint": current["fingerprint"],
+                        "node_count": current["node_count"],
+                        "edge_count": current["edge_count"]}}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="SA2-4: deterministic graph skeleton builder (zero LLM)")
@@ -401,11 +445,19 @@ def main() -> int:
                     help="filemem root (default: auto-resolved <base>/filemem)")
     ap.add_argument("--dry-run", action="store_true",
                     help="report node/edge counts; write nothing (not even .bak)")
+    ap.add_argument("--check", action="store_true",
+                    help="read-only freshness verdict (missing/fresh/stale + "
+                         "stored-vs-current node/edge deltas); writes nothing, "
+                         "never a .bak")
     args = ap.parse_args()
     root = Path(args.storage_root).expanduser() if args.storage_root else default_storage_root()
     if not root.is_dir():
         print(f"ERROR: storage root not found: {root}", file=sys.stderr)
         return 2
+    if args.check:
+        verdict = graph_status(root)
+        print(json.dumps(verdict, ensure_ascii=False, indent=2))
+        return 0
     summary = build_and_write(root, dry_run=args.dry_run)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0

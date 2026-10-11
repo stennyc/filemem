@@ -236,5 +236,7 @@ def test_10_hint_off_default_is_byte_identical_base_format():
     ctx = p.prefetch("anything", session_id="s_cur")
     # D-site: the content face is identical regardless of the hint switch —
     # the eligible row's content line, cross-profile rows never listed.
+    # Numbered list format (owner 2026-10-11): lines carry a 1-based
+    # index so the clarify panel can reference items by number.
     line = [l for l in ctx.splitlines() if "条待处置" in l or "mine" in l]
-    assert line == ["  - [L0] mine"], ctx
+    assert line == ["  1. [L0] mine"], ctx
