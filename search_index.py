@@ -135,11 +135,19 @@ class BM25Index:
 
 
 def rank_decay_axis(pool: List[Dict], lam: float = 0.05,
-                    salience_boost: float = 1.2) -> List[int]:
+                    salience_boost: float = 1.2,
+                    now: Optional[datetime] = None) -> List[int]:
     """The legacy decay curve as a ranking axis: `salience *
     exp(-lambda * age_days)` (reference_count >= 3 gets the salience boost,
-    M4 aware/naive ts semantics preserved verbatim)."""
-    now = datetime.now(timezone.utc)
+    M4 aware/naive ts semantics preserved verbatim).
+
+    F2: `now` pins the decay anchor. None (default) = wall-clock at call
+    time — byte-identical to the pre-F2 behavior (regression gate). A
+    pinned aware datetime makes the axis deterministic for a given pool
+    snapshot, so a same-session re-prefetch over an unchanged pool is
+    byte-stable (provider prefix-cache friendly)."""
+    if now is None:
+        now = datetime.now(timezone.utc)
 
     def rank_score(i: int) -> float:
         item = pool[i]
@@ -248,16 +256,20 @@ def bm25_ranked_score(rank_lists: List[List[int]], pool_size: int,
 
 def build_search_axes(pool: List[Dict], query: str,
                       decay: Optional[Dict] = None,
-                      graph: Optional[Dict] = None) -> List[float]:
+                      graph: Optional[Dict] = None,
+                      now: Optional[datetime] = None) -> List[float]:
     """One-stop host entry: build the bm25 + decay + graph axes over `pool`,
     fuse, normalize -> per-position [0,1] scores. `graph` = the loaded
-    graph.json dict (or None = fail-soft two-axis behavior)."""
+    graph.json dict (or None = fail-soft two-axis behavior).
+
+    F2: `now` pins the decay axis anchor (None = wall-clock, legacy)."""
     decay = decay or {}
     cfg = decay.get("search") or {}
     idx = BM25Index(k1=float(cfg.get("bm25_k1", 1.2)),
                     b=float(cfg.get("bm25_b", 0.75))).build(pool)
     axes: List[List[int]] = [idx.rank(query)]
     axes.append(rank_decay_axis(pool, lam=float(decay.get("lambda_days", 0.05)),
-                                salience_boost=float(decay.get("salience_boost", 1.2))))
+                                salience_boost=float(decay.get("salience_boost", 1.2)),
+                                now=now))
     axes.append(graph_axis_stub(graph, query, pool))
     return bm25_ranked_score(axes, len(pool))

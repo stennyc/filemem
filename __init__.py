@@ -2515,8 +2515,6 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
           B4 盘写失败由 _write_episodic_entry 内部 try/except 吞掉并打
           logger.warning（见 _write_episodic_entry 末尾 except 分支，约 L11308）；
           _on_turn_close_check 本身不 catch _write_episodic_entry 的异常（设计如此，
-          由 sync_turn 末尾的 try/except 兜底）；sync_turn 的 DEBUG 行（约 L4705-4706）
-          是 catch-all，本层不重复打 WARNING。
 
         Partial-snapshot semantic (N3):
           本 fallback 在 session 中途（turn 1/N）触发时，写出的 B4 行是
@@ -2524,6 +2522,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
           on_session_end 正常跑通，它会再写一行完整 snapshot；两行可共存
           （append-only 写层不 dedup），rescore 面靠 scored-id gate 去重，
           重复 eid 不会造成双打分。
+          由 sync_turn 末尾的 try/except 兜底）；sync_turn 的 DEBUG 行（约 L4705-4706）
+          是 catch-all，本层不重复打 WARNING。
         """
         if not session_id:
             return
@@ -3221,6 +3221,16 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # P3: remember this turn's query so the snapshot write at the tail
         # (_save_injected_snapshot) can persist its token fingerprint.
         self._last_recall_query = query
+        # F2: refresh the session's decay time anchor ONCE per user turn,
+        # at the prefetch entry (before any search). Wall-clock enters the
+        # decay computation ONLY here; the anchor is then frozen for the
+        # whole search below, so a same-turn / same-pool re-prefetch is
+        # byte-stable (provider prefix-cache friendly). The refresh is
+        # idempotent within a turn — a re-entered prefetch for the same
+        # session re-anchors to a few seconds later, which cannot reorder a
+        # decay axis (sub-minute age deltas are below the lambda resolution
+        # that ever changes an RRF rank), so no new drift class is introduced.
+        self._f2_time_anchor = datetime.now(timezone.utc)
 
         # P3 cold-start replay: on a (re-)initialized provider for a session that
         # already has a saved injection block, replay that block verbatim on the
@@ -3318,9 +3328,13 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # hard default. Now A and the gate share one source-of-truth.
         # P0-2: the denoised query + the session profile scope (None = fail-open
         # full recall). The EXPLICIT face keeps its raw query + no scope.
+        # F2: pin the decay axis on this turn's anchor (above) so the top-N
+        # selection is deterministic for a pool snapshot — the explicit face
+        # passes nothing and stays on wall-clock (byte-identical regression).
         results = self.search_memories(_q_for_search, limit=8,
                                        min_score=self.min_search_score,
-                                       profile_scope=_session_sp)
+                                       profile_scope=_session_sp,
+                                       time_anchor=self._f2_time_anchor)
         # O1 ① auto-face fold-out: superseded rows (EP-1 save-door / O1 explicit
         # supersede / EP-2 confirmed all write metadata.superseded) and (b)
         # lapsed rows (valid_until already past) leave the AUTO-INJECT face
@@ -6963,7 +6977,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         ranking: str = "decay", include_fixture: bool = False,
                         window: Optional[Dict[str, Any]] = None,
                         profile_scope: Optional[str] = None,
-                        mem_type: Optional[str] = None) -> List[Dict]:
+                        mem_type: Optional[str] = None,
+                        time_anchor: Optional[datetime] = None) -> List[Dict]:
         """Multi-axis RRF retrieval: bm25 keyword axis + decay/recency axis
         (+ graph axis stub, SA2-4), fused by reciprocal rank fusion.
 
@@ -7149,6 +7164,14 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 _lineage_superseded, window)
 
         lam = float(self._decay.get("lambda_days", 0.05))
+        # F2: pin the decay anchor. `time_anchor` (aware UTC) makes the axis
+        # deterministic for a pool snapshot so a same-session re-prefetch over
+        # an unchanged pool is byte-stable (provider prefix-cache friendly).
+        # None (default, EXPLICIT face) = wall-clock at call time, byte-
+        # identical to the pre-F2 behavior (regression gate).
+        _f2_anchor = time_anchor
+        if _f2_anchor is not None and _f2_anchor.tzinfo is None:
+            _f2_anchor = _f2_anchor.replace(tzinfo=timezone.utc)
 
         def decayed_rank(item):
             sal = float(item.get("salience", 0.5))
@@ -7165,7 +7188,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     dt = datetime.fromisoformat(ts)
                     if dt.tzinfo is None:
                         dt = dt.replace(tzinfo=timezone.utc)
-                    now_tz = datetime.now(timezone.utc)
+                    now_tz = _f2_anchor if _f2_anchor is not None else datetime.now(timezone.utc)
                     age_days = max(0.0, (now_tz - dt).total_seconds() / 86400.0)
                 else:
                     age_days = 0.0
@@ -7207,7 +7230,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 from search_index import build_search_axes
                 fused_scores = build_search_axes(
                     all_memories, query_for_axes, decay=self._decay,
-                    graph=self._load_graph())
+                    graph=self._load_graph(), now=_f2_anchor)
             except Exception as e:  # pragma: no cover - fail-soft gate
                 logger.warning(f"FileMem: RRF axes failed, legacy keyword scoring: {e}")
                 fused_scores = None
