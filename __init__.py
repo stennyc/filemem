@@ -2517,6 +2517,13 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
           _on_turn_close_check 本身不 catch _write_episodic_entry 的异常（设计如此，
           由 sync_turn 末尾的 try/except 兜底）；sync_turn 的 DEBUG 行（约 L4705-4706）
           是 catch-all，本层不重复打 WARNING。
+
+        Partial-snapshot semantic (N3):
+          本 fallback 在 session 中途（turn 1/N）触发时，写出的 B4 行是
+          PARTIAL snapshot（只含到当前 turn 为止的 drafts）。若之后
+          on_session_end 正常跑通，它会再写一行完整 snapshot；两行可共存
+          （append-only 写层不 dedup），rescore 面靠 scored-id gate 去重，
+          重复 eid 不会造成双打分。
         """
         if not session_id:
             return
