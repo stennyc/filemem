@@ -426,6 +426,9 @@ def test_tool_stdlib_only_import_audit():
     # Zero-external-dependency gate: stdlib + host/plugin face only.
     # `__init__` here resolves to the plugin module (the extractor is the
     # single source of truth — reusing it is a LOCAL import, not a dep).
+    if not hasattr(sys, "stdlib_module_names"):
+        import pytest
+        pytest.skip("requires Python 3.10+ (sys.stdlib_module_names)")
     tool = _PLUGIN_ROOT / "tools" / "backfill_occurred_at.py"
     all_imports = _all_imports(tool)
     external = all_imports - set(sys.stdlib_module_names) - {"__init__"}
@@ -441,6 +444,9 @@ def test_plugin_top_level_import_audit():
     # Epic constraint: the plugin's module-scope imports are stdlib + the host
     # agent face (+ platform lock shims + the sibling consolidation module)
     # only. This pins the whole file, so the SA2-1 additions are audited too.
+    if not hasattr(sys, "stdlib_module_names"):
+        import pytest
+        pytest.skip("requires Python 3.10+ (sys.stdlib_module_names)")
     plugin = _PLUGIN_ROOT / "__init__.py"
     top = _top_level_imports(plugin)
     allowed = (set(sys.stdlib_module_names)

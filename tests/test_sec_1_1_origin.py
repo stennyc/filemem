@@ -394,6 +394,9 @@ def _all_imports(path: pathlib.Path):
 
 def test_tool_stdlib_only_import_audit():
     # Zero-external-dependency gate: stdlib + host/plugin face only.
+    if not hasattr(sys, "stdlib_module_names"):
+        import pytest
+        pytest.skip("requires Python 3.10+ (sys.stdlib_module_names)")
     tool = _PLUGIN_ROOT / "tools" / "backfill_origin.py"
     all_imports = _all_imports(tool)
     external = all_imports - set(sys.stdlib_module_names) - {"__init__"}

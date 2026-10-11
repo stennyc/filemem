@@ -194,7 +194,11 @@ for _ in range({K}):
         v = json.loads(shard.read_text()) if shard.exists() else 0
         shard.write_text(json.dumps(v + 1))
 """, encoding="utf-8")
-    env = dict(os.environ, PYTHONPATH=str(REPO) + os.pathsep + str(ENGINE))
+    # child inherits the caller's PYTHONPATH (the hermes-agent engine root),
+    # not a hardcoded engine path — the Windows-fallback default for ENGINE
+    # is meaningless on a Linux host and would clobber the real PYTHONPATH
+    # (agent/ would become unimportable in the child -> spurious ModuleNotFound).
+    env = dict(os.environ, PYTHONPATH=str(REPO) + os.pathsep + os.environ.get("PYTHONPATH", ""))
     procs = [subprocess.Popen([sys.executable, str(child)], env=env) for _ in range(N)]
     for pr in procs:
         assert pr.wait() == 0, pr.stderr
