@@ -2323,6 +2323,14 @@ class FileMemProvider(MemoryProvider):
         # Load session drafts
         self._load_session_drafts()
 
+        # P3-1: in-memory set of session_ids whose B4 episodic entry has
+        # been written THIS process lifetime. _on_turn_close_check uses it
+        # to run the B4 fallback at most once per session; a process
+        # restart re-arms the set (acceptable — the incremental gate in
+        # _llm_consolidate dedups by scored-id, so a re-written entry is
+        # a no-op on the consumer side).
+        self._episodic_written: set = set()
+
         # Ops guard (117 incident 2026-09-27): stale backup dirs left in the
         # plugin discovery root all carry plugin.yaml, so the engine
         # auto-registers each as a second filemem provider. Backups belong
@@ -2441,6 +2449,8 @@ class FileMemProvider(MemoryProvider):
         # (the common production case) still fires the tick. The episodic /
         # draft flow below stays drafts-gated (a draft-less session has
         # nothing to summarize). Locked order: spawn, then episodic.
+        # (P3-1: _spawn_llm_consolidation 已在 sync_turn 的 post_llm_call
+        #  每个 turn 末 O(1) 触发，此处保留为收账边界面的备份入口。)
         self._spawn_llm_consolidation()
 
         # BRINGBACK P1: record this session as closed for the current profile,
@@ -2469,12 +2479,50 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
 
         # B4: write episodic summary into sharded JSONL (yyyy/mm), gated by salience_threshold
         self._write_episodic_entry(session_id, drafts)
+        # P3-1: mark this session as B4-written so the turn-level fallback
+        # (_on_turn_close_check) does not re-write if on_session_end ran
+        # before the host skipped it.
+        getattr(self, "_episodic_written", set()).add(session_id)
 
         # D4(a): the consolidation tick spawn was relocated to BEFORE the
         # drafts gate (the unconditional boundary trigger, F2/S1b) so a
         # zero-draft session still fires it. Only ONE spawn call remains in
         # on_session_end — the pre-gate one above.
         return prompt
+
+    def _on_turn_close_check(self, session_id: str) -> None:
+        """P3-1: turn-level B4 fallback for _write_episodic_entry.
+
+        Runs at the end of every sync_turn (post_llm_call path). If the
+        current session has pending drafts in _session_drafts AND this
+        provider has NOT yet written an episodic entry for this session,
+        call _write_episodic_entry here — closing the gap when the host
+        skips on_session_end (hook timeout / 60s suppression window).
+
+        The host's _record_last_closed_session is NOT called here: that
+        field is a semantic "session closed" marker that belongs to the
+        session-end path; the turn-level fallback stamps nothing. The
+        bring-back consumer reads last_closed_sessions.jsonl and treats
+        a missing row as "no bring-back leg for this session" — a safe
+        default, not a crash.
+
+        Fail-soft: any exception is logged at DEBUG and never propagates
+        into the post_llm_call hook.
+        """
+        if not session_id:
+            return
+        if session_id in getattr(self, "_episodic_written", set()):
+            return
+        drafts = (getattr(self, "_session_drafts", {}) or {}).get(session_id, [])
+        if not drafts:
+            return
+        # Call B4 write; it gates on salience_threshold internally.
+        self._write_episodic_entry(session_id, drafts)
+        getattr(self, "_episodic_written", set()).add(session_id)
+        logger.info(
+            f"FileMem: B4 episodic entry written via turn-level fallback "
+            f"for {session_id} ({len(drafts)} drafts, reason=on_session_end skipped or not yet reached)"
+        )
 
     def _probe_storage_root_override(self) -> str:
         """T5b: explicit ``storage_root`` override from
@@ -4595,6 +4643,20 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # never pre-compresses and ends sessions draft-locked ran ZERO
         # ticks for 3 days (North Star #1: consolidation_log silence).
         self._maybe_spawn_consolidation_tick()
+
+        # P3-1: turn-level B4 fallback — if the host skips on_session_end
+        # (hook timeout / suppression), _write_episodic_entry never runs
+        # and the episodic pool starves. Run the B4 write on the first
+        # sync_turn of a session that already has drafts. Idempotent via
+        # _episodic_written (per-provider in-memory set; cross-process
+        # dedup is NOT a concern because _write_episodic_entry writes are
+        # append-only JSONL and the incremental gate in _llm_consolidate
+        # uses scored-id dedup, not episodic-pool uniqueness).
+        # Fail-soft: never raises into the post_llm_call hook.
+        try:
+            self._on_turn_close_check(session_id)
+        except Exception as _e:
+            logger.debug(f"FileMem: turn-close B4 fallback skipped: {_e}")
 
 
     def _detect_turn_failures(self, sid: str, user_content: str,
