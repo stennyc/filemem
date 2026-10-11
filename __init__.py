@@ -2333,6 +2333,16 @@ class FileMemProvider(MemoryProvider):
         # 若未来同实例多线程访问，需改为 self._lock guard（acquire lock around add/read）。
         self._episodic_written: set = set()
 
+        # Task-anchor-on-pre-compress (O1 line, owner 2026-10-11 "漂移" fix ②):
+        # the pre-compress boundary pins in-flight worktree/task state
+        # (subagent delegation ids, landed git short-hashes, touched
+        # test-file paths) as a salience-1.0 episodic row so a post-
+        # supercompress auto-recall carries the landing state back into the
+        # waking model's context. One anchor row per session per provider
+        # lifetime (idempotency via this set — same N4 single-threaded
+        # invariant as _episodic_written above).
+        self._task_anchor_written: set = set()
+
         # Ops guard (117 incident 2026-09-27): stale backup dirs left in the
         # plugin discovery root all carry plugin.yaml, so the engine
         # auto-registers each as a second filemem provider. Backups belong
@@ -2595,9 +2605,15 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # auto → neutral root
         home = Path(self.hermetis_home or Path.home() / ".hermes")
         parts = [p for p in home.parts if p]
-        if "profiles" in parts:
-            idx = parts.index("profiles")
-            base = Path(*parts[:idx]) if idx > 0 else None
+        # Strip the TRAILING "profiles/<name>" tail ONLY when the path
+        # actually ENDS in "profiles/<name>" (i.e. "profiles" is followed by
+        # exactly one more segment). A hermes_home may live PHYSICALLY under
+        # a real ~/.hermes/profiles/... tree (e.g. a tmp fixture inside
+        # coder's own cache/scratch) without naming an owning profile — in
+        # that case no stripping happens and the whole path IS the base.
+        tail_profiles = len(parts) >= 2 and parts[-2] == "profiles"
+        if tail_profiles:
+            base = Path(*parts[:-2]) if len(parts) > 2 else None
         else:
             base = Path(*parts) if parts else None
         if base is None:
@@ -3983,23 +3999,45 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             # filemem_review_drafts(confirm|discard) WITHOUT target.
             my_sp = getattr(self, "source_profile", None)
             lines = []
+            line_idx = 0
+            last_hdr_owner = None
             for item in pending:
                 # item = (filename, eligible, skipped) — eligible>0 here
                 # (corrupt files enter the list as (name, 1) with no data
                 # read, so re-reading them fails -> fallback line).
                 filename = item[0]
+                # T6 (owner 2026-10-11): surface the BARE session/owner id —
+                # the value `filemem_review_drafts`'s `target` accepts — and
+                # NEVER the drafts_*.json filename (A-site red line held).
+                # One header per file, emitted before that file's first line.
+                _owner = (filename[len("drafts_"):-len(".json")]
+                          if filename.startswith("drafts_")
+                             and filename.endswith(".json")
+                          else filename)
                 df = storage_dir / filename
                 try:
                     data = json.loads(df.read_text(encoding="utf-8"))
                 except Exception:
-                    lines.append("  - （内容不可读，待确认）")
+                    line_idx += 1
+                    if last_hdr_owner != _owner:
+                        lines.append(f"  [session {_owner}]")
+                        last_hdr_owner = _owner
+                    lines.append(f"  {line_idx}. （内容不可读，待确认）")
                     continue
                 if not isinstance(data, (list, tuple)):
-                    lines.append("  - （内容不可读，待确认）")
+                    line_idx += 1
+                    if last_hdr_owner != _owner:
+                        lines.append(f"  [session {_owner}]")
+                        last_hdr_owner = _owner
+                    lines.append(f"  {line_idx}. （内容不可读，待确认）")
                     continue
                 for row in data:
                     if not isinstance(row, dict):
-                        lines.append("  - （内容不可读，待确认）")
+                        line_idx += 1
+                        if last_hdr_owner != _owner:
+                            lines.append(f"  [session {_owner}]")
+                            last_hdr_owner = _owner
+                        lines.append(f"  {line_idx}. （内容不可读，待确认）")
                         continue
                     row_sp = _row_source_profile(row)
                     if my_sp in (None, ""):
@@ -4023,7 +4061,11 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     if len(content) > 80:
                         content = content[:80] + "…"
                     level = row.get("level") or "L0"
-                    lines.append(f"  - [{level}] {content}")
+                    line_idx += 1
+                    if last_hdr_owner != _owner:
+                        lines.append(f"  [session {_owner}]")
+                        last_hdr_owner = _owner
+                    lines.append(f"  {line_idx}. [{level}] {content}")
                 # P1-3 5b companion: a file listed as pending (the zero-
                 # eligible LIST path) whose rows are ALL unrenderable (not
                 # dicts) must still surface ONE fallback line — otherwise
@@ -4031,7 +4073,11 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 # Cross-profile-only files legitimately render zero lines
                 # (the owner filter is the point) — no fallback for those.
                 if not lines and any(not isinstance(r, dict) for r in data):
-                    lines.append("  - （内容不可读，待确认）")
+                    line_idx += 1
+                    if last_hdr_owner != _owner:
+                        lines.append(f"  [session {_owner}]")
+                        last_hdr_owner = _owner
+                    lines.append(f"  {line_idx}. （内容不可读，待确认）")
             notice = (
                 "\n\n[未决草稿] 以下历史会话的记忆草稿待确认，可批量处置：\n"
                 + "\n".join(lines)
@@ -6009,6 +6055,20 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         self._flush_pending()
         # D4(a): offline LLM consolidation at the context-switch moment (non-blocking)
         self._spawn_llm_consolidation()
+        # Task-anchor pin (O1 line, owner 2026-10-11 "漂移" fix ②): the LAST
+        # moment the whole history is knowable — mechanically extract the
+        # in-flight task/worktree anchors (delegation ids / landed git
+        # hashes / touched test files) from tool-result text and pin them
+        # as ONE salience-1.0 episodic row, so the post-supercompress
+        # auto-recall carries the landing state back to the waking model.
+        # Idempotent per session per provider lifetime; no-op (no row) when
+        # nothing landable was found; never raises into this hook.
+        sid = session_id or getattr(self, "session_id", "") or "default"
+        if sid not in self._task_anchor_written:
+            anchors = self._extract_task_anchors(messages)
+            if anchors:
+                self.write_task_anchor(sid, anchors)
+                self._task_anchor_written.add(sid)
         return messages
 
     def _extract_memories(self, messages: List[Dict],
@@ -6855,6 +6915,43 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             return g if isinstance(g, dict) else None
         except (json.JSONDecodeError, OSError):
             return None  # corrupt graph = no graph, not a crash
+
+    def _graph_freshness(self) -> Dict[str, Any]:
+        """O(1) mtime-only freshness verdict for the search envelope.
+
+        Pure stat, zero corpus re-scan (deliberately NOT build_graph's
+        fingerprint path — that is an ops-call cost, this is a hot-path
+        probe). Compares graph.json's mtime against the newest file under
+        memories/ + episodic/. Corpus newer than the graph -> "stale"; no
+        graph.json -> "missing"; else "fresh". Read-only: never writes,
+        never triggers a rebuild (hint-only, owner rule). Fail-soft: any
+        stat hiccup -> "missing" (the probe degrades, never breaks the
+        search envelope).
+        """
+        root = getattr(self, "storage_dir", None)
+        if not isinstance(root, Path):
+            return {"status": "missing"}
+        graph_path = root / "graph.json"
+        try:
+            if not graph_path.is_file():
+                return {"status": "missing"}
+            graph_mtime = graph_path.stat().st_mtime
+        except OSError:
+            return {"status": "missing"}
+        newest_corpus = 0.0
+        for sub in ("memories", "episodic"):
+            d = root / sub
+            if not d.is_dir():
+                continue
+            try:
+                for f in d.iterdir():
+                    if f.is_file():
+                        newest_corpus = max(newest_corpus, f.stat().st_mtime)
+            except OSError:
+                continue
+        if newest_corpus > graph_mtime:
+            return {"status": "stale"}
+        return {"status": "fresh"}
 
     def _load_knowledge_pool(self) -> List[Dict]:
         """active 知识条目进检索面（@data-engineer 检索面第 6 条：复用 keyword 打分，
@@ -8115,8 +8212,22 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # param). Per-row source_profile stamps (data lineage) ride inside
         # each result item, unchanged; the two are orthogonal and the
         # envelope is the ONLY place recall_scope lives.
+        # SA2-4: O(1) mtime-only graph freshness verdict (never triggers a
+        # rebuild — hint-only, owner rule). Fresh -> silent (no hint key);
+        # missing/stale -> one-line hint pointing at tools/build_graph.py.
+        _g = self._graph_freshness()
+        if _g["status"] == "fresh":
+            _graph_field = {"status": "fresh"}
+        else:
+            _graph_field = {
+                "status": _g["status"],
+                "hint": ("graph.json is " + _g["status"]
+                         + " — rebuild it with tools/build_graph.py "
+                         "(read-only ops call, no LLM)."),
+            }
         return json.dumps(
-            {"recall_scope": recall_scope, "results": results},
+            {"recall_scope": recall_scope, "graph": _graph_field,
+             "results": results},
             ensure_ascii=False, indent=2)
 
     def _tool_delete(self, args: Dict) -> str:
@@ -11267,6 +11378,178 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
             logger.info(f"FileMem: episodic entry written for {session_id} ({len(drafts)} drafts, status={entry['status']})")
         except Exception as e:
             logger.warning(f"FileMem: episodic write failed: {e}")
+
+    # ── Task-anchor-on-pre-compress (O1 line, owner 2026-10-11 "漂移" fix ②) ──
+    # A context supercompress makes the waking model lose the IN-FLIGHT
+    # task/worktree state (which subagent dispatches were open, which git
+    # commits the session had landed, which test files were touched) — the
+    # compacted summary carries narrative, not landing state. The
+    # on_pre_compress boundary is the LAST moment that state is fully
+    # knowable (messages still holds the whole history), so we mechanically
+    # extract "task anchors" from tool-result text and pin them as a
+    # salience-1.0 episodic row right before the compression happens. The
+    # post-compact pre_llm_call auto-recall (M4 episodic extension) then
+    # carries them back into the waking context.
+    #
+    # Invariants (locked by tests/test_task_anchor_on_compress.py):
+    #   - ZERO LLM: pure regex over tool-role / assistant tool-invocation
+    #     content only. User/system prose is NEVER scanned — no
+    #     hallucinated anchors (a model's own "I'll commit X" narration is
+    #     a claim, not landing state).
+    #   - Three anchor classes, each deduped in first-seen order:
+    #       A1  delegation / kanban task ids (deleg_[0-9a-f]+, t_[0-9a-f]{8,})
+    #       A2  git short/long hashes — REQUIRED to sit on the same line as
+    #           a git-context marker (commit/revert/cherry-pick/tag/HEAD/
+    #           branch/checkout, or a `git <sub>` command line); a bare
+    #           hex-looking identifier (css color, python const) is NOT
+    #           captured.
+    #       A3  touched test-file paths (tests/test_*.py).
+    #   - write_task_anchor writes NOTHING when anchors == [] (no noise
+    #     rows for a session that had no landable state).
+    #   - The row is salience=1.0 + status=active + metadata.kind=
+    #     task_anchor + occurred_at=now (the compress moment) +
+    #     source_profile stamp (M6 Plan A, read at write time) — it must
+    #     NEVER be decay-gated (a decayed anchor is worse than no anchor:
+    #     it is the anti-drift layer itself).
+    #   - on_pre_compress calls it at most once per session per provider
+    #     lifetime (idempotency via _task_anchor_written — same N4
+    #     single-threaded invariant as _episodic_written).
+    #   - Disk failure is fail-soft: a logged warning, never a raise into
+    #     the on_pre_compress hook (the compress must proceed regardless).
+
+    _TASK_ANCHOR_DELEG_RE = re.compile(r"\b(deleg_[0-9a-f]{4,}|t_[0-9a-f]{8,})\b")
+    # A2: three alternatives, each its own capture group:
+    #   (1) "<hex> <marker>"          e.g. "d87aa17 commit landed"
+    #   (2) "<marker> [is at] <hex>" e.g. "HEAD is at 2fcf241"
+    #   (3) "git <sub> ... <hex>"    e.g. "git log: d87aa17 filemem P3-1"
+    _TASK_ANCHOR_GIT_RE = re.compile(
+        r"\b([0-9a-f]{7,40})\b\s+(?:commit|revert|cherry-pick|tag|HEAD)\b"
+        r"|\b(?:commit|revert|cherry-pick|tag|checkout|branch|HEAD)\b\s*(?:is\s+at\s*)?([0-9a-f]{7,40})\b"
+        r"|^\s*git\s+(?:log|show|status|diff|blame|rev-parse)\b.*?\b([0-9a-f]{7,40})\b",
+        re.IGNORECASE | re.MULTILINE)
+    _TASK_ANCHOR_TESTFILE_RE = re.compile(r"\b(tests/test_[A-Za-z0-9_\-]+\.py)\b")
+    _TASK_ANCHOR_MAX_PER_CLASS = 20  # bound the row size; first-seen wins
+
+    def _extract_task_anchors(self, messages: Optional[List[Dict[str, Any]]]) -> List[Dict[str, str]]:
+        """Mechanical, zero-LLM extraction of in-flight task anchors from a
+        messages history (see the class-level invariant block above).
+
+        Returns a flat list of {"kind", "value"} dicts: kind in
+        {"delegation", "git_hash", "test_file"}; deduped, first-seen
+        order preserved per class, capped at _TASK_ANCHOR_MAX_PER_CLASS
+        each. [] when nothing landable was found. Never raises.
+        """
+        if not messages:
+            return []
+        out: List[Dict[str, str]] = []
+        seen_deleg: set = set()
+        seen_hash: set = set()
+        seen_tf: set = set()
+
+        def _scan(text: str) -> None:
+            # A1: delegation / kanban task ids (deduped, capped)
+            for m in self._TASK_ANCHOR_DELEG_RE.finditer(text):
+                v = m.group(1)
+                if v not in seen_deleg:
+                    seen_deleg.add(v)
+                    out.append({"kind": "delegation", "value": v})
+            # A2: git hashes — only when a git-context marker sits on the
+            # SAME line (commit/HEAD/…/git-subcommand-dump); bare hex
+            # identifiers stay out.
+            for line in text.splitlines():
+                for m in self._TASK_ANCHOR_GIT_RE.finditer(line):
+                    # 3 alternatives, exactly one group captures per match.
+                    v = m.group(1) or m.group(2) or m.group(3)
+                    if not v:
+                        continue
+                    if v in seen_hash:
+                        continue
+                    seen_hash.add(v)
+                    out.append({"kind": "git_hash", "value": v})
+            # A3: touched test-file paths
+            for m in self._TASK_ANCHOR_TESTFILE_RE.finditer(text):
+                v = m.group(1)
+                if v not in seen_tf:
+                    seen_tf.add(v)
+                    out.append({"kind": "test_file", "value": v})
+
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", ""))
+            content = msg.get("content")
+            if role == "tool":
+                # tool results are LANDING STATE — always scanned.
+                if isinstance(content, str) and content:
+                    _scan(content)
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            _scan(part["text"])
+            elif role == "assistant":
+                # Assistant PROSE (plain string content) is NOT scanned —
+                # narration ("I'll commit d87aa17 now") is a claim, not
+                # landing state. Only its tool-invocation blocks
+                # (content-as-list of parts) are scanned. user/system
+                # prose is never scanned (invariant #2).
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            _scan(part["text"])
+                # string content: skipped by design
+            # else: user / system / unknown role — never scanned.
+
+        # cap per class (first-seen order; the cap trims the tail)
+        by_class: Dict[str, List[Dict[str, str]]] = {"delegation": [], "git_hash": [], "test_file": []}
+        for a in out:
+            by_class[a["kind"]].append(a)
+        capped: List[Dict[str, str]] = []
+        for kind in ("delegation", "git_hash", "test_file"):
+            capped.extend(by_class[kind][: self._TASK_ANCHOR_MAX_PER_CLASS])
+        return capped
+
+    def write_task_anchor(self, session_id: str, anchors: List[Dict[str, str]]) -> None:
+        """Pin a session's in-flight task anchors as ONE salience-1.0
+        episodic row (see the class-level invariant block). No-op when
+        `anchors` is empty. Never raises (fail-soft disk path)."""
+        if not anchors:
+            return
+        if not isinstance(self.episodic_dir, Path):
+            return
+        now = _utcnow()
+        shard = self.episodic_dir / now.strftime("%Y") / now.strftime("%m")
+        content = " | ".join(f"[{a['kind']}] {a['value']}" for a in anchors)[:2000]
+        entry = {
+            "session_id": session_id,
+            "ts": now.isoformat(),
+            "drafts": 0,  # not a draft aggregation — a landing-state pin
+            "max_salience": 1.0,
+            "content": content,
+            "salience": 1.0,  # anti-drift layer: anchors never decay-gate
+            "status": "active",
+            "source_profile": getattr(self, "source_profile", None),
+            "metadata": {
+                "origin": dict(_EPISODIC_ORIGIN_STAMP),
+                "kind": "task_anchor",
+            },
+            "occurred_at": now.isoformat(),  # the compress moment itself
+        }
+        try:
+            shard.mkdir(parents=True, exist_ok=True)
+            ep_shard_file = shard / f"{session_id}.jsonl"
+            with self._shard_lock(ep_shard_file):
+                with open(ep_shard_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            logger.info(
+                f"FileMem: task-anchor written for {session_id} "
+                f"({len(anchors)} anchors: "
+                f"{sum(1 for a in anchors if a['kind'] == 'delegation')} deleg, "
+                f"{sum(1 for a in anchors if a['kind'] == 'git_hash')} git, "
+                f"{sum(1 for a in anchors if a['kind'] == 'test_file')} test-file)")
+        except Exception as e:
+            # Fail-soft: the pre-compress boundary must never block the
+            # compression itself over a pin-write hiccup.
+            logger.warning(f"FileMem: task-anchor write failed for {session_id}: {e}")
 
     # ── BRINGBACK P1: last-closed-session stamp (per-profile, central store) ──
     # 中央池 + 逻辑戳模型（owner 2026-10-10 定稿）：不拆 per-profile 目录，戳落在
