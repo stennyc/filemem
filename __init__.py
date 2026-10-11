@@ -2329,6 +2329,8 @@ class FileMemProvider(MemoryProvider):
         # restart re-arms the set (acceptable — the incremental gate in
         # _llm_consolidate dedups by scored-id, so a re-written entry is
         # a no-op on the consumer side).
+        # N4 (reviewer): 单线程不变量 — 宿主 1 profile × 1 provider，_episodic_written 裸 set 无锁安全；
+        # 若未来同实例多线程访问，需改为 self._lock guard（acquire lock around add/read）。
         self._episodic_written: set = set()
 
         # Ops guard (117 incident 2026-09-27): stale backup dirs left in the
@@ -2482,7 +2484,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # P3-1: mark this session as B4-written so the turn-level fallback
         # (_on_turn_close_check) does not re-write if on_session_end ran
         # before the host skipped it.
-        getattr(self, "_episodic_written", set()).add(session_id)
+        # N1: fail-safe for __new__ construction path (initialize() never ran).
+        if not hasattr(self, "_episodic_written"):
+            self._episodic_written = set()
+        self._episodic_written.add(session_id)
 
         # D4(a): the consolidation tick spawn was relocated to BEFORE the
         # drafts gate (the unconditional boundary trigger, F2/S1b) so a
@@ -2506,19 +2511,29 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         a missing row as "no bring-back leg for this session" — a safe
         default, not a crash.
 
-        Fail-soft: any exception is logged at DEBUG and never propagates
-        into the post_llm_call hook.
+        Fail-soft diagnostic chain (N2):
+          B4 盘写失败由 _write_episodic_entry 内部 try/except 吞掉并打
+          logger.warning（见 _write_episodic_entry 末尾 except 分支，约 L11308）；
+          _on_turn_close_check 本身不 catch _write_episodic_entry 的异常（设计如此，
+          由 sync_turn 末尾的 try/except 兜底）；sync_turn 的 DEBUG 行（约 L4705-4706）
+          是 catch-all，本层不重复打 WARNING。
         """
         if not session_id:
             return
-        if session_id in getattr(self, "_episodic_written", set()):
+        # N1: fail-safe for the __new__ construction path (tests / crash-
+        # recovery) where initialize() never ran and the attribute is absent.
+        if not hasattr(self, "_episodic_written"):
+            self._episodic_written = set()
+        if session_id in self._episodic_written:
             return
-        drafts = (getattr(self, "_session_drafts", {}) or {}).get(session_id, [])
+        # S2: defensive copy (snapshot atomicity) — the caller's drafts list
+        # may be mutated concurrently between this read and the B4 write.
+        drafts = list((getattr(self, "_session_drafts", {}) or {}).get(session_id, []))
         if not drafts:
             return
         # Call B4 write; it gates on salience_threshold internally.
         self._write_episodic_entry(session_id, drafts)
-        getattr(self, "_episodic_written", set()).add(session_id)
+        self._episodic_written.add(session_id)
         logger.info(
             f"FileMem: B4 episodic entry written via turn-level fallback "
             f"for {session_id} ({len(drafts)} drafts, reason=on_session_end skipped or not yet reached)"
@@ -4652,6 +4667,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # dedup is NOT a concern because _write_episodic_entry writes are
         # append-only JSONL and the incremental gate in _llm_consolidate
         # uses scored-id dedup, not episodic-pool uniqueness).
+        # N4: in-process set access is lock-free: the invariant assumes
+        # single-threaded access to a provider instance (host runs 1
+        # profile × 1 provider). If a future host multi-threads a shared
+        # instance, self._lock must guard _episodic_written read/write.
         # Fail-soft: never raises into the post_llm_call hook.
         try:
             self._on_turn_close_check(session_id)
@@ -9281,7 +9300,9 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         return latest
 
     def _unscored_episodic_candidates(self, scored_ids) -> List[Dict[str, Any]]:
-        """Active, non-fixture episodic entries NOT yet LLM-rescored (incremental gate)."""
+        """Active, non-fixture episodic entries NOT yet LLM-rescored (incremental gate).
+        S3/S4 dedup: cross-process double-writes of the same eid collapse to one
+        candidate, keeping the rescore N-cap slice O(distinct) instead of O(rows)."""
         cands: List[Dict[str, Any]] = []
         if self.episodic_dir is None or not self.episodic_dir.exists():
             return cands
@@ -9308,7 +9329,15 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                     })
             except OSError:
                 continue
-        return cands
+        # S3/S4 dedup: collapse cross-process double-writes of the same eid
+        seen: set = set()
+        deduped: List[Dict[str, Any]] = []
+        for c in cands:
+            if c["id"] in seen:
+                continue
+            seen.add(c["id"])
+            deduped.append(c)
+        return deduped
 
     def _llm_consolidate(self) -> None:
         """D4(a): score salience for unscored episodic entries via the host LLM.
@@ -11248,25 +11277,33 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
             # accumulates N rows for one session and the "most recent closed"
             # read (by closed_ts) drifts. If this session id already has a
             # row, skip the append (keep the FIRST close stamp as canonical).
-            existing: set = set()
-            if p.exists():
-                try:
-                    with open(p, "r", encoding="utf-8") as rf:
-                        for line in rf:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                r = json.loads(line)
-                            except Exception:
-                                continue  # P1-3 fail-soft: corrupt line skipped
-                            if isinstance(r, dict) and r.get("session_id"):
-                                existing.add(r.get("session_id"))
-                except Exception:
-                    pass  # a read hiccup degrades to "append" (old behavior)
-            if session_id in existing:
-                return  # D: already stamped this session — do not duplicate
+            #
+            # Concurrency hardening (reviewer 2026-10-11, 💭->fix): the read of
+            # existing session ids and the append must BOTH run under the same
+            # _shard_lock so a concurrent process cannot both read "no row for
+            # this session" and both append (the TOCTOU window the reviewer
+            # flagged). The read + decision + write is now one critical
+            # section; a read hiccup inside the lock degrades to "append"
+            # (old behavior) and never raises.
             with self._shard_lock(p):
+                existing: set = set()
+                if p.exists():
+                    try:
+                        with open(p, "r", encoding="utf-8") as rf:
+                            for line in rf:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    r = json.loads(line)
+                                except Exception:
+                                    continue  # P1-3 fail-soft: corrupt line skipped
+                                if isinstance(r, dict) and r.get("session_id"):
+                                    existing.add(r.get("session_id"))
+                    except Exception:
+                        pass  # a read hiccup degrades to "append" (old behavior)
+                if session_id in existing:
+                    return  # D: already stamped this session — do not duplicate
                 with open(p, "a", encoding="utf-8") as f:
                     f.write(json.dumps({
                         "session_id": session_id,

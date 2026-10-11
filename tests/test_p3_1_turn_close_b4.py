@@ -17,6 +17,11 @@ Invariants:
   #4  on_session_end, after B4 write, stamps _episodic_written so the
       turn-level fallback does NOT re-write
   #5  The B4 episodic file lands on disk with the correct content shape
+  #6  _write_episodic_entry raising does NOT stamp _episodic_written
+      (failure = retry next turn), and the exception propagates out of
+      _on_turn_close_check to be caught by sync_turn's fail-soft wrapper
+  #7  on_session_end stamp makes the fallback a no-op (standalone pin)
+  #8  failed write leaves sid unstamped (short retry-probe form)
 
 Run:
     cd /root/.hermes/plugins/filemem
@@ -26,6 +31,7 @@ Run:
 import json
 import sys
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -153,8 +159,9 @@ def test_p31_05_episodic_file_written_to_disk(tmp_path):
     p._on_turn_close_check(sid)  # no mock — real B4 write
 
     # Find the episodic shard file
-    year = __import__("datetime").datetime.utcnow().strftime("%Y")
-    month = __import__("datetime").datetime.utcnow().strftime("%m")
+    now_utc = datetime.now(timezone.utc)
+    year = now_utc.strftime("%Y")
+    month = now_utc.strftime("%m")
     shard = p.episodic_dir / year / month / f"{sid}.jsonl"
     assert shard.exists(), f"expected {shard} to exist"
     rows = [json.loads(l) for l in shard.read_text().splitlines() if l.strip()]
@@ -162,3 +169,79 @@ def test_p31_05_episodic_file_written_to_disk(tmp_path):
     assert rows[0]["session_id"] == sid
     assert rows[0]["drafts"] == 1
     assert rows[0]["status"] == "active"  # salience 0.8 > threshold 0.5
+
+
+def test_p31_06_fallback_retries_when_write_raises(tmp_path):
+    """S1: _on_turn_close_check propagates OSError; the sync_turn-side
+    try/except swallows it without stamping _episodic_written, so a
+    subsequent turn retry fires the B4 write again."""
+    p = _make_provider(tmp_path)
+    sid = "s_p3_1"
+    p._session_drafts[sid] = [_mk_draft("x")]
+
+    # Phase 1: _write_episodic_entry raises → exception propagates out of
+    # _on_turn_close_check; sid must NOT be stamped.
+    with patch.object(p, "_write_episodic_entry",
+                      side_effect=OSError("disk full")):
+        try:
+            p._on_turn_close_check(sid)
+            raise AssertionError("expected OSError to propagate")
+        except OSError:
+            pass
+
+    assert sid not in p._episodic_written
+
+    # Phase 2: simulate the sync_turn-side try/except wrapping the retry.
+    # Now _write_episodic_entry succeeds → sid stamped, no exception.
+    with patch.object(p, "_write_episodic_entry") as mock_ok:
+        mock_ok.return_value = None
+        try:
+            p._on_turn_close_check(sid)
+        except Exception as _e:
+            pytest.fail(f"sync_turn-side try/except should have swallowed: {_e}")
+        mock_ok.assert_called_once()
+        assert sid in p._episodic_written
+
+
+def test_p31_07_on_session_end_prevents_fallback_rewrite(tmp_path):
+    """Optional: after on_session_end stamps _episodic_written, a later
+    _on_turn_close_check is a no-op (pins the invariant in a standalone
+    case, reusing test_p31_04's logic)."""
+    p = _make_provider(tmp_path)
+    sid = "s_p3_1"
+    p._session_drafts[sid] = [_mk_draft("via session-end")]
+
+    with patch.object(p, "_spawn_llm_consolidation"), \
+         patch.object(p, "_record_last_closed_session"), \
+         patch.object(p, "_write_episodic_entry") as mock_write:
+        mock_write.return_value = None
+        p.on_session_end([])
+        mock_write.assert_called_once_with(sid, p._session_drafts[sid])
+        assert sid in p._episodic_written
+
+    # Turn-level fallback must not re-write
+    with patch.object(p, "_write_episodic_entry") as mock_write2:
+        p._on_turn_close_check(sid)
+        mock_write2.assert_not_called()
+
+
+def test_p31_08_write_failure_not_marked(tmp_path):
+    """#6: _write_episodic_entry raising OSError -> sid NOT stamped
+    (retry next turn), exception propagates (caught by sync_turn wrapper)."""
+    p = _make_provider(tmp_path)
+    sid = "s_p3_1_fail"
+    p._session_drafts[sid] = [_mk_draft("will fail")]
+
+    def _raise(*args, **kwargs):
+        raise OSError("disk write failed")
+
+    with patch.object(p, "_write_episodic_entry", side_effect=_raise):
+        with pytest.raises(OSError, match="disk write failed"):
+            p._on_turn_close_check(sid)
+
+    # (b) sid must NOT be in _episodic_written after a failed write
+    assert sid not in p._episodic_written, (
+        "failed B4 write must not stamp _episodic_written; "
+        "next turn should retry"
+    )
+
