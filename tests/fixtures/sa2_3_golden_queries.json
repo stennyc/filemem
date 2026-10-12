@@ -1,122 +1,130 @@
 {
-  "captured_at": "2026-10-07 (path a: re-captured from live store)",
+  "captured_at": "2026-10-12 (path b: re-captured from live store)",
   "note": "baseline_top5 deduped (a duplicate episodic id can appear twice in legacy top5). Post-SA2-3 gate = RETRIEVABILITY, not top5-set-invariance: every baseline id must still be eligible in the post-RRF pool (legacy substring qualification gate is preserved verbatim, so nothing previously recallable is lost). RRF re-ranking within the eligible pool is BY DESIGN (spec SA2-3 Acceptance 1 also requires idf-based ranking improvement, which top5-set-invariance would forbid). Ranking improvement is gated separately by test_bm25_idf_rare_term_outranks_common.",
   "queries": {
     "en": [
       {
         "query": "hermes plugin decay",
         "baseline_top5": [
-          "preference_110_1791259073",
-          "decision_27_1791246965",
-          "fact_215_1791154611",
-          "task_181_1791243926"
+          "preference_154_1791703264",
+          "preference_o1sup_1791743452579",
+          "preference_145_1791346523",
+          "task_o1sup_1791744092375",
+          "task_163_1791696347"
         ],
-        "n_hits": 1000
+        "n_hits": 724
       },
       {
         "query": "CJS module system",
         "baseline_top5": [
-          "preference_110_1791259073",
-          "decision_27_1791246965",
-          "fact_215_1791154611",
-          "task_181_1791243926"
+          "preference_154_1791703264",
+          "preference_drain_152_1791702783",
+          "preference_drain_202_1791628484",
+          "task_177_1791715001",
+          "preference_o1sup_1791743452579"
         ],
-        "n_hits": 1000
+        "n_hits": 723
       },
       {
         "query": "flock cross process lock",
         "baseline_top5": [
-          "preference_110_1791259073",
-          "task_181_1791243926",
-          "task_130_1791196716",
-          "fact_215_1791154611"
+          "preference_154_1791703264",
+          "fact_drain_179_1791688201",
+          "preference_o1sup_1791743452579",
+          "decision_58_1791703270",
+          "preference_drain_202_1791628484"
         ],
-        "n_hits": 1000
+        "n_hits": 721
       },
       {
         "query": "knowledge tier",
         "baseline_top5": [
-          "preference_110_1791259073",
-          "decision_27_1791246965",
-          "fact_215_1791154611",
-          "task_163_1791235860"
+          "preference_154_1791703264",
+          "preference_drain_152_1791702783",
+          "preference_drain_116_1791601882",
+          "task_o1sup_1791744092375",
+          "preference_145_1791346523"
         ],
-        "n_hits": 1000
+        "n_hits": 724
       },
       {
         "query": "file_memory_search min score",
         "baseline_top5": [
-          "preference_110_1791259073",
-          "decision_27_1791246965",
-          "fact_215_1791154611",
-          "task_163_1791235860"
+          "preference_154_1791703264",
+          "preference_o1sup_1791743452579",
+          "preference_145_1791346523",
+          "preference_drain_152_1791702783",
+          "preference_drain_153_1791702802"
         ],
-        "n_hits": 1000
+        "n_hits": 724
       },
       {
         "query": "python pytest tests",
         "baseline_top5": [
-          "fact_81_1790673823",
-          "fact_86_1790673824",
-          "decision_8_1790713641",
-          "fact_90_1790673824",
-          "fact_29_1790664360"
+          "preference_154_1791703264",
+          "task_o1sup_1791744092375",
+          "preference_145_1791346523",
+          "task_163_1791696347",
+          "preference_320_1791457650"
         ],
-        "n_hits": 5
+        "n_hits": 723
       }
     ],
     "zh": [
       {
         "query": "测试 通过",
         "baseline_top5": [
-          "fact_49_1790664382",
-          "fact_19_1790658946",
-          "fact_29_1790664360"
+          "preference_154_1791703264",
+          "fact_drain_179_1791688201",
+          "task_o1sup_1791744092375",
+          "preference_145_1791346523",
+          "preference_320_1791457650"
         ],
-        "n_hits": 254
+        "n_hits": 487
       },
       {
         "query": "部署 记忆",
         "baseline_top5": [
-          "task_6_1790664382",
-          "fact_19_1790658946",
-          "decision_8_1790713641",
-          "fact_29_1790664360",
-          "fact_83_1790673824"
+          "preference_154_1791703264",
+          "task_166_1791698632",
+          "task_o1sup_1791744092375",
+          "preference_drain_93_1791594637",
+          "preference_drain_157_1791375676"
         ],
-        "n_hits": 5
+        "n_hits": 651
       },
       {
         "query": "文件 锁",
         "baseline_top5": [
-          "fact_35_1790664360",
-          "fact_29_1790664360",
-          "fact_17_1790658946",
-          "fact_52_1790664390"
+          "preference_154_1791703264",
+          "decision_58_1791703270",
+          "fact_drain_179_1791688201",
+          "task_166_1791698632",
+          "task_163_1791696347"
         ],
-        "n_hits": 5
+        "n_hits": 714
       },
       {
         "query": "插件 目录",
         "baseline_top5": [
-          "task_17_1790673824",
-          "fact_25_1790661647",
-          "decision_8_1790713641",
-          "fact_29_1790664360",
-          "fact_83_1790673824"
+          "preference_154_1791703264",
+          "task_177_1791715001",
+          "preference_drain_137_1791684701",
+          "preference_320_1791457650",
+          "task_o1sup_1791744092375"
         ],
-        "n_hits": 5
+        "n_hits": 653
       },
       {
         "query": "用户 偏好",
         "baseline_top5": [
-          "fact_29_1790664360",
-          "fact_83_1790673824",
-          "fact_52_1790664390",
-          "fact_72_1790672947",
-          "fact_19_1790658946"
+          "preference_drain_202_1791628484",
+          "preference_drain_152_1791702783",
+          "preference_142_1791687192",
+          "preference_201_1791627642",
+          "preference_119_1791677567"
         ],
-        "n_hits": 5
+        "n_hits": 655
       }
     ]
   }
