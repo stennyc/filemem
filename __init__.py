@@ -3655,18 +3655,55 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         _q0, _q1 = _qdelims[0], _qdelims[1]
         parts = []
         for item in results:
+            _fm = item.get("metadata") or {}
+            # owner 2026-10-12: cross-session provenance annotation on the
+            # auto-inject face. A row that ORIGINATED in another session
+            # (memories pool: metadata.origin_session stamped at the _save_memory
+            # door; episodic pool: top-level session_id from the B4 write) gets
+            # a "（来自 session <sid>）" suffix — the injection surface is where
+            # a stale other-session "待办" statement re-reads as current truth,
+            # and a bare session id is what the user needs to spot that. Same-
+            # session rows are NOT annotated (no noise); rows with no provenance
+            # field (legacy memories rows written before the stamp landed, or a
+            # standalone save with no active session) render UNCHANGED — fail-
+            # soft: absence of a stamp means "nothing to show", never a guess.
+            _row_sp = getattr(self, "session_id", None)
+            _prov = _fm.get("origin_session") or item.get("session_id")
+            _provenance = ""
+            if _prov and _prov != _row_sp and _prov != "default":
+                _provenance = f"（来自 session {_prov}）"
             if item.get("id") in _quoted_ids:
                 parts.append(
-                    f"[{item['type']}] {_q0} {item['content']} {_q1}")
+                    f"[{item['type']}] {_q0} {item['content']} {_q1}{_provenance}")
             else:
-                parts.append(f"[{item['type']}] {item['content']}")
+                parts.append(f"[{item['type']}] {item['content']}{_provenance}")
             # Negative-example v1 (gate ③): a recalled item carrying a failure
             # marker gets ONE trailing lesson line — injected only alongside the
             # hit item (relevance gate by construction, not a global dump).
-            fm = item.get("metadata") or {}
-            if fm.get("failure_type"):
-                ctx = (fm.get("failure_ctx") or "").strip()
-                parts.append(f"⚠️ 失败教训({fm['failure_type']}){': ' + ctx if ctx else ''}")
+            if _fm.get("failure_type"):
+                ctx = (_fm.get("failure_ctx") or "").strip()
+                parts.append(f"⚠️ 失败教训({_fm['failure_type']}){': ' + ctx if ctx else ''}")
+            # owner 2026-10-12: lifecycle hint on the auto-inject face for rows
+            # carrying an EXISTING stale marker. A STALE row passes the O1
+            # fold (only superseded / settled / lapsed fold out — a stale row
+            # with a live confirmed=True is NOT lapsed) and therefore still
+            # reaches this formatting loop; the hint is what lets the
+            # model/user weigh it as "可能已过时" rather than current state.
+            # The row is KEPT (the explicit search face is untouched, no new
+            # fold-out) — hint only. settled is DELIBERATELY NOT hinted here:
+            # a settled row is folded out of the auto face by _o1_fold_out_of_auto
+            # before this loop runs (lifecycle done, not "maybe stale"), so it
+            # can never reach the formatting section — hinting it would be dead
+            # code. No new state, no new verdict, zero LLM.
+            _life_hint = []
+            if _fm.get("stale"):
+                _life_hint.append("stale")
+            if _life_hint:
+                _reason = (_fm.get("stale_reason") or "").strip()
+                parts.append(
+                    f"ℹ️ 生命周期提示: 该条已标记 {'+'.join(_life_hint)}"
+                    f"{f'（{_reason[:60]}）' if _reason else ''}，"
+                    "内容可能已过时，检索面仍可捞取。")
 
         context = "\n".join(parts)
         self._last_recall = RecallStatus("filemem", len(results))
@@ -5729,6 +5766,19 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 # (the single door through which every persistent row is born:
                 # auto / manual / confirmed_draft all flow here).
                 _stamp_origin_in_meta(_item_meta, source)
+                # owner 2026-10-12: stamp the originating session on the
+                # memories-pool row (metadata.origin_session) so the read-side
+                # auto-inject face can annotate "来自 session <sid>" on
+                # cross-session rows. The episodic pool already carries
+                # top-level session_id (B4 write); the memories pool had none,
+                # which is why the injection surface could not show provenance.
+                # Only stamped when a real session is active — a standalone /
+                # non-host / empty snapshot leaves it unset (fail-soft: a
+                # missing origin_session never blocks the save; the read face
+                # treats absence as "no provenance to show", not an error).
+                _osid = getattr(self, "session_id", None)
+                if _osid and _osid != "default":
+                    _item_meta["origin_session"] = _osid
                 # ── settled 双通道汇流打标（_save_memory 是唯一 choke point）──
                 # auto 面命中完成信号表 → settled_candidate（纯自动提名，不折出，
                 # 防误杀半程卡）；confirmed_draft（confirm 拍板）→ settled（确认态，
