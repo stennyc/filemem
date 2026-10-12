@@ -3667,10 +3667,14 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             # field (legacy memories rows written before the stamp landed, or a
             # standalone save with no active session) render UNCHANGED — fail-
             # soft: absence of a stamp means "nothing to show", never a guess.
-            _row_sp = getattr(self, "session_id", None)
+            # _turn_active_sid 优先（复用实例的 stale-lease 窗口里 self.session_id
+            # 可能是上一 session），fallback self.session_id —— 与同职能的
+            # ingress/queue/ledger 戳（L5684/5889/6007/6544）同源，避免写读两侧
+            # 在不同 sid 口径上漂移。
+            _cur_sid = getattr(self, "_turn_active_sid", None) or getattr(self, "session_id", None)
             _prov = _fm.get("origin_session") or item.get("session_id")
             _provenance = ""
-            if _prov and _prov != _row_sp and _prov != "default":
+            if _prov and _prov != _cur_sid and _prov != "default":
                 _provenance = f"（来自 session {_prov}）"
             if item.get("id") in _quoted_ids:
                 parts.append(
@@ -3695,14 +3699,13 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             # before this loop runs (lifecycle done, not "maybe stale"), so it
             # can never reach the formatting section — hinting it would be dead
             # code. No new state, no new verdict, zero LLM.
-            _life_hint = []
             if _fm.get("stale"):
-                _life_hint.append("stale")
-            if _life_hint:
                 _reason = (_fm.get("stale_reason") or "").strip()
+                if _reason:
+                    _reason = _reason[:60] + ("…" if len(_reason) > 60 else "")
                 parts.append(
-                    f"ℹ️ 生命周期提示: 该条已标记 {'+'.join(_life_hint)}"
-                    f"{f'（{_reason[:60]}）' if _reason else ''}，"
+                    f"ℹ️ 生命周期提示: 该条已标记 stale"
+                    f"{f'（{_reason}）' if _reason else ''}，"
                     "内容可能已过时，检索面仍可捞取。")
 
         context = "\n".join(parts)
@@ -3892,7 +3895,19 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 kept_lines.append(line)
                 continue
             content_key = m.group(2).strip()
-            rows_for_content = by_content.get(content_key)
+            # owner 2026-10-12 (reviewer round 3, finding #2): the frozen
+            # block is written AFTER the provenance suffix is composed into
+            # each `[type] content` line, so content_key may carry a
+            # "（来自 session <sid>）" tail. The by_content pool index is
+            # keyed on BARE content — without this strip, a provenance-
+            # annotated line would never match its pool row and would
+            # fail-open-keep (even if the pool row is now superseded/settled)
+            # until the next live re-freeze. Stripping here keeps the
+            # re-freeze convergent. (The separate ℹ️ lifecycle-hint lines
+            # don't match the [type] regex, so they're kept verbatim and
+            # need no strip.)
+            _ck = re.sub(r"（来自 session [^）]+）\s*$", "", content_key)
+            rows_for_content = by_content.get(_ck)
             if rows_for_content is None:
                 # Content not in the pool (drained / deduped / new since
                 # freeze): fail-open keep the line.
@@ -5776,7 +5791,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 # non-host / empty snapshot leaves it unset (fail-soft: a
                 # missing origin_session never blocks the save; the read face
                 # treats absence as "no provenance to show", not an error).
-                _osid = getattr(self, "session_id", None)
+                _osid = getattr(self, "_turn_active_sid", None) or self.session_id
                 if _osid and _osid != "default":
                     _item_meta["origin_session"] = _osid
                 # ── settled 双通道汇流打标（_save_memory 是唯一 choke point）──

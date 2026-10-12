@@ -66,16 +66,31 @@ def _make_provider(tmpdir: pathlib.Path, session_id: str = "s_cur",
 
 
 # ── write side: _save_memory stamps metadata.origin_session ─────────────
-def test_save_memory_stamps_origin_session():
+def test_save_memory_stamps_origin_session_prefers_turn_active_sid():
     tmp = pathlib.Path(tempfile.mkdtemp())
-    p = _make_provider(tmp, session_id="s_live_42")
+    p = _make_provider(tmp, session_id="s_stale")
     p._failure_recent = {}
-    p._turn_active_sid = "s_live_42"
+    # a reused-instance scenario: _turn_active_sid is the caller's real
+    # current session (fresh), self.session_id is STALE (prior session).
+    p._turn_active_sid = "s_fresh"
     item_id = p._save_memory("一条带来源戳的新记忆", level="L0", source="auto")
     assert item_id, "save should return an id"
     items = json.loads((p.memories_dir / "fact.json").read_text(encoding="utf-8"))
     row = [r for r in items if r["id"] == item_id][0]
-    assert row["metadata"].get("origin_session") == "s_live_42"
+    # _turn_active_sid wins over the stale self.session_id
+    assert row["metadata"].get("origin_session") == "s_fresh"
+
+
+def test_save_memory_falls_back_to_session_id_when_no_turn_active_sid():
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    p = _make_provider(tmp, session_id="s_cur")
+    p._failure_recent = {}
+    p._turn_active_sid = None  # standalone / no active turn
+    item_id = p._save_memory("无活跃 turn 的保存", level="L0", source="auto")
+    assert item_id
+    items = json.loads((p.memories_dir / "fact.json").read_text(encoding="utf-8"))
+    row = [r for r in items if r["id"] == item_id][0]
+    assert row["metadata"].get("origin_session") == "s_cur"
 
 
 def test_save_memory_default_session_stamps_no_origin_session():
