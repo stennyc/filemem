@@ -45,7 +45,8 @@ MEMORY_FILES = ["fact.json", "preference.json", "decision.json", "task.json"]
 # exec1 window lower bound: manifest anchor_rules says
 # "created_at >= 2026-09-24T23:50:00 (local naive; room discussion window)".
 # This host is MSL UTC+8, and item created_at is written naive-UTC by the
-# provider (datetime.utcnow().isoformat()), so the bound in created_at format:
+# provider (_utcnow() in __init__.py: aware-UTC stripped to naive), so the
+# bound in created_at format:
 WINDOW_START_LOCAL = "2026-09-24T23:50:00"
 WINDOW_START_UTC = "2026-09-24T15:50:00"
 LOCAL_TZ_OFFSET_H = 8
@@ -198,7 +199,7 @@ def main() -> int:
         })
     record = {
         "run_id": "p2-selftest-20260925-v2-tag-m2",
-        "executed_at": datetime.now().astimezone().isoformat(),
+        "executed_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         "executed_by": "coder (v2 tag script, M2 exec window)",
         "recompute_rule": {
             "window_local": WINDOW_START_LOCAL,

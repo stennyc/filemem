@@ -1,5 +1,5 @@
 {
-  "captured_at": "2026-10-12 (path b: re-captured from live store)",
+  "captured_at": "2026-10-12 (path b: re-captured via tools/recapture_sa2_3_fixture.py)",
   "note": "baseline_top5 deduped (a duplicate episodic id can appear twice in legacy top5). Post-SA2-3 gate = RETRIEVABILITY, not top5-set-invariance: every baseline id must still be eligible in the post-RRF pool (legacy substring qualification gate is preserved verbatim, so nothing previously recallable is lost). RRF re-ranking within the eligible pool is BY DESIGN (spec SA2-3 Acceptance 1 also requires idf-based ranking improvement, which top5-set-invariance would forbid). Ranking improvement is gated separately by test_bm25_idf_rare_term_outranks_common.",
   "queries": {
     "en": [
@@ -9,10 +9,10 @@
           "preference_154_1791703264",
           "preference_o1sup_1791743452579",
           "preference_145_1791346523",
-          "task_o1sup_1791744092375",
-          "task_163_1791696347"
+          "task_o1sup_1791751891814",
+          "preference_drain_202_1791628484"
         ],
-        "n_hits": 724
+        "n_hits": 731
       },
       {
         "query": "CJS module system",
@@ -23,29 +23,29 @@
           "task_177_1791715001",
           "preference_o1sup_1791743452579"
         ],
-        "n_hits": 723
+        "n_hits": 730
       },
       {
         "query": "flock cross process lock",
         "baseline_top5": [
           "preference_154_1791703264",
           "fact_drain_179_1791688201",
-          "preference_o1sup_1791743452579",
           "decision_58_1791703270",
-          "preference_drain_202_1791628484"
+          "preference_drain_202_1791628484",
+          "preference_o1sup_1791743452579"
         ],
-        "n_hits": 721
+        "n_hits": 728
       },
       {
         "query": "knowledge tier",
         "baseline_top5": [
           "preference_154_1791703264",
           "preference_drain_152_1791702783",
+          "task_o1sup_1791751891814",
           "preference_drain_116_1791601882",
-          "task_o1sup_1791744092375",
           "preference_145_1791346523"
         ],
-        "n_hits": 724
+        "n_hits": 731
       },
       {
         "query": "file_memory_search min score",
@@ -53,21 +53,21 @@
           "preference_154_1791703264",
           "preference_o1sup_1791743452579",
           "preference_145_1791346523",
-          "preference_drain_152_1791702783",
-          "preference_drain_153_1791702802"
+          "task_o1sup_1791751891814",
+          "preference_drain_152_1791702783"
         ],
-        "n_hits": 724
+        "n_hits": 731
       },
       {
         "query": "python pytest tests",
         "baseline_top5": [
           "preference_154_1791703264",
-          "task_o1sup_1791744092375",
           "preference_145_1791346523",
-          "task_163_1791696347",
-          "preference_320_1791457650"
+          "task_o1sup_1791751891814",
+          "preference_320_1791457650",
+          "task_163_1791696347"
         ],
-        "n_hits": 723
+        "n_hits": 730
       }
     ],
     "zh": [
@@ -76,22 +76,22 @@
         "baseline_top5": [
           "preference_154_1791703264",
           "fact_drain_179_1791688201",
-          "task_o1sup_1791744092375",
           "preference_145_1791346523",
+          "task_o1sup_1791751891814",
           "preference_320_1791457650"
         ],
-        "n_hits": 487
+        "n_hits": 492
       },
       {
         "query": "部署 记忆",
         "baseline_top5": [
           "preference_154_1791703264",
-          "task_166_1791698632",
-          "task_o1sup_1791744092375",
+          "task_o1sup_1791751891814",
           "preference_drain_93_1791594637",
-          "preference_drain_157_1791375676"
+          "preference_drain_157_1791375676",
+          "task_166_1791698632"
         ],
-        "n_hits": 651
+        "n_hits": 657
       },
       {
         "query": "文件 锁",
@@ -102,7 +102,7 @@
           "task_166_1791698632",
           "task_163_1791696347"
         ],
-        "n_hits": 714
+        "n_hits": 720
       },
       {
         "query": "插件 目录",
@@ -111,9 +111,9 @@
           "task_177_1791715001",
           "preference_drain_137_1791684701",
           "preference_320_1791457650",
-          "task_o1sup_1791744092375"
+          "task_o1sup_1791751891814"
         ],
-        "n_hits": 653
+        "n_hits": 659
       },
       {
         "query": "用户 偏好",
@@ -124,7 +124,7 @@
           "preference_201_1791627642",
           "preference_119_1791677567"
         ],
-        "n_hits": 655
+        "n_hits": 661
       }
     ]
   }

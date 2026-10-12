@@ -80,6 +80,34 @@ def test_human_text_starting_with_parenthesis_is_not_noise():
     assert FileMemProvider._is_noise_confirm_row("(见上文) 结论已确认") is False
 
 
+# ── noise rule tightening (reviewer round 2, finding #3) ───────────────────
+def test_cjk_brace_mark_human_text_is_kept():
+    # "{注意} 模板要注意转义" starts with { but is a CJK human marker, not JSON
+    assert FileMemProvider._is_noise_confirm_row("{注意} 这个模板要注意转义") is False
+
+
+def test_cjk_bracket_mark_human_text_is_kept():
+    assert FileMemProvider._is_noise_confirm_row("[注意] 这是人话说明") is False
+
+
+def test_cjk_brace_metaphor_human_text_is_kept():
+    assert FileMemProvider._is_noise_confirm_row("{这个括号是比喻，不是JSON}") is False
+
+
+def test_truncated_json_with_ascii_key_pattern_is_noise():
+    # truncated tool output still carries the "key": structure -> noise
+    assert FileMemProvider._is_noise_confirm_row('{"file": "x.py", "lines": [1, 2, 3]') is True
+
+
+def test_truncated_json_with_cjk_key_pattern_is_noise():
+    # tool output truncated at a CJK-quoted key still carries the key pattern
+    assert FileMemProvider._is_noise_confirm_row('{"任务": "P3-1 filemem 低价值草稿静默…') is True
+
+
+def test_complete_json_dict_is_noise():
+    assert FileMemProvider._is_noise_confirm_row('{"status": "dispatched", "count": 1}') is True
+
+
 # ── _session_title_hint ────────────────────────────────────────────────────
 def _write_trace(p: FileMemProvider, sid: str, first_user: str,
                  assistant_first: bool = False) -> None:

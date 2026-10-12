@@ -2523,11 +2523,13 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
 
         Fail-soft diagnostic chain (N2):
           B4 盘写失败由 _write_episodic_entry 内部 try/except 吞掉并打
-          logger.warning（见 L11379-11380 的 except 分支）；
+          logger.warning（见 _write_episodic_entry 末尾的 except 分支，搜
+          "episodic write failed"）；
           _on_turn_close_check 本身不 catch _write_episodic_entry 的异常（设计
           如此，由 sync_turn 末尾的 try/except 兜底）；sync_turn 的 DEBUG 行
-          （L4745: "turn-close B4 fallback skipped"）是 catch-all，本层
+          （搜 "turn-close B4 fallback skipped"）是 catch-all，本层
           不重复打 WARNING。
+          （行号故意用软引用：绝对行号随后续 commit 漂移，搜日志串才稳。）
 
         Partial-snapshot semantic (N3):
           本 fallback 在 session 中途（turn 1/N）触发时，写出的 B4 行是
@@ -4231,11 +4233,14 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         裁决面 —— 用户没法对着一串 JSON 做 confirm/discard 裁决。
 
         判定（保守，只丢"确定是 JSON 输出"的行，绝不误伤人话）：
-          * 去空白后以 { 或 [ 开头，且 json.loads 解析失败（截断/内嵌
-            多段输出）-> 噪声（例：{"status": "success", "output": …）
           * json.loads 成功（完整 JSON 对象/数组，工具结果整包被存成草稿）
             -> 噪声（例：{"tasks": [{"id": …}]}）
-          * 解析失败但开头不是 {/[ -> 人话草稿，保留
+          * json.loads 失败（截断/残片）且开头 {/[ 且首 200 字符内
+            含 `"key":` 键值模式（re 双引号版或裸 CJK-key 单/双引号版）
+            -> 截断 JSON 工具输出，噪声（例：{"status": "success", …）
+          * json.loads 失败但 {/[ 开头且无键值模式（如 "{注意} 模板
+            要转义" / "[注意] 人话" 等 CJK 标记式人话）-> 保留
+          * 开头不是 {/[ -> 人话草稿，保留
         噪声行仍留在 drafts 存储里（审计面不受影响），只是 pending-confirm
         队列 / [记忆报告] 面板不再列它。
         """
@@ -4248,7 +4253,15 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             json.loads(text)
             return True  # 完整 JSON 包 = 工具输出整包
         except Exception:
-            return True  # 截断 JSON 残片 = 工具输出片段
+            # 截断残片：只有形似键值结构的才判噪声。"key": 双引号 ASCII 版
+            # 或 '"CJK词":' 版（工具输出被截断到 CJK 键处仍保留冒号结构）；
+            # 无键值模式（{注意}/[注意] 人话标记）保留。
+            window = text[:200]
+            if re.search(r'"\w+"\s*:', window):
+                return True  # ASCII "key": value pattern
+            if re.search(r'"[\u4e00-\u9fff]+"\s*[:：]', window):
+                return True  # CJK "词": / "词"： key pattern
+            return False
 
     def _turn_report_line(self, sid: str) -> str:
         """T4①: the turn-level memory-confirmation line (@user requirement:
