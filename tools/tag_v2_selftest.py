@@ -30,7 +30,7 @@ import argparse
 import hashlib
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # --- topology (N=1, resolved physical path — Reviewer path-resolution rule) ---
@@ -162,7 +162,7 @@ def main() -> int:
         if not target_idx:
             continue
         rows = json.loads(fpath.read_text(encoding="utf-8"))
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         for idx, item in enumerate(rows):
             if idx not in target_idx:
                 continue

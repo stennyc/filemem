@@ -2523,8 +2523,11 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
 
         Fail-soft diagnostic chain (N2):
           B4 盘写失败由 _write_episodic_entry 内部 try/except 吞掉并打
-          logger.warning（见 _write_episodic_entry 末尾 except 分支，约 L11308）；
-          _on_turn_close_check 本身不 catch _write_episodic_entry 的异常（设计如此，
+          logger.warning（见 L11379-11380 的 except 分支）；
+          _on_turn_close_check 本身不 catch _write_episodic_entry 的异常（设计
+          如此，由 sync_turn 末尾的 try/except 兜底）；sync_turn 的 DEBUG 行
+          （L4745: "turn-close B4 fallback skipped"）是 catch-all，本层
+          不重复打 WARNING。
 
         Partial-snapshot semantic (N3):
           本 fallback 在 session 中途（turn 1/N）触发时，写出的 B4 行是
@@ -2532,8 +2535,6 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
           on_session_end 正常跑通，它会再写一行完整 snapshot；两行可共存
           （append-only 写层不 dedup），rescore 面靠 scored-id gate 去重，
           重复 eid 不会造成双打分。
-          由 sync_turn 末尾的 try/except 兜底）；sync_turn 的 DEBUG 行（约 L4705-4706）
-          是 catch-all，本层不重复打 WARNING。
         """
         if not session_id:
             return

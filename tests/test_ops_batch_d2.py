@@ -19,7 +19,7 @@ import pathlib
 import sys
 import tempfile
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from __init__ import FileMemProvider  # noqa: E402
@@ -28,7 +28,7 @@ _PLUGIN_LOGGER = "__init__"  # `logger = logging.getLogger(__name__)` in the plu
 
 
 def _now_ts() -> float:
-    return datetime.utcnow().timestamp()
+    return datetime.now(timezone.utc).timestamp()
 
 
 def _provider(tmp: pathlib.Path, sid: str = "s_q") -> FileMemProvider:
