@@ -4015,20 +4015,27 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                           if filename.startswith("drafts_")
                              and filename.endswith(".json")
                           else filename)
+                # Owner 2026-10-12: attach the session topic (first user
+                # message of the owning session's trace) so the user knows
+                # WHICH session this bare id refers to. Fail-soft: empty
+                # hint -> bare id header, unchanged.
+                _title = self._session_title_hint(_owner)
+                _header = (f"  [session {_owner} · {_title}]"
+                           if _title else f"  [session {_owner}]")
                 df = storage_dir / filename
                 try:
                     data = json.loads(df.read_text(encoding="utf-8"))
                 except Exception:
                     line_idx += 1
                     if last_hdr_owner != _owner:
-                        lines.append(f"  [session {_owner}]")
+                        lines.append(_header)
                         last_hdr_owner = _owner
                     lines.append(f"  {line_idx}. （内容不可读，待确认）")
                     continue
                 if not isinstance(data, (list, tuple)):
                     line_idx += 1
                     if last_hdr_owner != _owner:
-                        lines.append(f"  [session {_owner}]")
+                        lines.append(_header)
                         last_hdr_owner = _owner
                     lines.append(f"  {line_idx}. （内容不可读，待确认）")
                     continue
@@ -4036,7 +4043,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     if not isinstance(row, dict):
                         line_idx += 1
                         if last_hdr_owner != _owner:
-                            lines.append(f"  [session {_owner}]")
+                            lines.append(_header)
                             last_hdr_owner = _owner
                         lines.append(f"  {line_idx}. （内容不可读，待确认）")
                         continue
@@ -4056,7 +4063,14 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     # pending-draft notice is a user-visible auto surface).
                     if _meta.get("superseded") or _meta.get("settled"):
                         continue
-                    content = (row.get("content") or "").strip().replace("\n", " ")
+                    # Owner 2026-10-12: noise drafts (raw tool-output JSON
+                    # fragments) are NOT surfaced — the user cannot judge a
+                    # JSON fragment. They stay in draft storage (audit face
+                    # untouched); the notice just skips them.
+                    _row_content = (row.get("content") or "").strip().replace("\n", " ")
+                    if self._is_noise_confirm_row(_row_content):
+                        continue
+                    content = _row_content
                     if not content:
                         continue
                     if len(content) > 80:
@@ -4064,7 +4078,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     level = row.get("level") or "L0"
                     line_idx += 1
                     if last_hdr_owner != _owner:
-                        lines.append(f"  [session {_owner}]")
+                        lines.append(_header)
                         last_hdr_owner = _owner
                     lines.append(f"  {line_idx}. [{level}] {content}")
                 # P1-3 5b companion: a file listed as pending (the zero-
@@ -4076,13 +4090,20 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 if not lines and any(not isinstance(r, dict) for r in data):
                     line_idx += 1
                     if last_hdr_owner != _owner:
-                        lines.append(f"  [session {_owner}]")
+                        lines.append(_header)
                         last_hdr_owner = _owner
                     lines.append(f"  {line_idx}. （内容不可读，待确认）")
+            # Owner 2026-10-12: if every pending row was noise/superseded
+            # (nothing surfaced), skip the notice entirely — an empty body
+            # claiming "drafts await confirmation" is the same problem we're
+            # fixing (noise on a judgment surface).
+            if not lines:
+                return self._join_context(recall_context, turn_line)
             notice = (
                 "\n\n[未决草稿] 以下历史会话的记忆草稿待确认，可批量处置：\n"
                 + "\n".join(lines)
-                + "\n请调用 clarify（确认保存/丢弃/取消），确认后调 "
+                + f"\n{self.LEVEL_LEGEND}\n"
+                + "请调用 clarify（确认保存/丢弃/取消），确认后调 "
                   'filemem_review_drafts(action="confirm"/"discard") 批量处置。'
             )
             logger.info(
@@ -4162,6 +4183,73 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         """Concatenate the user-visible recall surface parts, dropping empties."""
         return "".join(part for part in parts if part)
 
+    # 裁决面级别图例（owner 2026-10-12：用户不知道 L0/L1/L2 是什么，
+    # 每个 user-visible 裁决面板尾部统一挂一行含义说明）。
+    LEVEL_LEGEND = (
+        "级别含义：L0 环境事实（自动存）/ L1 操作经验（session 结束确认）"
+        "/ L2 架构决策（需显式确认）"
+    )
+
+    def _session_title_hint(self, sid: str, max_len: int = 40) -> str:
+        """Owner 2026-10-12: 从 session trace 首条 user 消息提取 session 主题，
+        作为 [未决草稿] header 的标题（用户不知道裸 session id 是哪个 session）。
+
+        sessions/<sid>.jsonl 是 append-only trace；首条 role==user 的 content
+        就是该 session 的主题。读不到/trace 缺失/首条非 user -> 返回 ""
+        （fail-soft：header 退化为裸 id，不影响 notice 主体）。零锁纯读，
+        单文件顺序扫描首匹配即停，trace 文件小（KB 级），不引入 I/O 瓶颈。
+        """
+        if not sid:
+            return ""
+        sessions_dir = getattr(self, "sessions_dir", None)
+        if not sessions_dir:
+            return ""
+        trace = sessions_dir / f"{sid}.jsonl"
+        try:
+            if not trace.exists():
+                return ""
+            with trace.open(encoding="utf-8") as fh:
+                for raw in fh:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        entry = json.loads(raw)
+                    except Exception:
+                        continue
+                    if isinstance(entry, dict) and entry.get("role") == "user":
+                        msg = (entry.get("content") or "").strip().replace("\n", " ")
+                        if msg:
+                            return msg[:max_len] + ("…" if len(msg) > max_len else "")
+            return ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _is_noise_confirm_row(content: str) -> bool:
+        """Owner 2026-10-12 裁决：纯工具输出残片（JSON blob / 截断 JSON）不进
+        裁决面 —— 用户没法对着一串 JSON 做 confirm/discard 裁决。
+
+        判定（保守，只丢"确定是 JSON 输出"的行，绝不误伤人话）：
+          * 去空白后以 { 或 [ 开头，且 json.loads 解析失败（截断/内嵌
+            多段输出）-> 噪声（例：{"status": "success", "output": …）
+          * json.loads 成功（完整 JSON 对象/数组，工具结果整包被存成草稿）
+            -> 噪声（例：{"tasks": [{"id": …}]}）
+          * 解析失败但开头不是 {/[ -> 人话草稿，保留
+        噪声行仍留在 drafts 存储里（审计面不受影响），只是 pending-confirm
+        队列 / [记忆报告] 面板不再列它。
+        """
+        text = (content or "").strip()
+        if not text:
+            return False
+        if not (text.startswith("{") or text.startswith("[")):
+            return False
+        try:
+            json.loads(text)
+            return True  # 完整 JSON 包 = 工具输出整包
+        except Exception:
+            return True  # 截断 JSON 残片 = 工具输出片段
+
     def _turn_report_line(self, sid: str) -> str:
         """T4①: the turn-level memory-confirmation line (@user requirement:
         list WHAT will be saved, one item per line with its id, then a
@@ -4178,6 +4266,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         if not sid:
             return ""
         pending = (getattr(self, "_pending_confirm", None) or {}).get(sid, [])
+        # Owner 2026-10-12: noise rows (raw tool-output JSON fragments) are
+        # NOT surfaced — the user cannot judge a JSON fragment. They stay in
+        # draft storage (audit face untouched); the panel just skips them.
+        pending = [it for it in pending if not self._is_noise_confirm_row(it.get("content") or "")]
         if not pending:
             return ""
         lines = []
@@ -4190,7 +4282,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         return (
             "\n\n[记忆报告] 以下记忆将保存/已自动生成，可批量处置：\n"
             + "\n".join(lines)
-            + "\n请调用 clarify（确认保存/丢弃/取消），确认后调 "
+            + f"\n{self.LEVEL_LEGEND}\n"
+            + "请调用 clarify（确认保存/丢弃/取消），确认后调 "
               'filemem_review_drafts(action="confirm"/"discard") 批量处置。'
         )
 
