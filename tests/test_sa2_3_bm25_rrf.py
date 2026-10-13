@@ -69,13 +69,15 @@ def test_retrievability_gate_en_zh():
     also demands ranking improvement — gated separately by
     test_bm25_idf_rare_term_outranks_common).
 
-    NOTE: rows purged from the live store by an operational data-plane
-    cleanup (e.g. the 2026-10-13 host relay-block purge, C-leg) are NOT part
-    of the legacy substring qualification gate — they no longer exist, so they
-    must not be asserted as recallable. The fixture's baseline_top5 entries
-    already exclude the 2026-10-13-purged ids (preference_154, task_163,
-    task_166, task_177, task_199, task_211–217, decision_52/77/78/96,
-    preference_220); see the note field on the affected entries.
+    NOTE (2026-10-13 host relay-block purge): the C-leg data-plane cleanup
+    removed 22 rows from the live store. Of those, exactly 4 ids —
+    preference_154_1791703264, task_163_1791696347, task_166_1791698632,
+    task_177_1791715001 — were present in this fixture's baseline_top5 and
+    are now excluded here (dropped from the affected golden queries). The
+    other 18 purged rows were NEVER part of this fixture's baseline_top5, so
+    their absence from the live store has no bearing on this gate and they
+    are intentionally not listed in the fixture. A future reader should not
+    read the purged-id list as "all were once in the fixture".
     """
     p = _make_live_provider()
     checked = 0
