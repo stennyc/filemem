@@ -6,21 +6,19 @@
       {
         "query": "hermes plugin decay",
         "baseline_top5": [
-          "preference_154_1791703264",
           "preference_o1sup_1791743452579",
           "preference_145_1791346523",
           "task_o1sup_1791751891814",
           "preference_drain_202_1791628484"
         ],
-        "n_hits": 731
+        "n_hits": 731,
+        "note": "preference_154_1791703264 was a legacy baseline hit but was purged from the live store by relay-block C-leg (2026-10-13); it is no longer eligible, so it is dropped from baseline_top5 to keep the retrievability gate green without asserting on a deleted row."
       },
       {
         "query": "CJS module system",
         "baseline_top5": [
-          "preference_154_1791703264",
           "preference_drain_152_1791702783",
           "preference_drain_202_1791628484",
-          "task_177_1791715001",
           "preference_o1sup_1791743452579"
         ],
         "n_hits": 730
@@ -28,7 +26,6 @@
       {
         "query": "flock cross process lock",
         "baseline_top5": [
-          "preference_154_1791703264",
           "fact_drain_179_1791688201",
           "decision_58_1791703270",
           "preference_drain_202_1791628484",
@@ -39,7 +36,6 @@
       {
         "query": "knowledge tier",
         "baseline_top5": [
-          "preference_154_1791703264",
           "preference_drain_152_1791702783",
           "task_o1sup_1791751891814",
           "preference_drain_116_1791601882",
@@ -50,7 +46,6 @@
       {
         "query": "file_memory_search min score",
         "baseline_top5": [
-          "preference_154_1791703264",
           "preference_o1sup_1791743452579",
           "preference_145_1791346523",
           "task_o1sup_1791751891814",
@@ -61,11 +56,9 @@
       {
         "query": "python pytest tests",
         "baseline_top5": [
-          "preference_154_1791703264",
           "preference_145_1791346523",
           "task_o1sup_1791751891814",
-          "preference_320_1791457650",
-          "task_163_1791696347"
+          "preference_320_1791457650"
         ],
         "n_hits": 730
       }
@@ -74,7 +67,6 @@
       {
         "query": "测试 通过",
         "baseline_top5": [
-          "preference_154_1791703264",
           "fact_drain_179_1791688201",
           "preference_145_1791346523",
           "task_o1sup_1791751891814",
@@ -85,30 +77,23 @@
       {
         "query": "部署 记忆",
         "baseline_top5": [
-          "preference_154_1791703264",
           "task_o1sup_1791751891814",
           "preference_drain_93_1791594637",
-          "preference_drain_157_1791375676",
-          "task_166_1791698632"
+          "preference_drain_157_1791375676"
         ],
         "n_hits": 657
       },
       {
         "query": "文件 锁",
         "baseline_top5": [
-          "preference_154_1791703264",
           "decision_58_1791703270",
-          "fact_drain_179_1791688201",
-          "task_166_1791698632",
-          "task_163_1791696347"
+          "fact_drain_179_1791688201"
         ],
         "n_hits": 720
       },
       {
         "query": "插件 目录",
         "baseline_top5": [
-          "preference_154_1791703264",
-          "task_177_1791715001",
           "preference_drain_137_1791684701",
           "preference_320_1791457650",
           "task_o1sup_1791751891814"

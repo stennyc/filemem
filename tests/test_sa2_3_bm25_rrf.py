@@ -61,13 +61,22 @@ def _fixture_queries():
 
 # ── Acceptance 1+2 (corrected gate): RETRIEVABILITY, not top5-set-invariance ─
 def test_retrievability_gate_en_zh():
-    """Every TRUE pre-SA2-3 legacy top-5 id must still be ELIGIBLE in the
-    post-RRF pool (min_score=0.0 over the full pool). The legacy substring
-    qualification gate is preserved verbatim by SA2-3, so nothing
-    previously recallable may be lost. RRF/idf re-ranking WITHIN the
-    eligible pool is by design and is NOT gated here (spec SA2-3
-    Acceptance 1 also demands ranking improvement — gated separately by
-    test_bm25_idf_rare_term_outranks_common)."""
+    """Every TRUE pre-SA2-3 legacy top-5 id that STILL EXISTS in the live store
+    must be ELIGIBLE in the post-RRF pool (min_score=0.0 over the full pool).
+    The legacy substring qualification gate is preserved verbatim by SA2-3, so
+    nothing previously recallable may be lost. RRF/idf re-ranking WITHIN the
+    eligible pool is by design and is NOT gated here (spec SA2-3 Acceptance 1
+    also demands ranking improvement — gated separately by
+    test_bm25_idf_rare_term_outranks_common).
+
+    NOTE: rows purged from the live store by an operational data-plane
+    cleanup (e.g. the 2026-10-13 host relay-block purge, C-leg) are NOT part
+    of the legacy substring qualification gate — they no longer exist, so they
+    must not be asserted as recallable. The fixture's baseline_top5 entries
+    already exclude the 2026-10-13-purged ids (preference_154, task_163,
+    task_166, task_177, task_199, task_211–217, decision_52/77/78/96,
+    preference_220); see the note field on the affected entries.
+    """
     p = _make_live_provider()
     checked = 0
     for lang, entries in _fixture_queries().items():
