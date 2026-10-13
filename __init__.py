@@ -260,6 +260,59 @@ _TOOL_OUTPUT_PREFIX = "<untrusted_tool_result"
 _TASK_PROMPT_MIN_CHARS = 1000
 _TASK_PROMPT_MIN_STEPS = 3
 
+# ── P1 relay-block 污染面（owner 2026-10-13，deleg_16f405d3 两轮复盘定稿）──
+# 宿主 delegate_task 回传块（`[ASYNC DELEGATION BATCH COMPLETE — deleg_…]`，
+# 内嵌旧任务 spec 全文 + "Full live transcript (…)" 尾行 + transcript 路径）
+# 被写侧误抽成持久行（preference_154 毒行实证：confirmed 全局骨架腿零过滤
+# + P0-2 中性 fail-open → 每个 session 含 delegate 子进程都灌旧任务全文，
+# compact 后活上下文短 → 权重放大 → 模型跳回旧任务）。现有三腿 (a)(b)(c)
+# 全漏（'[ASYNC DELEGATION' 不在 host 前缀表；回传块是 prose+JSON 混排非
+# opener dump；无 step 编号；P0-3 opener 表是 startswith，回传块开头恰是
+# 干净 prose `--- ✓ TASK 1/2: …`）。
+# 双特征判据（宁漏勿错：真经验行提 deleg_xxx 但无 'Full live transcript'
+# 尾特征 → 不命中；截断回传块漏尾 → 漏一行，接受 fail-soft）。
+_RELAY_BLOCK_TAIL_MARKER = "Full live transcript"   # 回传块尾行特征（硬门 (i)）
+_RELAY_BLOCK_HEAD_MARKERS = ("[ASYNC DELEGATION",)  # 回传块头特征（(ii) 之一）
+_RELAY_BLOCK_DELEG_RE = re.compile(r"deleg_[0-9a-f]{8}")  # 回传块必含批次 id
+
+
+def _is_relay_block(content: Optional[str]) -> bool:
+    """P1: single-source relay-block detector (write ingress + read fold).
+
+    TRUE iff the content carries BOTH relay-block features:
+      (i)  'Full live transcript' tail marker (hard gate — a human-written
+           experience line never carries it), AND
+      (ii) '[ASYNC DELEGATION' head marker OR a deleg_<8hex> batch id.
+    Pure stdlib (str scan + one precompiled re), zero LLM, never raises on
+    any input. A truncated relay block that lost its tail line misses (i)
+    and passes — accepted fail-soft (missing one row < killing a batch of
+    legitimate rows, same posture as the P0-1 ingress gate)."""
+    s = (content or "")
+    if _RELAY_BLOCK_TAIL_MARKER not in s:
+        return False
+    if any(m in s for m in _RELAY_BLOCK_HEAD_MARKERS):
+        return True
+    return bool(_RELAY_BLOCK_DELEG_RE.search(s))
+
+
+def _relay_pollution_fold(row: Any) -> bool:
+    """P1 read-side fold-out predicate (auto-inject face ONLY, zero I/O).
+
+    owner 裁决①（2026-10-13）：content 命中 _is_relay_block 双特征 → 一律
+    折出 auto-inject 面（不论 metadata.confirmed / failure_type /
+    source_profile）。行保留在 store + 显式 search 面可见，只是不再被
+    pre_llm_call 自动灌入。调用面：prefetch 过滤链（L3402 段）+ P3
+    cold-start replay 的 _filter_replayed_snapshot（L3934 段）——两个入口
+    共用本谓词（单源，写/读腿永不漂移，P0-3 既有先例）。fail-open：
+    非 dict 行 / content 非 str → False（不折，绝不因谓词 bug 丢召回）。
+    """
+    try:
+        if not isinstance(row, dict):
+            return False
+        return _is_relay_block(row.get("content"))
+    except Exception:  # pragma: no cover - fail-open
+        return False
+
 # ── settled 机制（"已定案"独立状态位，与 superseded/stale 语义分离）───────
 # 语义三分（owner 钉）：
 #   superseded = 这条错了/过时，被新结论顶替（有 superseded_by 接替行）
@@ -347,6 +400,16 @@ def ingress_reject_class(content: Optional[str],
     if len(s) >= _TASK_PROMPT_MIN_CHARS:
         if len(_TASK_STEP_RE.findall(s)) >= _TASK_PROMPT_MIN_STEPS:
             return "whole_task_prompt"
+    # (d) host relay block (P1, owner 2026-10-13): a delegate_task batch
+    # completion relay ([ASYNC DELEGATION …] + embedded old-task spec +
+    # 'Full live transcript' tail + transcript path) mis-captured as an
+    # experience row. Double-feature detector _is_relay_block (single
+    # source shared with the read-side _relay_pollution_fold). After (c),
+    # before return None — zero cross-interaction with (a)(b)(c) (the head
+    # marker is not in _HOST_INSTRUCTION_PREFIXES, the body is not a JSON/
+    # tool-opener dump, and it carries no step-numbering).
+    if _is_relay_block(s):
+        return "host_relay_block"
     return None
 
 
@@ -3403,6 +3466,24 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                                          getattr(self, "session_id", None))
             ]
             _c_folded = _c_pre - len(results)
+            # P1 relay-block read-side fold (owner 裁决①, 2026-10-13):
+            # host relay blocks ([ASYNC DELEGATION … + 'Full live transcript'
+            # tail) are NEVER auto-injected — regardless of the confirmed /
+            # failure stamps that let them survive the gate above (the
+            # poison-row class preference_154). The row stays in the store
+            # and on the explicit search face; only the auto-inject face is
+            # cut. Single source _relay_pollution_fold (shared detector with
+            # the write ingress (d) leg) — this cut is DELIBERATE (unlike
+            # the unconfirmed-gate cut) and logs its own line so it is
+            # auditable.
+            _relay_pre = len(results)
+            results = [r for r in results if not _relay_pollution_fold(r)]
+            _relay_folded = _relay_pre - len(results)
+            if _relay_folded:
+                logger.info(
+                    f"FileMem: P1 relay-block cut {_relay_folded} item(s) "
+                    f"(host relay-block rows folded out of the auto-inject "
+                    f"face; store + search face unaffected)")
             # BRINGBACK P4 'bring_back' (B2-A): reorder, NOT collect. Pin the
             # previous closed session's confirmed rows to the top of the
             # surviving set (continuity context first). The row set is
@@ -3891,10 +3972,23 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             # produces. A line not in that shape is not a recall line (e.g. a
             # [未决草稿] notice riding the same return); keep it.
             m = re.match(r"^\[(\w+)\]\s(.+)$", s)
-            if not m:
-                kept_lines.append(line)
-                continue
-            content_key = m.group(2).strip()
+            if m:
+                content_key = m.group(2).strip()
+            else:
+                # P1 relay-block gap: a recall line whose CONTENT opens with
+                # `[` (host relay blocks: `[ASYNC DELEGATION …]`) is not
+                # parseable by the primary `^\[(\w+)\]\s(.+)$` (the content's
+                # `[` breaks the `\s` boundary) and would fail-open-keep.
+                # Retry with the type-bracket matched but the boundary NOT
+                # required — content = everything after `[<type>]`. This lets
+                # the relay-fold predicate (below) gate a legacy frozen relay
+                # line; a content that genuinely is not in the pool still
+                # fails open (by_content miss -> keep), so zero recall loss.
+                m2 = re.match(r"^\[(\w+)\] ?(.*)$", s)
+                if not m2:
+                    kept_lines.append(line)
+                    continue
+                content_key = m2.group(2).strip()
             # owner 2026-10-12 (reviewer round 3, finding #2): the frozen
             # block is written AFTER the provenance suffix is composed into
             # each `[type] content` line, so content_key may carry a
@@ -3931,8 +4025,15 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             # confirmed global skeleton rather than an empty block.
             any_row_kept = False
             for row in rows_for_content:
+                # P1 relay-block replay fold (owner 裁决①, 2026-10-13):
+                # host relay-block lines are dropped from the frozen
+                # snapshot exactly like the live prefetch face (single
+                # source _relay_pollution_fold) — otherwise a poison-row
+                # frozen BEFORE the A leg landed would keep re-injecting
+                # on every cold-start replay of this session.
                 if _auto_inject_eligible(row, session_sp,
-                                          getattr(self, "session_id", None)):
+                                          getattr(self, "session_id", None)) \
+                        and not _relay_pollution_fold(row):
                     any_row_kept = True
                     break
             if any_row_kept:

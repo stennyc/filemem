@@ -1,0 +1,28 @@
+[ASYNC DELEGATION BATCH COMPLETE — deleg_4f93e18d]
+A background fan-out unit you dispatched earlier — 2 subagent(s) — has finished; its consolidated results are below. Any other units from the same delegate_task call report separately as they finish. You may have moved on since dispatching — act on these or re-dispatch if things have changed. If you are still waiting on siblings, end your turn after acting on this one.
+
+Dispatched: 2026-10-11 21:33:31 (20m57s ago)
+Role: leaf   Model: ?   Total duration: 1258.02s
+
+--- ✓ TASK 1/2: 修改 /root/.hermes/plugins/filemem 的 P3-1 改动，补全 4 项：S1（失败路径无测试）、S2（drafts 活引用改防御拷贝）、N1（getattr set 死角消除）、N4（并发不变量注释）。完成后跑测试确认全绿。这是文件级改动，不要碰宿主 /usr/local/lib/hermes-agent。  (status=completed, api_calls=29, 1253.01s) ---
+Both failures are the 2 pre-existing known failures from the task spec (test_flock_n_process_zero_lost + test_retrievability_gate_en_zh). All P3-1 tests pass.
+
+{"verdict":"ok","tests_after":"791 passed, 2 failed (pre-existing: test_flock_n_process_zero_lost + test_retrievability_gate_en_zh)"}
+Full live transcript (complete tool/assistant trace): /root/.hermes/cache/delegation/live/deleg_4f93e18d/task-0.log
+
+--- ✓ TASK 2/2: 修改 /root/.hermes/plugins/filemem/__init__.py 的 _unscored_episodic_candidates，在 return 前加 eid 去重（解决跨进程双写同 eid 导致 rescore N-cap 切片拖延迟 + 候选扫描 O(总行数) 问题），并确认 _s3_water_level_rescan 的 (b) 项计数同步变 distinct。完成后跑相关测试确认全绿。  (status=completed, api_calls=23, 559.43s) ---
+All three edits have been verified on disk. Test results:
+
+- **Targeted tests**: `tests/test_p1_1_burst_rescan.py` + `tests/test_ep_2_observe.py` → **24 passed**, no failures.
+- **Full suite**: **787 passed, 4 failed** — I verified via `git stash` that 2 of the 4 failures (`test_flock_n_process_zero_lost`, `test_retrievability_gate_en_zh`) are pre-existing at HEAD, unrelated to my changes. The other 2 stem from sibling subagents modifying the same file concurrently:
+  - `test_f2_drafts_flow_unchanged`: a sibling added `_episodic_written` to `__init__.py` but the provider's `__init__` never initializes it → `AttributeError`, pre-existing in the working tree, not caused by my changes.
+  - `test_p31_06_write_failure_does_not_stamp`: the original test was renamed to `test_p31_06_fallback_write_failure_not_marked` by a sibling; my version passes (1/1).
+- **Water level (b) count**: `_s3_water_level_rescan` directly does `total += len(self._unscored_episodic_candidates(...))` — no logic change needed, I added a single-line comment clarifying the dedup posture.
+- **Red-line check**: I modified only `_unscored_episodic_candidates` (dedup logic + docstring) and one comment line in `_s3_water_level_rescan`. `_llm_consolidate`, `_s3_water_level`, and N-cap logic are untouched.
+
+```json
+{"verdict": "ok", "tests_after": "787 passed, 4 failed (2 pre-existing at HEAD, 1 sibling rename + 1 sibling init gap)"}
+```
+
+[NOTE: subagent modified files the parent previously read — re-read before editing: /root/.hermes/plugins/filemem/__init__.py]
+Full live transcript (complete tool/assistant trace): /root/.hermes/cache/delegation/live/deleg_4f93e18d/task-1.log
