@@ -8,17 +8,15 @@
         "baseline_top5": [
           "preference_o1sup_1791743452579",
           "preference_145_1791346523",
-          "task_o1sup_1791751891814",
-          "preference_drain_202_1791628484"
+          "task_o1sup_1791751891814"
         ],
         "n_hits": 731,
-        "note": "preference_154_1791703264 was a legacy baseline hit but was purged from the live store by relay-block C-leg (2026-10-13); it is no longer eligible, so it is dropped from baseline_top5 to keep the retrievability gate green without asserting on a deleted row."
+        "note": "preference_154_1791703264 was a legacy baseline hit but was purged from the live store by relay-block C-leg (2026-10-13); it is no longer eligible, so it is dropped from baseline_top5 to keep the retrievability gate green without asserting on a deleted row. preference_drain_202_1791628484 (the legacy filemem-only standing-rules row) was likewise dropped from this fixture's baseline_top5 on 2026-10-14: a newer consolidated row preference_drain_176_1791918178 (filemem + knowledge-base-search + code_map owner rules) stamped it metadata.superseded=true with superseded_by -> drain_202, moving drain_202 out of the search main pool (EP-1 superseded fold-out). The semantic content remains reachable through the surviving successor row drain_176, so the gate's assertion no longer keys off the superseded legacy row."
       },
       {
         "query": "CJS module system",
         "baseline_top5": [
           "preference_drain_152_1791702783",
-          "preference_drain_202_1791628484",
           "preference_o1sup_1791743452579"
         ],
         "n_hits": 730
@@ -28,7 +26,6 @@
         "baseline_top5": [
           "fact_drain_179_1791688201",
           "decision_58_1791703270",
-          "preference_drain_202_1791628484",
           "preference_o1sup_1791743452579"
         ],
         "n_hits": 728
@@ -103,7 +100,6 @@
       {
         "query": "用户 偏好",
         "baseline_top5": [
-          "preference_drain_202_1791628484",
           "preference_drain_152_1791702783",
           "preference_142_1791687192",
           "preference_201_1791627642",
