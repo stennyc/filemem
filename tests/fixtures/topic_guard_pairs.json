@@ -1,0 +1,35 @@
+{
+  "threshold_default": 0.1,
+  "same_class": [
+    {
+      "id": "filemem_bringback_vs_cross_session_skeleton",
+      "prev_topic": "filemem bring-back 串项目",
+      "cur_topic": "filemem 跨 session confirmed 骨架",
+      "expect_gate": true,
+      "note": "共享 filemem / session 词干，BM25 得分 >= 0.1"
+    },
+    {
+      "id": "kb_search_vs_kb_cleanup",
+      "prev_topic": "知识库 tool search 多轮混用",
+      "cur_topic": "知识库源码只可以一份 workspace 副本清理",
+      "expect_gate": true,
+      "note": "共享 知识库 / 源码 词干，同类"
+    }
+  ],
+  "cross_class": [
+    {
+      "id": "filemem_bringback_vs_codemap",
+      "prev_topic": "filemem bring-back 串项目",
+      "cur_topic": "codemap 读侧 cross-folder signal",
+      "expect_gate": false,
+      "note": "无共享词干，BM25 得分 0 < 0.1"
+    },
+    {
+      "id": "filemem_bringback_vs_supercompress",
+      "prev_topic": "filemem bring-back 串项目",
+      "cur_topic": "supercompress 上下文压缩水位复盘",
+      "expect_gate": false,
+      "note": "不同项目词干，异类"
+    }
+  ]
+}

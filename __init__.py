@@ -635,6 +635,100 @@ def _auto_inject_eligible(row: Any, session_sp: Optional[str],
         return False
 
 
+# ── P1-2: bring-back 跨 session 串项目根治（topic 维度 + 第 4 选项, 2026-10-14）──
+# 模块常量：topic 重叠自动闸默认关（owner 裁决 3）—— False = 不折任何跨
+# session confirmed 行（现状不变），owner 点头才开（monkeypatch / 宿主 env
+# 无关，测试直接 setattr 模块常量）。
+_TOPIC_OVERLAP_GATE_ENABLED = False
+# 默认 threshold（decay.json 的 topic_guard.threshold 热改优先，未配置回落
+# 0.1；纯 stdlib 数值，无宿主依赖）。
+_TOPIC_GUARD_DEFAULT_THRESHOLD = 0.1
+# T4 注入点：测试模块可注入自定义异常类（monkeypatch search_index 失败后，
+# 闸的 fail-soft 只认这个类 + 兜底 Exception —— 注入类使失败路径无歧义）。
+_TOPIC_GUARD_INJECT_EXC: Optional[type] = None
+
+
+def _topic_overlap_gate(prev_topic: Any, cur_topic: Any,
+                        decay_cfg: Optional[Dict[str, Any]] = None,
+                        threshold: Optional[float] = None) -> bool:
+    """P1-2 修复 3 谓词：topic 重叠自动闸（BM25 单方向，owner 裁决 1）。
+
+    以当前 session topic 为语料（单 doc corpus），上一 session topic 当
+    query 跑 search_index.BM25Index(k1, b).build([cur_doc]).score(prev_topic)
+    —— 纯 stdlib 确定性检索算子，零 LLM。得分 >= threshold（decay.json
+    topic_guard.threshold 热改，未配置回落 0.1）→ 同类主题，放行（True）；
+    < threshold → 不同类，折出（False，调用方据此折行）。
+
+    只用于"非当前 session 的 confirmed 行"（调用方谓词组合，本谓词只判
+    topic 相似度本身）。fail-soft（宁漏勿错，绝不丢数据）：
+      - 任一 topic 空 / None / 非 str → 放行（True，fail-open 不折）；
+      - threshold 未配置回落 0.1（decay_cfg 的 topic_guard.block 缺失 /
+        非 dict / 非数值同样回落，不 raise）；
+      - search_index import 失败 / tokenize 抛异常 / BM25Index 构造或
+        build/score 抛异常 → 放行（True，fail-open）——含测试注入的
+        自定义异常类（_TOPIC_GUARD_INJECT_EXC）及其兜底 Exception。
+    """
+    global _TOPIC_GUARD_INJECT_EXC
+    p = prev_topic if isinstance(prev_topic, str) else None
+    c = cur_topic if isinstance(cur_topic, str) else None
+    if not p or not c:
+        return True  # fail-open: 缺 topic 不折（无信息可判）
+    # threshold 解析：显式参数 > decay_cfg.topic_guard.threshold > 默认 0.1
+    t = threshold
+    if t is None:
+        t = _TOPIC_GUARD_DEFAULT_THRESHOLD
+        if isinstance(decay_cfg, dict):
+            tg = decay_cfg.get("topic_guard")
+            if isinstance(tg, dict):
+                raw = tg.get("threshold")
+                try:
+                    t = float(raw)
+                except (TypeError, ValueError):
+                    pass  # 非数值 → 回落默认
+    try:
+        from search_index import tokenize, BM25Index
+        doc = {"content": c, "topic": c}
+        idx = BM25Index().build([doc])
+        score = idx.score(p)
+        return bool(score) and score[0] >= t
+    except Exception:
+        # fail-open：任何 tokenize / BM25 构造 / 打分异常都不折（不 raise）。
+        # _TOPIC_GUARD_INJECT_EXC：测试注入的自定义失败类优先（无歧义），
+        # 随后兜底 Exception 全量 fail-open。
+        if _TOPIC_GUARD_INJECT_EXC is not None:
+            # reaching here means the generic handler caught something the
+            # injection class covers -> fail-open by design
+            return True
+        return True
+
+
+def _cross_session_confirmed_fold(row: Any,
+                                  cur_session_id: Optional[str]) -> bool:
+    """P1-2 修复 2 收行谓词（owner 裁决 2 = A）：topic_mismatch 选项下折出
+    "带 session 戳的跨 session confirmed 行"。
+
+    True（折出）当且仅当：row 是 dict + metadata.confirmed=True +
+    row.session_id 存在（非 None）且 != cur_session_id。零误伤（精确治串）：
+      - 无 session_id 的全局 confirmed 骨架行 → False（保留）；
+      - 当前 session 自己的 confirmed 行（sid == cur）→ False（保留）；
+      - 未 confirmed 的行 → False（上游 V2 两腿本来就不收，谓词不叠加）。
+    fail-open：非 dict / cur_session_id 为 None / 字段缺失 → False（不折，
+    绝不因谓词 bug 丢召回）。本谓词本身不调用方判 choice —— 调用方在
+    choice=='topic_mismatch' 时才对每行跑它（其他三值恒 False，零回归）。
+    """
+    try:
+        if not isinstance(row, dict):
+            return False
+        if not ((row.get("metadata") or {}).get("confirmed")):
+            return False
+        sid = row.get("session_id")
+        if sid is None:
+            return False  # 全局骨架（无 session 戳）→ 保留
+        return sid != cur_session_id
+    except Exception:
+        return False
+
+
 def _noise_table_hit(s: str, decay_cfg: Optional[Dict[str, Any]]) -> bool:
     """P0-3: the shared egress-noise OPENER tables — one table, wired into
     BOTH faces so they can never drift apart (写侧 ingress 切同表):
@@ -2314,6 +2408,12 @@ class FileMemProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize the provider."""
         self.session_id = session_id
+        # P1-3 子进程闸（owner 2026-10-14）：宿主 pre_llm_call 面
+        # filemem_auto_retrieve 每轮传入的 platform（delegate_task child
+        # session = "subagent"）。缺省 None —— 宿主没传 / 老版本 / 非
+        # pre_llm_call 路径时 _is_subagent_session() 恒 False（fail-soft，
+        # 退回现状不漏弹主 session footer）。
+        self._last_platform: Optional[str] = None
         self.hermetis_home = Path(kwargs.get("hermes_home", Path.home() / ".hermes"))
 
         # Setup directories — T5b config tier: auto-resolves to the shared
@@ -3484,6 +3584,54 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     f"FileMem: P1 relay-block cut {_relay_folded} item(s) "
                     f"(host relay-block rows folded out of the auto-inject "
                     f"face; store + search face unaffected)")
+            # P1-2 修复 2：topic_mismatch 选项（owner 裁决 2 = A）— 只折"带
+            # session 戳的跨 session confirmed 行"，保留无 session 戳全局
+            # 骨架 + 当前 session 自己的 confirmed 行（精确治串、零误伤）。
+            # choice != 'topic_mismatch' 时谓词根本不被调用 → 恒 False，
+            # 行为 == 现状（零回归不变量）。fail-open 单源谓词
+            # _cross_session_confirmed_fold（与 relay 腿同构）。
+            if _bb_choice == "topic_mismatch":
+                _tm_pre = len(results)
+                _cur_sid = getattr(self, "session_id", None)
+                results = [r for r in results
+                           if not _cross_session_confirmed_fold(r, _cur_sid)]
+                _tm_folded = _tm_pre - len(results)
+                if _tm_folded:
+                    logger.info(
+                        "FileMem: P1-2 topic_mismatch cut "
+                        f"{_tm_folded} item(s) (cross-session confirmed rows "
+                        f"folded; global skeleton + current-session rows kept)")
+            # P1-2 修复 3：topic 重叠自动闸（BM25，owner 裁决 1；默认关，
+            # owner 裁决 3）。只折"非当前 session 的 confirmed 行"里
+            # topic 与当前 session 异类的（_topic_overlap_gate 得分 <
+            # threshold）；同类放行；fail-soft 放行（topic 缺 / 异常不折）。
+            # 全局开关 + 阈值热改（decay.json topic_guard.threshold）；
+            # 检索面（filemem_search）不受影响（全新 ≠ 失联）。读模块级
+            # 当前值（globals()），所以测试的 monkeypatch 立即生效（避免
+            # 方法体直接引用全局名被 CPython 常量折叠）。
+            if globals().get("_TOPIC_OVERLAP_GATE_ENABLED"):
+                _cur_sid = getattr(self, "session_id", None) or session_id
+                _cur_topic = self._session_title_hint(_cur_sid) \
+                    if _cur_sid else ""
+                _gate_cfg = getattr(self, "_decay", None)
+                _pre = len(results)
+                _kept = []
+                for r in results:
+                    if _cross_session_confirmed_fold(r, _cur_sid) \
+                            and not _topic_overlap_gate(
+                                self._session_title_hint(
+                                    r.get("session_id")) if r.get("session_id")
+                                else "",
+                                _cur_topic, _gate_cfg):
+                        continue  # 异类跨 session confirmed 行 → 折出
+                    _kept.append(r)
+                _folded = _pre - len(_kept)
+                if _folded:
+                    logger.info(
+                        f"FileMem: P1-2 topic-guard cut {_folded} item(s) "
+                        f"(cross-class cross-session confirmed rows folded "
+                        f"by BM25 topic overlap gate; same-class kept)")
+                results = _kept
             # BRINGBACK P4 'bring_back' (B2-A): reorder, NOT collect. Pin the
             # previous closed session's confirmed rows to the top of the
             # surviving set (continuity context first). The row set is
@@ -3491,7 +3639,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             # the confirmed-global leg; this only surfaces it ahead of newer /
             # less-confirmed rows. pin=None (not chosen / no stamp) -> stable
             # order (== clean_start). Search face is untouched either way.
-            if _bb_choice == "bring_back" and len(results) > 1:
+            if _bb_choice == "bring_back" and len(results) > 1 \
+                    and not self._is_subagent_session():
                 _pin_sid = self._resolve_bringback_session_id(
                     getattr(self, "session_id", None))
                 if _pin_sid is not None:
@@ -8237,10 +8386,14 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     "properties": {
                         "choice": {
                             "type": "string",
-                            "enum": ["bring_back", "clean_start", "fresh"],
+                            "enum": ["bring_back", "clean_start", "fresh",
+                                     "topic_mismatch"],
                             "description": "bring_back=pin previous session's confirmed summaries to top of auto-inject; "
                                            "clean_start=V2 default (confirmed skeleton + current session rows, no pinning); "
-                                           "fresh=nothing auto-injected this session (search face still fully available)."
+                                           "fresh=nothing auto-injected this session (search face still fully available); "
+                                           "topic_mismatch=fold cross-session CONFIRMED rows (other sessions' stamped "
+                                           "confirmed lines) out of auto-inject while keeping the global confirmed "
+                                           "skeleton + this session's own rows (owner 裁决 2=A, P1-2 2026-10-14)."
                         }
                     },
                     "required": ["choice"]
@@ -9477,7 +9630,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         prefetch; the model resolves the user's choice (via clarify) and calls
         this tool exactly ONCE to persist it.
 
-        THREE choices (owner 2026-10-10, B2-A + fresh):
+        THREE choices (owner 2026-10-10, B2-A + fresh), PLUS the P1-2 fourth
+        option (owner 2026-10-14):
           - 'bring_back'  — pin the previous closed session's confirmed rows to
             the TOP of this session's auto-inject face (reorder only; the row
             set is unchanged from V2 — a confirmed prev-session row is already
@@ -9487,6 +9641,11 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             session's own rows; no pinning.
           - 'fresh'       — this session injects NOTHING on the auto face (even
             the confirmed global skeleton is folded out); a truly clean start.
+          - 'topic_mismatch' — P1-2 第 4 选项（owner 裁决 2 = A）: fold ONLY
+            cross-session CONFIRMED rows (rows carrying another session's
+            session_id + confirmed=True) out of the auto face; the global
+            confirmed skeleton (no session stamp) and this session's own
+            rows are KEPT (精确治串、零误伤).
 
         Per-session: the choice file is keyed by session_id; a fresh session
         re-asks. Fail-soft: an unreadable session_id degrades to 'unknown
@@ -9499,7 +9658,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         (owner invariant: 全新 ≠ 失联)."""
         sid = args.get("session_id") or getattr(self, "session_id", None)
         choice = args.get("choice", "clean_start")
-        valid = ("bring_back", "clean_start", "fresh")
+        valid = ("bring_back", "clean_start", "fresh", "topic_mismatch")
         if choice not in valid:
             return json.dumps({"success": False,
                               "error": f"choice must be one of {list(valid)}"})
@@ -12010,7 +12169,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         'fresh' (this session injects NOTHING on the auto face — even the
         confirmed global skeleton is folded out; the SEARCH face is unaffected).
         Any unrecognized value degrades to 'clean_start' (fail-soft to V2)."""
-        valid = ("bring_back", "clean_start", "fresh")
+        valid = ("bring_back", "clean_start", "fresh", "topic_mismatch")
         if choice not in valid:
             choice = "clean_start"
         p = self._bringback_choice_path(session_id)
@@ -12028,7 +12187,11 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         """P4 read: default 'clean_start' (== V2 two-leg behavior) when the file
         is absent/unreadable, the session is unresolvable, or the file carries
         an unrecognized value — fail-soft toward the default, never a crash,
-        never 'fresh' (a missing choice must not silently empty the auto face)."""
+        never 'fresh' (a missing choice must not silently empty the auto face).
+        P1-2 (owner 2026-10-14): the 4-value enum adds 'topic_mismatch'
+        (fold cross-session confirmed rows; global skeleton + current-session
+        rows kept — 裁决 2 = A). Unrecognized values still degrade to the
+        'clean_start' default (零回归)."""
         p = self._bringback_choice_path(session_id or "")
         if p is None:
             return "clean_start"
@@ -12037,7 +12200,8 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                 return "clean_start"
             data = json.loads(p.read_text(encoding="utf-8"))
             choice = data.get("choice")
-            if choice in ("bring_back", "clean_start", "fresh"):
+            if choice in ("bring_back", "clean_start", "fresh",
+                          "topic_mismatch"):
                 return choice
             # Back-compat: pre-3-value files stored boolean bring_back.
             if isinstance(data.get("bring_back"), bool):
@@ -12134,11 +12298,32 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         if sid:
             st[sid] = True
 
+    def _is_subagent_session(self) -> bool:
+        """P1-3 子进程闸谓词（owner 2026-10-14）：当前 session 是否为
+        delegate_task 子进程。宿主在创建 delegate_task child session 时
+        显式设 platform="subagent"（/usr/local/lib/hermes-agent/tools/
+        delegate_tool.py:277），并在每轮 pre_llm_call hook 面
+        filemem_auto_retrieve(session_id, ..., platform, ...) 把该 platform
+        传进来。provider 在 pre_llm_call 入口缓存到 self._last_platform，
+        本谓词只读该缓存，不碰宿主逻辑。
+
+        fail-soft：宿主老版本没传 / 非 pre_llm_call 路径（_last_platform
+        缺省或为 None）→ 不判子进程 → False（退回现状，不漏弹主 session
+        的 bring-back footer）。"""
+        return getattr(self, "_last_platform", None) == "subagent"
+
     def _bringback_clarify_footer(self, session_id: str) -> str:
         """Return the one-shot bring-back footer for THIS session's first
         non-trivial prefetch, or '' when: already asked (one-shot gate), a
         bring-back choice was already recorded for this session (idempotent —
         never re-ask), or no per-profile last_closed stamp to offer.
+
+        P1-3 子进程闸（owner 2026-10-14）：delegate_task 子进程 session
+        （platform == "subagent"）完全不生成 bring-back footer —— 不 clarify
+        3 选、不置顶、不 bring-back（子进程是一次性 leaf，开它不是为了"接着
+        上个 session 干"，弹 footer 只会把父 session 的 confirmed 摘要串进
+        子进程 prompt，导致子进程锚定回父 session 最早任务）。主 session
+        （platform != "subagent"）行为完全不变。
 
         THREE choices (owner 2026-10-10, B2-A + fresh option), mapped to
         filemem_set_bringback choice values:
@@ -12155,6 +12340,16 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         """
         sid = session_id or getattr(self, "session_id", None)
         if not sid:
+            return ""
+        # P1-3 子进程闸：delegate_task 子进程 session 完全不弹 bring-back
+        # footer（不 clarify、不置顶、不 bring-back）。父 session 行为不变。
+        if self._is_subagent_session():
+            logger.info(
+                "FileMem: P1-3 subagent gate: bring-back footer suppressed "
+                "for platform=subagent session %s (no bring-back, no clarify)"
+                % sid)
+            st = self._bringback_footer_state()
+            st[sid] = True  # one-shot held: 子进程不再重弹
             return ""
         st = self._bringback_footer_state()
         if st.get(sid, False):
@@ -12173,6 +12368,11 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         if prev_sid is None:
             return ""  # no per-profile last_closed stamp -> nothing to bring back
         st[sid] = True  # mark asked NOW so a re-fetch this turn does not re-fire
+        # P1-2 修复 1（owner 2026-10-14）: carry the PREVIOUS session's topic
+        # (its first user message via _session_title_hint, fail-soft to a bare
+        # id) so the model/owner sees WHICH topic is about to be crossed —
+        # the "串了谁" signal that the bare session id cannot give.
+        prev_topic = self._session_title_hint(prev_sid)
         # A (owner 2026-10-11): the footer is text that DIRECTS the model to
         # resolve the choice — it must emit the clarify TOOL (the native
         # single-select card, keyboard ↑↓ + Enter), NOT paraphrase the three
@@ -12186,11 +12386,13 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         # is an A-limitation, not a bug in this patch.)
         return (
             "\n\n---\n🔁 [带回账本] 上一个 session（"
-            f"{prev_sid}）已关闭。本次 session 的自动注入面如何处理？\n"
+            f"{prev_sid}"
+            + (f" · 主题「{prev_topic}」" if prev_topic else "")
+            + "）已关闭。本次 session 的自动注入面如何处理？\n"
             "【指令：必须调用 clarify 工具（原生单选卡，用户可键盘 ↑↓ 选择）问用户"
-            "一次，把下列 3 个选项作为 clarify 的 choices 传入；"
+            "一次，把下列 4 个选项作为 clarify 的 choices 传入；"
             "不要用纯文字把人话转述这几个选项。】\n"
-            "clarify 选项（3 个，按顺序传入 choices）：\n"
+            "clarify 选项（4 个，按顺序传入 choices）：\n"
             "  1) 带回 — 接着刚才干，把上一个 session 确认过（confirmed）的摘要"
             "【置顶】本次自动注入（只改排序、不新增行；收行仍是 V2 两腿）\n"
             "     → 用户选它后用 filemem_set_bringback(choice=\"bring_back\", "
@@ -12202,6 +12404,12 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
             "  3) 全新 — 本 session 彻底不自动注入（连全局确认骨架也不带）；"
             "检索面（filemem_search）仍全捞，全新 ≠ 失联\n"
             "     → 用 filemem_set_bringback(choice=\"fresh\", session_id=...) 落选\n"
+            "  4) 主题不连续（topic_mismatch）— 上一个 session 与本次主题不同类"
+            "（如串了别的项目）：只折出『带 session 戳的跨 session confirmed 行』，"
+            "保留无 session 戳的全局确认骨架 + 当前 session 自己的 confirmed 行；"
+            "检索面仍全捞\n"
+            "     → 用 filemem_set_bringback(choice=\"topic_mismatch\", "
+            "session_id=...) 落选\n"
             "不变式：检索面始终能跨 session 全捞，本选择只控制“要不要自动灌/带什么”，"
             "不控制“能不能拿到”。\n"
             "用户不答时按 fail-soft 默认“干净开局”（= V2 现状，不置顶、不折骨架）。"
@@ -12281,6 +12489,14 @@ def filemem_auto_retrieve(session_id: str, user_message: str, conversation_histo
         # Use cached provider instance (solution 2)
         provider = _get_cached_provider(session_id)
         _refresh_provider_llm_ctx(provider)  # S1b F3
+        # P1-3 子进程闸（owner 2026-10-14）：宿主每轮 pre_llm_call 把
+        # platform 传进来（delegate_task child session 为 "subagent"，
+        # 见 /usr/local/lib/hermes-agent/tools/delegate_tool.py:277）。
+        # 缓存到 provider 实例，供 _is_subagent_session() 读（零宿主改动，
+        # 只读宿主传入的参数）。fail-soft：platform 缺省 / None → _last_platform
+        # 保持缺省，_is_subagent_session 恒 False（退回现状，不漏弹主 session）。
+        if platform is not None:
+            provider._last_platform = platform
 
         # Native-md drain first (turn_start): move this profile's native
         # MEMORY.md/USER.md §-entries into the shared pool, then cleanly delete
