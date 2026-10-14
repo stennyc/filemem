@@ -363,7 +363,7 @@ TYPE_CLASSIFY_SCHEMA = {
     "properties": {
         "type": {
             "type": "string",
-            "enum": ["preference", "fact", "decision", "task"],
+            "enum": ["preference", "fact", "decision", "task", "plan"],
             "description": "the memory shard this content most precisely belongs to",
         },
     },
@@ -375,6 +375,9 @@ Classify the single memory content below into EXACTLY one shard type:
 - "preference": a user preference / taste / standing choice
 - "decision": a settled choice or decision about what to use / adopt / commit to
 - "task": an action to do, a to-do, something that MUST / needs to be completed
+- "plan": a structured multi-step execution sequence / PRD / ordered repair
+  plan with a clear done-when criterion; distinct from a single atomic task
+  (task = one to-do; plan = ordered steps with progress + completion state)
 - "fact": a neutral durable statement (default when none of the above fit)
 Prefer the MOST SPECIFIC non-fact type the content genuinely supports; use
 "fact" only when it is purely a neutral fact. Return a JSON object."""
@@ -395,7 +398,7 @@ def classify_type(main_runtime: Optional[Dict[str, Any]], content: str) -> Dict[
                                   TYPE_CLASSIFY_SCHEMA, content,
                                   temperature=0.0, max_tokens=64) or {}
         verdict = parsed.get("type")
-        if verdict not in ("preference", "fact", "decision", "task"):
+        if verdict not in ("preference", "fact", "decision", "task", "plan"):
             _record_face_fallback(main_runtime, Exception("invalid_type"))  # card 3: llm_call row fallback
             return {"type": None, "model_used": False,
                     "reason": f"invalid_type_fallback={verdict!r}"}

@@ -104,9 +104,17 @@ def test_zh_plain_fact_stays_fact():
 
 def test_regex_is_zero_llm_and_table_driven():
     """_detect_type touches only the module table + re: no LLM seam, no
-    provider LLM field needed. Every declared type has >=1 pattern row."""
-    assert set(_MEMORY_TYPE_REGEX) == {"preference", "decision", "task"}
-    for t in ("preference", "decision", "task"):
+    provider LLM field needed. Every declared type (except fact, the default
+    with no pattern row) has >=1 pattern row.
+
+    PLAN-type PRD §1.3: the table gained a "plan" entry; the invariant is
+    "every non-default type carries a pattern row", not a hardcoded key set
+    (a hardcoded set broke the day plan landed — this assertion now derives
+    from MEMORY_TYPES so adding a type can't silently regress the gate)."""
+    expected_keys = set(MEMORY_TYPES) - {"fact"}
+    assert set(_MEMORY_TYPE_REGEX) == expected_keys, \
+        f"_MEMORY_TYPE_REGEX keys {set(_MEMORY_TYPE_REGEX)} != {expected_keys}"
+    for t in expected_keys:
         assert _MEMORY_TYPE_REGEX[t], f"empty pattern row for {t}"
     p = _provider()
     # A provider with NO _main_runtime at all must still classify (regex-only).

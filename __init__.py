@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import json
 import math
 import logging
@@ -112,7 +113,7 @@ _HOST_LLM_CTX = None
 _HOST_MAIN_RUNTIME = None
 
 # Memory types
-MEMORY_TYPES = ["preference", "fact", "decision", "task"]
+MEMORY_TYPES = ["preference", "fact", "decision", "task", "plan"]
 
 # Memory levels
 MEMORY_LEVELS = ["L0", "L1", "L2"]
@@ -165,8 +166,24 @@ _MEMORY_TYPE_REGEX = {
     "task": [
         # English (legacy, unchanged)
         r"todo|to do|task|remember to|need to|should|must|have to",
-        # Chinese strong signals (no bare 需要/应该 — see the comment above)
-        r"待办|记得|别忘|不忘|要完成|计划|打算|必须|在下周|在下月|下个月|周五前|下下周",
+        # Chinese strong signals (no bare 需要/应该 — see the comment above;
+        # PLAN-type PRD §1.3: 裸"计划"已移除 — 它既可能是待办"我计划做X"(task)
+        # 也可能是"实施计划"(plan)，太弱会跟 plan 抢行；plan 的"实施计划"
+        # 强信号归 plan，task 保留更明确的待办/时间信号)
+        r"待办|记得|别忘|不忘|要完成|打算|必须|在下周|在下月|下个月|周五前|下下周",
+    ],
+    "plan": [
+        # PLAN-type PRD §1.3: structured multi-step execution sequence / PRD /
+        # ordered repair plan with a clear done-when criterion. Distinct from a
+        # single atomic task. Placed AFTER task in the fixed precedence so a
+        # content matching both task and plan strong signals lands task first
+        # (task's "需要/待办" words are common inside plans; only genuinely
+        # step-ordered / roadmap / PRD content escalates to plan).
+        r"\bstep\s*\d\b|\bphase\s*\d\b|roadmap|implementation\s+plan"
+        r"|fix\s+sequence|repair\s+plan|action\s+plan|execution\s+plan|multi-step"
+        r"|\bprds?\b",
+        r"步骤\s*\d|第\s*\d+\s*(步|阶段|点|条)|实施计划|修复步骤|执行计划"
+        r"|多步|落地方案|PRD|路线图|分\s*\d+\s*(步|阶段)",
     ],
 }
 
@@ -580,11 +597,20 @@ def _auto_recall_filter(pool: List[Dict[str, Any]], session_sp: Optional[str]) -
     to re-appear every turn. Zero-native-code: only touches filemem's own dir.
     """
     if session_sp is None:
-        return list(pool)
+        # fail-open for profile isolation, but the plan-type fold (PRD §10)
+        # is NOT session-scoped — a plan row never auto-injects even in the
+        # fail-open path. Fold plan rows out unconditionally; keep the rest.
+        return [r for r in pool
+                if not (isinstance(r, dict)
+                        and (r.get("type") == "plan"
+                             or (r.get("metadata") or {}).get("plan_id")))]
     try:
         return [
             r for r in pool
             if isinstance(r, dict)
+            # (0) plan-type fold (PLAN-type PRD §10): plan rows NEVER auto-inject
+            and not (r.get("type") == "plan"
+                     or (r.get("metadata") or {}).get("plan_id"))
             and _auto_recall_eligible(_row_source_profile(r), session_sp)
             and not ((r.get("metadata") or {}).get("superseded"))
             and not ((r.get("metadata") or {}).get("settled"))
@@ -598,6 +624,10 @@ def _auto_inject_eligible(row: Any, session_sp: Optional[str],
     """SESSION_ISOLATION_V2: auto-inject 面骨架谓词（owner 2026-10-10 定稿）。
 
     三面共用（prefetch / P3 回放 / egress）：
+      (0) plan 类型恒折（PLAN-type PRD §10）: plan 行（memories/plan.json）
+          永不进入 auto-inject 面——"任务≠上下文"，plan 的唯一召回入口是
+          b 面 filemem_plan(action="list")。判定：row 顶层 type=="plan" 或
+          metadata.plan_id 存在（upsert 行的 plan 身份标记）。
       (1) profile 隔离   _auto_recall_eligible(row_sp, session_sp)  # P0-2 不变
       (2) O1 折出        not _o1_fold_out_of_auto(row)             # 不变
       (3) confirmed 门（C-b）:
@@ -618,6 +648,9 @@ def _auto_inject_eligible(row: Any, session_sp: Optional[str],
     _bringback_reorder_key），而不是新增一条收行腿。收行语义不变（V2 两腿）。"""
     try:
         if not isinstance(row, dict):
+            return False
+        # (0) plan-type fold (PLAN-type PRD §10): plan rows never auto-inject
+        if row.get("type") == "plan" or (row.get("metadata") or {}).get("plan_id"):
             return False
         if session_sp is not None:
             if not _auto_recall_eligible(_row_source_profile(row), session_sp):
@@ -6344,7 +6377,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         runs at the save door, NOT in here.
         """
         content_lower = (content or "").lower()
-        for mem_type in ("preference", "decision", "task"):
+        for mem_type in ("preference", "decision", "task", "plan"):
             for pattern in _MEMORY_TYPE_REGEX.get(mem_type, ()):
                 if re.search(pattern, content_lower):
                     return mem_type
@@ -6698,7 +6731,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # Count the call against the budget (a call happened, whatever the verdict).
         budget[sid] = budget.get(sid, 0) + 1
         verdict = res.get("type")
-        if verdict in ("preference", "decision", "task"):
+        if verdict in ("preference", "decision", "task", "plan"):
             return verdict
         # LLM agreed with fact / returned an invalid verdict -> no override.
         return None
@@ -8200,7 +8233,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     "properties": {
                         "type": {
                             "type": "string",
-                            "enum": ["preference", "fact", "decision", "task"],
+                            "enum": ["preference", "fact", "decision", "task", "plan"],
                             "description": "Type of memory"
                         },
                         "content": {
@@ -8258,7 +8291,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         },
                         "type": {
                             "type": "string",
-                            "enum": ["all", "preference", "fact", "decision", "task"],
+                            "enum": ["all", "preference", "fact", "decision", "task", "plan"],
                             "description": "Optional memory-type filter: recall only items of this type (a shard slice of the memory pool; 'all' or omitted = full pool including episodic + knowledge extensions)."
                         },
                         "window": {
@@ -8313,7 +8346,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         },
                         "type": {
                             "type": "string",
-                            "enum": ["preference", "fact", "decision", "task"],
+                            "enum": ["preference", "fact", "decision", "task", "plan"],
                             "description": "Optional: the shard/type the new correcting row should land in. Defaults to the type of the old row."
                         },
                         "level": {
@@ -8398,8 +8431,841 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     },
                     "required": ["choice"]
                 }
+            },
+            {
+                "name": "filemem_plan",
+                "description": "Manage structured multi-step plans (PLAN-type PRD). action='list' recalls unfinished plans (in_progress + blocked) cross-profile by default — the ONLY recall entry for plans (plans are NEVER auto-injected; this is the b-face). action='create' lands a new plan row (L2, no TTL). action='advance' drives the plan state machine (continue/revise now; block/select_option/complete_all/abandon/reopen/reconcile follow). Progress updates and route changes are ALL through this tool, never filemem_write. Cross-profile: any filemem-enabled profile may advance any plan; the three stamps (source_profile / last_touched_by / last_completed_by) record provenance without a 'current owner' field.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["list", "create", "advance"],
+                            "description": "Which verb: list = recall unfinished plans; create = land a new plan; advance = drive one plan's state machine"
+                        },
+                        # list params
+                        "state": {
+                            "type": "string",
+                            "enum": ["in_progress", "blocked", "done", "abandoned", "superseded", "all"],
+                            "description": "list only. Default 'in_progress' returns in_progress + blocked (unfinished). Explicit terminal state for audit."
+                        },
+                        "topic": {
+                            "type": "string",
+                            "description": "list/create only. Optional topic tag filter"
+                        },
+                        "profile": {
+                            "type": "string",
+                            "description": "list only. Optional refine: 'source:X' = plans created by X; 'touched:X' = plans last touched by X. Omit = cross-profile full view."
+                        },
+                        # create params
+                        "title": {
+                            "type": "string",
+                            "description": "create only. Short plan title"
+                        },
+                        "steps": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "create only. Ordered step texts (auto-id'd 1..N, all pending)"
+                        },
+                        "done_when": {
+                            "type": "string",
+                            "description": "create only. Completion criterion"
+                        },
+                        # advance params
+                        "plan_id": {
+                            "type": "string",
+                            "description": "advance only. Target plan id (from list)"
+                        },
+                        "op": {
+                            "type": "string",
+                            "enum": ["continue", "revise", "block", "select_option",
+                                     "resume", "complete_all", "abandon", "reopen",
+                                     "reconcile"],
+                            "description": "advance only. State-machine op (slice 2: revise live; the rest pending slice 3)"
+                        },
+                        "step": {"type": "integer", "description": "advance. Target step id"},
+                        "step_done": {"type": "integer", "description": "advance(continue). Mark this step done"},
+                        "anchor": {
+                            "type": "object",
+                            "description": "advance(continue/complete_all). REQUIRED when marking a step done: {kind: test_pass|git_hash|file_path, value: ...} OR {kind: no_anchor} (PRD §1.5)",
+                            "properties": {
+                                "kind": {"type": "string", "enum": ["test_pass", "git_hash", "file_path", "no_anchor"]},
+                                "value": {"type": "string"}
+                            }
+                        },
+                        "reason": {"type": "string", "description": "advance. Audit reason (block/select_option/abandon/reopen)"},
+                        "options": {
+                            "type": "array",
+                            "description": "advance(block). Options offered when stuck: [{id, text}]",
+                            "items": {"type": "object",
+                                      "properties": {"id": {"type": "string"}, "text": {"type": "string"}}}
+                        },
+                        "choice": {"type": "string", "description": "advance(select_option). The chosen option id"},
+                        "new_steps": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "advance(revise). Replace the plan's step list (same-goal refinement)"
+                        },
+                        "supersede_with": {
+                            "type": "string",
+                            "description": "advance(abandon). If the plan's route is being replaced by a NEW plan, set its plan_id (old plan becomes 'superseded'/L1; without it the plan becomes 'abandoned'/L0)"
+                        }
+                    },
+                    "required": ["action"]
+                }
             }
         ]
+
+    # ── PLAN-type PRD §6: filemem_plan tool (list / create / advance) ────────
+    # A dedicated tool for the structured multi-step plan memory type. The
+    # 9 advance ops are landed in a later slice; this slice implements the
+    # storage shard helpers + create + list (advance revives a row for upsert
+    # is exercised via op="revise" which the storage layer supports).
+    #
+    # Invariants (locked by tests/test_plan_type_slice2.py):
+    #   - plan.json is a NEW shard, flat list of plan rows (same shape as
+    #     memories/{type}.json). upsert-by-plan_id: a second write with the
+    #     same plan_id MERGES metadata (plan_revision+1), does NOT stack a
+    #     new row (plan = live record, not an immutable log).
+    #   - create: lands an in_progress / L2 / source_profile-stamped row with
+    #     auto-id'd pending steps. Zero LLM, deterministic.
+    #   - list: cross-profile by default (PRD §6.3 — any filemem-enabled
+    #     profile sees all plans; the three stamps make provenance visible).
+    #     state="in_progress" (the default) returns in_progress + blocked
+    #     ("unfinished" semantics, PRD §6.4); explicit state=... returns
+    #     that terminal state for audit.
+    #   - I1 no-DELETE: list never mutates; abandoned/superseded/done rows
+    #     stay on disk (folded from auto-inject elsewhere, §10).
+
+    def _plan_shard_path(self) -> "Path":
+        return self.memories_dir / "plan.json"
+
+    def _plan_load_rows(self) -> List[Dict[str, Any]]:
+        f = self._plan_shard_path()
+        if not f.exists():
+            return []
+        try:
+            with self._shard_lock(f):
+                with open(f, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _plan_find_row(self, plan_id: str) -> Optional[Dict[str, Any]]:
+        for row in self._plan_load_rows():
+            if row.get("id") == plan_id or (row.get("metadata") or {}).get("plan_id") == plan_id:
+                return row
+        return None
+
+    def _plan_write_rows(self, rows: List[Dict[str, Any]]) -> None:
+        f = self._plan_shard_path()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        with self._shard_lock(f):
+            with open(f, "w", encoding="utf-8") as fh:
+                json.dump(rows, fh, ensure_ascii=False, indent=2)
+
+    def _reconcile_default_verifiers(self) -> Dict[str, Any]:
+        """PLAN-type PRD §8: production-default on-disk verifier surface.
+
+        Engaged ONLY when no injected ``_reconcile_verifiers`` seam is set
+        (the test-deterministic override keeps precedence). Returns a
+        ``{kind: callable(value) -> True|False|None}`` map + a ``"relocate"``
+        callable that re-checks anchors against the real repo at
+        ``source_cwd``. Each verifier is TRI-STATE:
+
+          True   = inspected and still holds (commit in object DB / file
+                   exists / test run green)
+          False  = inspected and the artifact is genuinely MISSING ->
+                   behind (rollback candidate)
+          None   = cannot inspect on this host (no source_cwd / not a git
+                   repo / runner unavailable) -> unverifiable, NOT behind
+
+        Fail-soft invariant (PRD §8.2): a host that cannot be inspected
+        yields None, NEVER a False 'behind' verdict — that would roll back
+        work we didn't check.
+
+          * git_hash  -> ``git cat-file -e <hash>`` (True/False object
+            existence; no repo / git exception -> None).
+          * file_path -> ``Path(source_cwd / value).exists()`` (no
+            source_cwd -> None).
+          * test_pass -> re-run the specific test via the project test
+            runner (``self._test_runner`` seam or the pytest default);
+            green -> True, failing -> False, cannot run -> None.
+          * relocate  -> git_hash only. Trigger: the stored hash still
+            resolves in the object DB (cat-file True) but is NOT reachable
+            from any ref in ``git rev-list --all`` (a rebase/amend orphaned
+            it; the patch survives under a new commit). Re-locate by
+            scanning rev-list for a commit whose tree
+            (``git rev-parse <h>^{}``) matches the stored hash's tree; when
+            no same-tree match exists (amend changed the content), fall
+            back to the current branch HEAD. Returns a refreshed anchor
+            dict, or None when the work cannot be re-located (the caller
+            then treats it as behind / unverifiable, never a bare
+            'not done')."""
+        source_cwd = getattr(self, "source_cwd", None)
+
+        def _git_repo() -> Optional[Path]:
+            if source_cwd is None:
+                return None
+            p = Path(source_cwd)
+            if not p.exists() or not p.is_dir():
+                return None
+            try:
+                r = subprocess.run(["git", "-C", str(p), "rev-parse",
+                                    "--is-inside-work-tree"],
+                                   capture_output=True, text=True, timeout=5)
+                return p if r.returncode == 0 else None
+            except Exception:
+                return None
+
+        repo = _git_repo()  # resolve once per reconcile call (cheap)
+
+        def _verify_git_hash(value: str):
+            """Tri-state verifier: True=commit exists in object DB,
+            False=inspected and missing (behind), None=cannot inspect.
+
+            PRD §8.2: never fabricate a 'behind' verdict on a host you
+            cannot inspect (repo is None -> None, not False)."""
+            if not value or repo is None:
+                return None
+            try:
+                r = subprocess.run(["git", "-C", str(repo), "cat-file", "-e",
+                                    value],
+                                   capture_output=True, text=True, timeout=10)
+                return r.returncode == 0
+            except Exception:
+                return None
+
+        def _verify_file_path(value: str):
+            """Tri-state: True=exists, False=missing (behind),
+            None=no source_cwd (cannot inspect -> unverifiable)."""
+            if not value:
+                return None
+            if source_cwd is None:
+                return None
+            return (Path(source_cwd) / value).exists()
+
+        def _verify_test_pass(value: str):
+            """Tri-state: True=still-green, False=reran and failing (behind),
+            None=cannot run (no source_cwd / runner missing) -> unverifiable.
+
+            The runner is ``self._test_runner`` when set (host can override
+            per-project: pytest / cargo test / go test / ...), else the
+            pytest default. Fail-soft: no source_cwd -> None (never fabricate
+            'the test still passes' or 'it is failing' on a host you cannot
+            inspect)."""
+            if not value:
+                return None
+            if source_cwd is None:
+                return None
+            runner = getattr(self, "_test_runner", None) or ["python", "-m", "pytest"]
+            try:
+                r = subprocess.run(
+                    list(runner) + [value],
+                    cwd=str(source_cwd),
+                    capture_output=True, text=True, timeout=120)
+                return r.returncode == 0
+            except Exception:
+                return None
+
+        def _relocate(step: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            """Anchor-invalid re-location (PRD §8.2): when a stored git hash
+            no longer points at an ACTIVE commit (rebase/amend orphaned it),
+            refresh the anchor to the re-located commit.
+
+            Trigger: the stored hash resolves in the object DB (cat-file
+            passes) but is NOT reachable from any ref (a rebase/amend
+            orphaned it — the patch survives under a new hash). The active
+            commit is found by scanning rev-list for the same patch: for an
+            amend of HEAD, the active hash is the current branch tip whose
+            tree matches. Returns a refreshed anchor dict, or None when the
+            work cannot be re-located (the caller then treats it as
+            behind / unverifiable, never a bare 'not done').
+            """
+            anchor = step.get("anchor") or {}
+            kind = anchor.get("kind")
+            if kind != "git_hash" or repo is None:
+                return None
+            old = str(anchor.get("value") or "")
+            if not old:
+                return None
+            # 1. Is the stored hash still reachable from any ref? A rebase /
+            #    amend orphans the old hash: cat-file still resolves it (the
+            #    object remains in the DB) but NO ref points at it, so the
+            #    stored anchor dangles — re-locate to the live commit that
+            #    carries the same tree (PRD §8.2: refresh, don't roll back).
+            #    A hash that IS reachable needs no re-location.
+            in_revlist = False
+            try:
+                r_all = subprocess.run(
+                    ["git", "-C", str(repo), "rev-list", "--all"],
+                    capture_output=True, text=True, timeout=10)
+                in_revlist = old in (r_all.stdout or "").split()
+            except Exception:
+                pass
+            if in_revlist:
+                return None  # still reachable -> no relocate needed
+            # 2. Orphaned (in the object DB but unreachable from any ref).
+            #    Re-locate: prefer a commit in rev-list whose tree matches the
+            #    stored hash's tree (an amend that kept the content keeps the
+            #    tree, only the commit hash changes). If no same-tree match
+            #    (content changed during amend), fall back to the current
+            #    branch HEAD — the most recent landing of that line of work.
+            try:
+                stored_tree = subprocess.run(
+                    ["git", "-C", str(repo), "rev-parse", old + "^{}"],
+                    capture_output=True, text=True, timeout=10)
+                tree = stored_tree.stdout.strip()
+                out = subprocess.run(
+                    ["git", "-C", str(repo), "rev-list", "--all"],
+                    capture_output=True, text=True, timeout=10)
+                for h in (out.stdout or "").splitlines():
+                    h = h.strip()
+                    if not h:
+                        continue
+                    t = subprocess.run(
+                        ["git", "-C", str(repo), "rev-parse", h + "^{}"],
+                        capture_output=True, text=True, timeout=10)
+                    if t.returncode == 0 and tree and t.stdout.strip() == tree:
+                        return {"kind": "git_hash", "value": h}
+                head = subprocess.run(
+                    ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                    capture_output=True, text=True, timeout=10)
+                if head.returncode == 0 and head.stdout.strip():
+                    return {"kind": "git_hash",
+                            "value": head.stdout.strip()}
+            except Exception:
+                return None
+            return None
+
+        return {"git_hash": _verify_git_hash,
+                "file_path": _verify_file_path,
+                "test_pass": _verify_test_pass,
+                "relocate": _relocate}
+
+    def _plan_commit_signal(self, content: str) -> bool:
+        """PLAN-type PRD §2: write-door commit-signal predicate (pure, zero LLM).
+
+        Decides whether a plan-typed save should fire the "store this plan?"
+        clarify. Returns True ONLY when the content is BOTH plan-typed
+        (matches the plan strong-signal regex rows) AND carries a commit
+        signal. A plan still under discussion (no commit phrase) or a
+        non-plan content with a commit phrase returns False.
+
+        This is the trigger gate for the write-door clarify (§2 of the PRD):
+        when True and the save target is the plan shard, the caller routes
+        the save through the host clarify face ("save this plan?") before it
+        lands. No commit signal -> the content lands as an L0 draft / task
+        shard instead of a plan shard (PRD §2). Fail-soft: any shape hiccup
+        -> False (a gate bug must never block a save, never misfire)."""
+        text = (content or "").lower()
+        if not text:
+            return False
+        # Plan strong-signal check: does this look like a structured plan?
+        plan_hit = False
+        for pattern in _MEMORY_TYPE_REGEX.get("plan", ()):
+            try:
+                if re.search(pattern, text):
+                    plan_hit = True
+                    break
+            except Exception:
+                continue
+        if not plan_hit:
+            return False
+        # Commit-signal check: is this the final / landed version?
+        _COMMIT_SIGNALS = (
+            # English
+            "final version", "final plan", "settled plan", "confirmed plan",
+            "here's the plan", "the plan is", "landing the plan",
+            "定稿", "最终版", "落地方案", "就按这个", "方案定了",
+            # Chinese
+            "定稿", "最终版", "落地方案", "确认方案", "这就是计划",
+            "方案定了", "就按这个", "定了",
+        )
+        for sig in _COMMIT_SIGNALS:
+            if sig in text:
+                return True
+        return False
+
+    def _plan_validate_anchor(self, anchor: Any, step_status: str) -> str:
+        """PLAN-type PRD §1.5: a step marked 'done' MUST carry an anchor
+        (kind+value) or an explicit no_anchor — no ambiguity. Returns an
+        error string, or "" when the anchor is acceptable for the status."""
+        if step_status != "done":
+            return ""  # pending / in_progress steps carry no anchor yet
+        if anchor is None:
+            return ("step done requires an anchor {kind,value} or an explicit "
+                    "no_anchor (PRD §1.5 anchor enforcement)")
+        if isinstance(anchor, dict):
+            kind = anchor.get("kind")
+            if kind == "no_anchor":
+                return ""
+            if kind in ("test_pass", "git_hash", "file_path") and anchor.get("value"):
+                return ""
+            return (f"anchor kind {kind!r} not in the cross-profile-verifiable "
+                    "whitelist (test_pass/git_hash/file_path/no_anchor)")
+        return "anchor must be a dict {kind, value} or 'no_anchor'"
+
+    def _tool_plan(self, args: Dict) -> str:
+        """PLAN-type PRD §6: filemem_plan tool — list / create / advance.
+
+        Returns a JSON string (the host's tool-result contract). Fail-soft:
+        any unexpected error is caught and returned as {"error": ...} so the
+        host turn never crashes (same posture as the other filemem tools).
+        """
+        action = args.get("action")
+        try:
+            if action == "create":
+                return json.dumps(self._plan_create(args), ensure_ascii=False)
+            elif action == "list":
+                return json.dumps(self._plan_list(args), ensure_ascii=False)
+            elif action == "advance":
+                return json.dumps(self._plan_advance(args), ensure_ascii=False)
+            else:
+                return json.dumps({"error": f"unknown action {action!r}; "
+                                            f"expected list/create/advance"})
+        except Exception as e:
+            logger.error(f"FileMem: filemem_plan action={action!r} failed: {e}")
+            return json.dumps({"error": str(e)})
+
+    def _plan_create(self, args: Dict) -> Dict[str, Any]:
+        title = (args.get("title") or "").strip()
+        steps = args.get("steps") or []
+        if not title:
+            return {"success": False, "error": "title is required"}
+        if not steps:
+            return {"success": False, "error": "at least one step is required"}
+        now = _utcnow().isoformat()
+        plan_id = f"plan_{now.replace(':', '')}_{uuid.uuid4().hex[:8]}"
+        plan_steps = [
+            {"id": i + 1, "text": str(s), "status": "pending", "anchor": None}
+            for i, s in enumerate(steps)
+        ]
+        row = {
+            "id": plan_id,
+            "type": "plan",
+            "content": title,
+            "level": "L2",
+            "source": "manual",
+            "created_at": now,
+            "updated_at": now,
+            "metadata": {
+                "plan_state": "in_progress",
+                "plan_id": plan_id,
+                "plan_revision": 1,
+                "plan_steps": plan_steps,
+                "done_when": args.get("done_when") or "all steps done",
+                "source_session": getattr(self, "session_id", None),
+                "last_step_updated_at": now,
+                "topic": args.get("topic"),
+                "source_profile": getattr(self, "source_profile", None),
+                "last_touched_by": getattr(self, "source_profile", None),
+                "last_completed_by": None,
+                "decision_log": [],
+                "progress_log": [],
+            },
+        }
+        with self._shard_lock(self._plan_shard_path()):
+            f = self._plan_shard_path()
+            f.parent.mkdir(parents=True, exist_ok=True)
+            if f.exists():
+                with open(f, "r", encoding="utf-8") as fh:
+                    rows = json.load(fh)
+                if not isinstance(rows, list):
+                    rows = []
+            else:
+                rows = []
+            rows.append(row)
+            with open(f, "w", encoding="utf-8") as fh:
+                json.dump(rows, fh, ensure_ascii=False, indent=2)
+        return {"success": True, "plan_id": plan_id, "title": title,
+                "plan_state": "in_progress", "level": "L2",
+                "steps": len(plan_steps)}
+
+    def _plan_list(self, args: Dict) -> Dict[str, Any]:
+        state = args.get("state") or "in_progress"
+        topic = args.get("topic")
+        profile_arg = args.get("profile")
+        rows = self._plan_load_rows()
+        if topic:
+            rows = [r for r in rows if (r.get("metadata") or {}).get("topic") == topic]
+        # profile filter (optional refine, PRD §6.3 — "source:X" / "touched:X")
+        if profile_arg:
+            if profile_arg.startswith("source:"):
+                target = profile_arg.split(":", 1)[1]
+                rows = [r for r in rows
+                        if (r.get("metadata") or {}).get("source_profile") == target]
+            elif profile_arg.startswith("touched:"):
+                target = profile_arg.split(":", 1)[1]
+                rows = [r for r in rows
+                        if (r.get("metadata") or {}).get("last_touched_by") == target]
+            # default (no profile arg) = cross-profile full view (PRD §6.3)
+        # state filter (PRD §6.4: default in_progress = in_progress + blocked)
+        if state in ("in_progress", "all"):
+            wanted = ("in_progress", "blocked") if state == "in_progress" else \
+                     ("in_progress", "blocked", "done", "abandoned", "superseded")
+            rows = [r for r in rows if (r.get("metadata") or {}).get("plan_state") in wanted]
+        else:
+            rows = [r for r in rows
+                    if (r.get("metadata") or {}).get("plan_state") == state]
+        # sort: most recently updated first (active at the top)
+        rows.sort(key=lambda r: (r.get("metadata") or {}).get("last_step_updated_at")
+                  or r.get("updated_at") or r.get("created_at") or "", reverse=True)
+        out_rows = []
+        for r in rows:
+            meta = r.get("metadata") or {}
+            out = {
+                "plan_id": meta.get("plan_id") or r.get("id"),
+                "title": r.get("content"),
+                "plan_state": meta.get("plan_state"),
+                "level": r.get("level"),
+                "topic": meta.get("topic"),
+                "source_profile": meta.get("source_profile"),
+                "last_touched_by": meta.get("last_touched_by"),
+                "last_completed_by": meta.get("last_completed_by"),
+                "last_updated": meta.get("last_step_updated_at") or r.get("updated_at"),
+                "steps": meta.get("plan_steps"),
+            }
+            total = len(meta.get("plan_steps") or [])
+            done = sum(1 for s in (meta.get("plan_steps") or []) if s.get("status") == "done")
+            out["progress"] = f"{done}/{total} done"
+            if meta.get("plan_state") == "blocked":
+                out["blocked_reason"] = meta.get("blocked_reason")
+                out["open_options"] = meta.get("open_options")
+            out_rows.append(out)
+        return {"plans": out_rows, "count": len(out_rows), "state": state}
+
+    def _plan_advance(self, args: Dict) -> Dict[str, Any]:
+        plan_id = args.get("plan_id")
+        op = args.get("op")
+        if not plan_id or not op:
+            return {"success": False, "error": "plan_id and op are required"}
+        row = self._plan_find_row(plan_id)
+        if row is None:
+            return {"success": False, "error": f"plan {plan_id!r} not found"}
+        meta = row.setdefault("metadata", {})
+        now = _utcnow().isoformat()
+        me = getattr(self, "source_profile", None)
+        state = meta.get("plan_state")
+        steps = meta.setdefault("plan_steps", [])
+
+        # ── shared helpers (PRD §6.2 atomic actions) ──
+
+        def _persist() -> None:
+            """Rewrite the whole shard: the mutated row + every OTHER row."""
+            self._plan_write_rows(
+                [row] + [r for r in self._plan_load_rows() if r.get("id") != row.get("id")])
+
+        def _touch() -> None:
+            meta["last_step_updated_at"] = now
+            row["updated_at"] = now
+            meta["updated_at"] = now
+            if me:
+                meta["last_touched_by"] = me
+
+        def _log_decision(sub: str, extra: Dict[str, Any] = None) -> None:
+            meta.setdefault("decision_log", []).append({
+                "ts": now, "by": me or "unknown", "op": op, "sub": sub,
+                **(extra or {})})
+
+        def _progress(note: str) -> None:
+            log = meta.setdefault("progress_log", [])
+            log.append({"ts": now, "op": op, "note": note})
+            del log[:-10]  # keep the most recent 10
+
+        def _find_step(sid: int) -> Optional[Dict[str, Any]]:
+            for s in steps:
+                if s.get("id") == sid:
+                    return s
+            return None
+
+        # ── op = revise (slice 2, unchanged) ──
+        if op == "revise":
+            new_steps = args.get("new_steps")
+            if not new_steps:
+                return {"success": False, "error": "revise requires new_steps"}
+            meta["plan_steps"] = [
+                {"id": i + 1, "text": str(s), "status": "pending", "anchor": None}
+                for i, s in enumerate(new_steps)
+            ]
+            meta["plan_revision"] = (meta.get("plan_revision") or 1) + 1
+            _touch()
+            _progress(f"revised to {len(meta['plan_steps'])} steps")
+            _persist()
+            return {"success": True, "plan_id": plan_id, "op": op,
+                    "plan_revision": meta["plan_revision"]}
+
+        # ── op = continue (PRD §6.2: step -> done + anchor enforced) ──
+        if op == "continue":
+            sid = args.get("step_done")
+            if not isinstance(sid, int):
+                return {"success": False, "error": "continue requires step_done (int)"}
+            target = _find_step(sid)
+            if target is None:
+                return {"success": False, "error": f"step {sid} not found"}
+            anchor = args.get("anchor")
+            err = self._plan_validate_anchor(anchor, "done")
+            if err:
+                return {"success": False, "error": err}
+            target["status"] = "done"
+            target["anchor"] = anchor
+            _touch()
+            _progress(f"step {sid} -> done (anchor={anchor.get('kind')})")
+            _persist()
+            return {"success": True, "plan_id": plan_id, "op": op, "step": sid}
+
+        # ── op = block (PRD §6.2: state -> blocked + store options) ──
+        if op == "block":
+            if state not in ("in_progress",):
+                return {"success": False, "error": f"block requires in_progress, "
+                                                   f"got {state!r}"}
+            opts = args.get("options") or []
+            sid = args.get("step")
+            meta["plan_state"] = "blocked"
+            meta["blocked_at_step"] = sid
+            meta["blocked_reason"] = args.get("reason") or "agent stuck"
+            meta["open_options"] = [
+                {"id": o.get("id"), "text": o.get("text"), "outcome": "pending"}
+                for o in opts]
+            _touch()
+            _progress(f"blocked at step {sid}")
+            _persist()
+            return {"success": True, "plan_id": plan_id, "op": op,
+                    "state": "blocked", "options_stored": len(opts)}
+
+        # ── op = resume (PRD §6.2: blocked -> in_progress, no scheme change) ──
+        if op == "resume":
+            if state != "blocked":
+                return {"success": False, "error": f"resume requires blocked, "
+                                                   f"got {state!r}"}
+            meta["plan_state"] = "in_progress"
+            for o in meta.get("open_options", []):
+                o["outcome"] = "rejected"  # none chosen; all not adopted
+            _touch()
+            _progress(f"resumed (reason={args.get('reason') or 'n/a'})")
+            _persist()
+            return {"success": True, "plan_id": plan_id, "op": op,
+                    "state": "in_progress"}
+
+        # ── op = complete_all (PRD §4: force ALL pending -> done, settled, L2) ──
+        if op == "complete_all":
+            for s in steps:
+                if s.get("status") != "done":
+                    s["status"] = "done"
+                    # never advanced -> explicit no_anchor (no ambiguity, PRD §1.5)
+                    if s.get("anchor") is None:
+                        s["anchor"] = {"kind": "no_anchor"}
+            meta["plan_state"] = "done"
+            meta["settled"] = True
+            row["level"] = "L2"
+            if me:
+                meta["last_completed_by"] = me
+            _touch()
+            _progress(f"complete_all ({len(steps)} steps forced done)")
+            _persist()
+            return {"success": True, "plan_id": plan_id, "op": op,
+                    "state": "done", "level": "L2"}
+
+        # ── op = abandon (PRD §4/§5: L0 or superseded L1 + decision_log) ──
+        if op == "abandon":
+            supersede_with = args.get("supersede_with")
+            if supersede_with:
+                meta["plan_state"] = "superseded"
+                row["level"] = "L1"
+                meta["superseded_by"] = supersede_with
+            else:
+                meta["plan_state"] = "abandoned"
+                row["level"] = "L0"
+            meta["superseded"] = True
+            _log_decision("abandon",
+                          {"supersede_with": supersede_with} if supersede_with else {})
+            _touch()
+            _progress(f"abandoned (supersede_with={supersede_with or 'none'})")
+            _persist()
+            return {"success": True, "plan_id": plan_id, "op": op,
+                    "state": meta["plan_state"], "level": row["level"],
+                    "supersede_with": supersede_with}
+
+        # ── op = reopen (PRD §4: terminal -> in_progress, level back L2) ──
+        if op == "reopen":
+            if state not in ("done", "abandoned", "superseded"):
+                return {"success": False, "error": f"reopen requires a terminal "
+                                                   f"state, got {state!r}"}
+            meta["plan_state"] = "in_progress"
+            meta.pop("settled", None)
+            meta.pop("superseded", None)
+            meta.pop("superseded_by", None)
+            row["level"] = "L2"
+            meta["plan_revision"] = (meta.get("plan_revision") or 1) + 1
+            _log_decision("reopen")
+            _touch()
+            _progress(f"reopened from {state}")
+            _persist()
+            return {"success": True, "plan_id": plan_id, "op": op,
+                    "state": "in_progress", "level": "L2"}
+
+        # ── op = select_option (PRD §6.2/§7: step-internal scheme swap) ──
+        if op == "select_option":
+            sid = args.get("step")
+            choice = args.get("choice")
+            if not isinstance(sid, int):
+                return {"success": False, "error": "select_option requires "
+                                                   f"step (int), got {sid!r}"}
+            if not choice:
+                return {"success": False, "error": "select_option requires "
+                                                   "choice (the option id)"}
+            # If the plan was never blocked, the caller may supply the option
+            # set inline; otherwise we use what block stored.
+            opts = args.get("options") or meta.get("open_options") or []
+            opt_ids = {o.get("id") for o in opts}
+            if choice not in opt_ids:
+                return {"success": False,
+                        "error": f"choice {choice!r} not among stored options "
+                                 f"{sorted(opt_ids)}"}
+            reason = args.get("reason") or ""
+            # Mark outcomes: chosen gets the reason, the rest rejected.
+            for o in opts:
+                if o.get("id") == choice:
+                    o["outcome"] = "chosen"
+                    if reason:
+                        o["reason"] = reason
+                else:
+                    o["outcome"] = "rejected"
+                    # keep any existing per-option reason; default to "not chosen"
+                    o.setdefault("reason", "not chosen")
+            # Update the target step's text to the chosen scheme's text
+            target = _find_step(sid)
+            if target is None:
+                return {"success": False, "error": f"step {sid} not found"}
+            chosen_text = next(o.get("text") for o in opts if o.get("id") == choice)
+            target["text"] = chosen_text
+            meta["open_options"] = opts
+            # Route changed -> revision bump + decision log (PRD §7)
+            meta["plan_revision"] = (meta.get("plan_revision") or 1) + 1
+            meta["plan_state"] = "in_progress"
+            _log_decision("select_option",
+                          {"step": sid, "choice": choice, "reason": reason})
+            _touch()
+            _progress(f"step {sid}: chose {choice} "
+                      f"(rejected {sorted(opt_ids - {choice})})")
+            _persist()
+            return {"success": True, "plan_id": plan_id, "op": op,
+                    "step": sid, "choice": choice,
+                    "rejected": sorted(opt_ids - {choice}),
+                    "plan_revision": meta["plan_revision"]}
+
+        # ── op = reconcile (PRD §8: verify recalled progress against the
+        #    on-disk reality the step anchors point to) ──
+        if op == "reconcile":
+            # Injected verifier surface (test seam) takes PRECEDENCE; when absent,
+            # the production-default on-disk verifier engages (PRD §8): real
+            # re-checks against source_cwd (git cat-file / file existence /
+            # test runner). The seam override keeps the op deterministic under
+            # test; the production default makes it actually usable in vivo.
+            verifiers = getattr(self, "_reconcile_verifiers", None) or \
+                self._reconcile_default_verifiers()
+            ahead: List[int] = []
+            behind: List[int] = []
+            diverged: List[int] = []
+            unverifiable: List[int] = []
+            needs_user: List[int] = []
+            actions: List[str] = []
+            changed = False
+
+            for s in steps:
+                sid = s.get("id")
+                status = s.get("status")
+                anchor = s.get("anchor")
+                kind = (anchor or {}).get("kind") if isinstance(anchor, dict) else None
+
+                # no_anchor -> not machine-verifiable, surface for the user
+                if kind == "no_anchor" or anchor is None:
+                    unverifiable.append(sid)
+                    needs_user.append(sid)
+                    continue
+
+                verifier = verifiers.get(kind)
+                # A step that is pending in the plan but the anchor (reality)
+                # still verifies -> ahead (reality is ahead of the plan row).
+                if status == "pending" and verifier is not None:
+                    vres = verifier((anchor or {}).get("value"))
+                    if vres is True:
+                        s["status"] = "done"
+                        ahead.append(sid)
+                        changed = True
+                        actions.append(
+                            f"step{sid}→done (reality ahead, anchor {kind})")
+                    # False (reality behind the step) or None (cannot inspect)
+                    # -> the step stays pending; nothing to promote.
+                    continue
+
+                # A step that claims done in the plan: verify the anchor still
+                # holds in reality.
+                if status == "done":
+                    # No verifier registered for this kind -> cannot inspect
+                    # reality at all; degrade to unverifiable, NEVER fabricate
+                    # a 'behind' rollback (PRD §8.2).
+                    if verifier is None:
+                        unverifiable.append(sid)
+                        needs_user.append(sid)
+                        continue
+                    holds = verifier((anchor or {}).get("value"))
+                    if holds is None:
+                        # Tri-state None = "cannot inspect" (no source_cwd /
+                        # not a repo / runner unavailable) -> unverifiable,
+                        # NOT behind (a host we cannot inspect must never
+                        # yield a 'behind' verdict — that would roll back work
+                        # we didn't check).
+                        unverifiable.append(sid)
+                        needs_user.append(sid)
+                        continue
+                    if holds:
+                        # Synced: the stored anchor still verifies in reality.
+                        # A git_hash that is live (not dangling) needs no
+                        # action. An ORPHANED hash (rebase/amend moved the
+                        # patch to a new commit; the old hash is reachable in
+                        # the object DB but no ref points at it) verifies via
+                        # cat-file but re-locates: refresh the anchor to the
+                        # re-located active commit so the step stays "done"
+                        # with a live reference, not a dangling one.
+                        rel = verifiers.get("relocate")
+                        new_anchor = rel(s) if callable(rel) else None
+                        if new_anchor:
+                            s["anchor"] = new_anchor
+                            changed = True
+                            actions.append(
+                                f"step{sid} anchor refreshed "
+                                f"(orphaned -> {new_anchor.get('kind')}:"
+                                f"{new_anchor.get('value')})")
+                        continue
+                    # False = "inspected and the artifact is missing" -> the
+                    # work is genuinely absent (reverted / never-landed) ->
+                    # BEHIND. Roll back to pending; a re-located reference is
+                    # not possible when the artifact is truly gone.
+                    s["status"] = "pending"
+                    s["anchor"] = None
+                    behind.append(sid)
+                    needs_user.append(sid)  # an auto-rollback still warrants user awareness
+                    changed = True
+                    actions.append(f"step{sid}→pending (behind, anchor missing)")
+
+            if changed:
+                meta["plan_revision"] = (meta.get("plan_revision") or 1) + 1
+                _touch()
+                _progress(f"reconcile: ahead={len(ahead)} behind={len(behind)} "
+                          f"diverged={len(diverged)} unverifiable={len(unverifiable)}")
+                _persist()
+            return {"success": True, "plan_id": plan_id, "op": "reconcile",
+                    "ahead": ahead, "behind": behind, "diverged": diverged,
+                    "unverifiable": unverifiable, "needs_user": needs_user,
+                    "actions_taken": actions}
+
+        # ── any remaining unknown op (no silent no-op) ──
+        return {"success": False,
+                "error": f"unknown op {op!r} "
+                         f"(valid: continue/revise/block/select_option/resume/"
+                         f"complete_all/abandon/reopen/reconcile)"}
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         """Handle tool calls."""
@@ -8418,6 +9284,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 return self._tool_review_drafts(args)
             elif tool_name == "filemem_set_bringback":
                 return self._tool_set_bringback(args)
+            elif tool_name == "filemem_plan":
+                return self._tool_plan(args)
             else:
                 return json.dumps({"error": f"Unknown tool: {tool_name}"})
         except Exception as e:
