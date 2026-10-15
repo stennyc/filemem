@@ -4312,6 +4312,11 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             notice_state = {}
             self._pending_drafts_notified = notice_state
         cur_sid = (session_id or getattr(self, "session_id", None) or "")
+        # P5 (owner 2026-10-15, 裁决 A): the current-session topic for the
+        # face-2 topic ordering (same source the P1-2 auto-inject fold
+        # reads — the trace title, fail-soft to "" = fail-open, no re-
+        # order, no tags).
+        _p5_cur_topic = self._session_title_hint(cur_sid) if cur_sid else ""
         # T3①: compose the per-turn incremental line FIRST so EVERY return
         # path below (gated session, empty pending, exception leg) carries
         # it. The historical [未决草稿] notice stays one-shot per session;
@@ -4360,6 +4365,26 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                             # preserved — a shape hiccup never locks the
                             # host out of its own notice.
                             pending.append((df.name, 1, 0))
+            # P5 face-2 reorder (owner 裁决 A): same-topic historical draft
+            # files sort FIRST; cross-topic files LAST and their headers
+            # carry a "（异类 topic）" tag. The predicate is the P1-2
+            # single-source _topic_overlap_gate (fail-open: an unresolvable
+            # owner topic — no trace / unreadable — is treated as same-
+            # topic, so the pre-P5 sorted-glob order survives intact).
+            # NEVER silences: drafts are the 待拍板 class (owner red line).
+            if pending and _p5_cur_topic:
+                _p5_gate_cfg = getattr(self, "_decay", None)
+                pending.sort(
+                    key=lambda it: (
+                        0 if _topic_overlap_gate(
+                            self._session_title_hint(
+                                it[0][len("drafts_"):-len(".json")]
+                                if it[0].startswith("drafts_") and
+                                it[0].endswith(".json") else it[0]),
+                            _p5_cur_topic, _p5_gate_cfg)
+                        else 1,
+                        it[0],
+                    ))
             if not pending:
                 return self._join_context(recall_context, turn_line)
             # D-site fix (2026-10-09 @user): the notice shows PENDING CONTENT,
@@ -4384,7 +4409,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 # One header per file, emitted before that file's first line.
                 _owner = (filename[len("drafts_"):-len(".json")]
                           if filename.startswith("drafts_")
-                             and filename.endswith(".json")
+                           and filename.endswith(".json")
                           else filename)
                 # Owner 2026-10-12: attach the session topic (first user
                 # message of the owning session's trace) so the user knows
@@ -4393,6 +4418,23 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 _title = self._session_title_hint(_owner)
                 _header = (f"  [session {_owner} · {_title}]"
                            if _title else f"  [session {_owner}]")
+                # P5 face-2 tag (owner 裁决 A): a CROSS-topic historical
+                # draft file carries "（异类 topic）" on its header so the
+                # owner can spot and discard it in one glance. The tag is
+                # computed with the SAME single-source P1-2 gate as the
+                # reorder above (fail-open: unresolvable owner topic or
+                # empty current topic -> no tag, byte-identical to the
+                # pre-P5 header).
+                _p5_cross = False
+                if _p5_cur_topic:
+                    _p5_owner_topic = (
+                        self._session_title_hint(_owner)
+                        if _owner != filename else "")
+                    _p5_cross = not _topic_overlap_gate(
+                        _p5_owner_topic or _title,
+                        _p5_cur_topic, getattr(self, "_decay", None))
+                if _p5_cross:
+                    _header += "（异类 topic）"
                 df = storage_dir / filename
                 try:
                     data = json.loads(df.read_text(encoding="utf-8"))
@@ -4644,6 +4686,19 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         CONSUMED by review_drafts(confirm|discard) or filemem_delete(id);
         "cancel" = no tool call = nothing consumed, so the same items
         re-report next turn. Empty pending queue -> empty string (silent).
+
+        P5 face-1 (owner 2026-10-15, 裁决 A): L0 auto-save ECHO rows whose
+        topic does not overlap the current session topic are SILENTLY
+        DROPPED from this notice line (the owner's 静默 pass — the row
+        stays in the pool with its TTL, only the notice stops announcing
+        it). Cross-session/room residue (依赖等待超时, tasks 表空, gave_up
+        根因 — other topics' leftovers re-injected here) no longer rides
+        this face. The predicate is the P1-2 single-source
+        _topic_overlap_gate; fail-open: an unresolvable current-session
+        topic lists EVERYTHING (pre-P5 behavior, zero false-silence).
+        L1/L2 (kind != 'l0') rows are the 待拍板 class — they are NEVER
+        silenced here (face-2 handles them), so the topic gate applies to
+        kind=='l0' only.
         """
         if not sid:
             return ""
@@ -4652,6 +4707,26 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # NOT surfaced — the user cannot judge a JSON fragment. They stay in
         # draft storage (audit face untouched); the panel just skips them.
         pending = [it for it in pending if not self._is_noise_confirm_row(it.get("content") or "")]
+        if not pending:
+            return ""
+        # P5 face-1: the current session topic (the trace title, fail-soft to
+        # "" = the gate is fail-open -> nothing is dropped, pre-P5 behavior).
+        _p5_cur_topic = self._session_title_hint(sid) if sid else ""
+        _p5_gate_cfg = getattr(self, "_decay", None)
+
+        def _p5_keep(it):
+            # L1/L2 (the 待拍板 class, kind != 'l0') are never silenced here.
+            if it.get("kind", "l0") != "l0":
+                return True
+            # No resolvable current topic -> fail-open: keep everything.
+            if not _p5_cur_topic:
+                return True
+            # The L0 row's own topic = its content (truncated); the P1-2 gate
+            # is the single source (BM25 overlap, default threshold 0.1).
+            _row_topic = ((it.get("content") or "").strip().replace("\n", " ")[:80])
+            return _topic_overlap_gate(_row_topic, _p5_cur_topic, _p5_gate_cfg)
+
+        pending = [it for it in pending if _p5_keep(it)]
         if not pending:
             return ""
         lines = []
