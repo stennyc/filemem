@@ -159,7 +159,14 @@ def test_egress_noise_cut_echo_class_length_gated():
 def test_egress_noise_cut_legacy_structural_classes_no_regression():
     """'{[' opener rows: the pre-existing structural reject stays live for
     egress — the old '{[' 拒写面 did not regress; now oversized '{[' rows
-    are cut even under the legacy ②/③ rules via the config opener class."""
+    are cut even under the legacy ②/③ rules via the config opener class.
+
+    P4 2026-10-15: egress leg ⑥ made the structural cut UNCONDITIONAL
+    (code default, no length gate) — the '{[' census rows that re-injected
+    on the auto-inject face were the SHORT ones, so a small '{' row is
+    now cut via the noise cut itself (pre-P4: passed the cut, kept only
+    by the room-marker predicate at the call site — the boundary that
+    produced the 71-row pool census)."""
     assert _egress_noise_cut('{"output": "tool result"}', _cfg()) is True
     assert _egress_noise_cut('{"error": "boom"}', _cfg()) is True
     # oversized '{' row beyond governance.max_chars (guaranteed: one extra
@@ -167,9 +174,10 @@ def test_egress_noise_cut_legacy_structural_classes_no_regression():
     big = "{" + "k: 1, " * (int(GOV["max_chars"] / 6) + 1)
     assert len(big) > GOV["max_chars"]
     assert _egress_noise_cut(big, _cfg()) is True
-    # a SMALL '{' row is structural-noise via the room-marker predicate, not
-    # via the noise cut (behavior boundary kept explicit)
-    assert _egress_noise_cut("{\"a\": 1}", _cfg()) is False
+    # P4: a SMALL '{' row is now cut by the UNCONDITIONAL structural leg
+    # ⑥ (pre-P4 this exact assertion was `is False` — the small-row
+    # blind spot that let the room-skeleton census re-inject)
+    assert _egress_noise_cut('{"a": 1}', _cfg()) is True
 
 
 def test_egress_noise_cut_fail_soft_on_missing_config():

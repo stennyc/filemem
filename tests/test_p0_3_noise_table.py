@@ -264,10 +264,21 @@ def test_normal_fact_row_byte_stable_zero_false_kill():
 def test_malformed_table_fails_open():
     """⑤ a broken block shape degrades the TABLE legs to "no hit" without
     raising and without taking down the sibling legs: (a) a malformed
-    table lets gap-class rows through the gate (fail-open), while the
-    3-key legacy rows are STILL rejected by the always-live code default;
-    (b) the same malformed tables fail open on the egress cut; (c) the
-    host-instruction class is unaffected by any table shape."""
+    table lets gap-class rows through the table legs (fail-open), while
+    the 3-key legacy rows are STILL rejected by the always-live code
+    default; (b) the same malformed tables fail open on the egress table
+    legs; (c) the host-instruction class is unaffected by any table
+    shape.
+
+    P4 note (2026-10-15): the structural leg (b2) and the egress
+    structural leg ⑥ are CODE DEFAULTS, not table legs — a malformed
+    table does NOT disable them. A `{[`-opening gap row is therefore
+    rejected as structural_opener (not "None" as pre-P4) even with a
+    broken cfg; the pre-P4 assertion "table row passes with malformed
+    cfg" now means "passes the table legs, still caught by the
+    structural leg". The 3-key/legacy/framed rows keep their
+    raw_tool_output class (code default ①), and clean prose facts still
+    pass everything."""
     malformed = [
         {"egress_noise": "corrupted"},  # block not a dict
         {"egress_noise": {"tool_dump_openers": ["not", "a", "dict"]}},
@@ -279,11 +290,19 @@ def test_malformed_table_fails_open():
     for cfg in malformed:
         # the table legs are dead, the 3-key code default is ALWAYS live
         assert ingress_reject_class(LEGACY_OUTPUT_DUMP, cfg) == "raw_tool_output"
-        assert ingress_reject_class(GAP_TOTAL_COUNT_ROW, cfg) is None, \
-            f"malformed cfg {cfg!r} must fail the table leg open"
+        # P4: the `{[` gap rows now reject via the CODE-DEFAULT structural
+        # leg regardless of table shape (pre-P4: None with malformed cfg)
+        assert ingress_reject_class(GAP_TOTAL_COUNT_ROW, cfg) == \
+            "structural_opener"
+        assert ingress_reject_class(GAP_SUCCESS_ROW, cfg) == "structural_opener"
+        # the CJK fragment row (no `{[` opener) still passes with the
+        # table legs dead — proving the structural leg does not over-kill
         assert ingress_reject_class(GAP_FRAGMENT_ROW, cfg) is None
-        assert _egress_noise_cut(GAP_SUCCESS_ROW, cfg) is False, \
-            f"malformed cfg {cfg!r} must fail the egress table leg open"
+        # egress: the TABLE legs fail open, but the code-default legs
+        # (① 3-key + ⑥ structural) stay live on the same rows
+        assert _egress_noise_cut(GAP_SUCCESS_ROW, cfg) is True, \
+            "P4 leg ⑥: a {/[ opener is cut even with a malformed cfg"
+        assert _egress_noise_cut(GAP_FRAGMENT_ROW, cfg) is False
     # a clean host block rejects regardless of table shape
     host_block = ("[CONTEXT COMPACTION — REFERENCE ONLY]\n"
                   "the earlier turns were compacted into this block")
@@ -315,24 +334,34 @@ def test_fragment_anchor_mid_text_not_killed():
 
 def test_decay_cfg_none_is_p0_1_code_only_behavior():
     """⑦ backward compatibility: with no decay config consulted the gate is
-    byte-for-byte the P0-1 code-only behavior — the three gap shapes pass,
-    the 3-key/legacy shapes reject. (A provider whose _decay block simply
-    lacks the tables — e.g. the P0-1 fixture `{"lambda_days": 0.05}` —
-    degrades to the same posture: no table hits, code default only.)"""
+    the CODE-ONLY behavior — the P0-1 code legs (3-key dump / framed
+    prefix / host block / task prompt / relay) are live, and the P4
+    structural leg (b2) is live too: it is a code default, not a table
+    leg (same posture as the 3-key default — a missing decay block never
+    disables it). (A provider whose _decay block simply lacks the tables
+    — e.g. the P0-1 fixture `{"lambda_days": 0.05}` — degrades to the
+    same posture: no table hits, code legs only.)
+
+    P4 note (2026-10-15): pre-P4 this test asserted the `{[`-opening gap
+    rows PASS with cfg=None (table-extension only). Post-P4 they reject
+    via the code-default structural leg — the source-cut semantics the
+    owner ruled (垃圾在源头丢弃)."""
     # module-level, decay_cfg omitted entirely
-    assert ingress_reject_class(GAP_TOTAL_COUNT_ROW) is None
-    assert ingress_reject_class(GAP_SUCCESS_ROW) is None
+    assert ingress_reject_class(GAP_TOTAL_COUNT_ROW) == "structural_opener"
+    assert ingress_reject_class(GAP_SUCCESS_ROW) == "structural_opener"
+    # the CJK fragment row: no `{[` opener, table legs dead with cfg=None
+    # -> the P0-1 code-only posture still lets it through (table-only hit)
     assert ingress_reject_class(GAP_FRAGMENT_ROW) is None
     assert ingress_reject_class(LEGACY_OUTPUT_DUMP) == "raw_tool_output"
     assert ingress_reject_class(TOOL_FRAMED_DUMP) == "raw_tool_output"
     # and an empty config block (no tables at all) behaves identically
-    assert ingress_reject_class(GAP_TOTAL_COUNT_ROW, {}) is None
-    assert ingress_reject_class(GAP_SUCCESS_ROW, {}) is None
+    assert ingress_reject_class(GAP_TOTAL_COUNT_ROW, {}) == "structural_opener"
+    assert ingress_reject_class(GAP_SUCCESS_ROW, {}) == "structural_opener"
     # provider face: P0-1-style fixture decay (no egress_noise block)
     tmp = pathlib.Path(tempfile.mkdtemp())
     p = _make_provider(tmp)  # default {"lambda_days": 0.05}, no tables
-    assert p._ingress_rejection(GAP_SUCCESS_ROW) is None, \
-        "no table block -> P0-1 code-only behavior (row passes)"
+    assert p._ingress_rejection(GAP_SUCCESS_ROW) == "structural_opener", \
+        "no table block -> code-default structural leg still rejects"
     assert p._ingress_rejection(LEGACY_CONTENT_DUMP) == "raw_tool_output", \
         "the 3-key default stays live even without any table"
 

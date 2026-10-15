@@ -94,13 +94,21 @@ def test_is_room_marker_item_selectors():
 # ---- 2. ingress stamping --------------------------------------------------
 
 def test_room_turn_stamps_item():
+    """P4 semantics (owner 2026-10-15 源头过滤): an ORDINARY room meta
+    turn lands NOTHING in the pool — the structural ingress leg rejects
+    the `[Group chat …]` skeleton at source (quarantine + one
+    ingress_reject audit row stamped structural_opener). Pre-P4 this
+    turn stamped self_test on a landed item; that design is what
+    produced the 71-room-row pool census. The self-test audit legs now
+    run on: (a) the CANARY turn (run_canary_turn, exempted — still
+    lands its double-stamped item; see test_canary_double_stamp_and_
+    negative_leg below) and (b) the negative leg
+    (count_untagged_room_markers) over pre-existing residue rows."""
     tmp = pathlib.Path(tempfile.mkdtemp())
     p = _make_provider(tmp)
     p.sync_turn(ROOM_BLOCK, "", messages=[{"role": "user", "content": ROOM_BLOCK}])
-    items = [i for i in _read_all(p) if i["metadata"].get("self_test")]
-    assert items, "room meta turn must stamp every born item with self_test"
-    for i in items:
-        assert i["metadata"].get("canary") is None, "non-canary turn must not carry canary"
+    rows = _read_all(p)
+    assert rows == [], "ordinary room meta turn must land NOTHING (P4)"
 
 
 def test_non_room_turn_untagged():

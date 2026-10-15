@@ -87,8 +87,8 @@
   },
   "egress_noise": {
     "tool_dump_openers": {
-      "en": ["Fetch finished", "{\"total_count\":", "{\"success\":"],
-      "zh": ["Fetch finished", "{\"total_count\":", "{\"success\":"]
+      "en": ["Fetch finished", "{\"total_count\":", "{\"success\":", "⏸ [", "✔ [", "⏱ ["],
+      "zh": ["Fetch finished", "{\"total_count\":", "{\"success\":", "⏸ [", "✔ [", "⏱ ["]
     },
     "fragment_prefixes": {
       "en": ["搞清楚了。我把情况说明清楚"],

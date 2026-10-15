@@ -78,6 +78,16 @@ def test_retrievability_gate_en_zh():
     their absence from the live store has no bearing on this gate and they
     are intentionally not listed in the fixture. A future reader should not
     read the purged-id list as "all were once in the fixture".
+
+    NOTE (2026-10-15 P4 structural sweep): the one-off
+    tools/sweep_structural_noise.py archived 183 structural-garbage rows
+    ({[ openers / kanban relays) from the live store. Of those, exactly
+    FOUR ids were present in this fixture's baseline_top5 and are now
+    excluded here (dropped from the affected golden queries):
+    preference_320_1791457650, preference_142_1791687192,
+    preference_201_1791627642, preference_119_1791677567 — all
+    [Group chat …] room-skeleton rows. The other 179 swept rows were
+    never part of any baseline_top5.
     """
     p = _make_live_provider()
     checked = 0

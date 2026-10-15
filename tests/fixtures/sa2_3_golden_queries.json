@@ -54,8 +54,7 @@
         "query": "python pytest tests",
         "baseline_top5": [
           "preference_145_1791346523",
-          "task_o1sup_1791751891814",
-          "preference_320_1791457650"
+          "task_o1sup_1791751891814"
         ],
         "n_hits": 730
       }
@@ -66,8 +65,7 @@
         "baseline_top5": [
           "fact_drain_179_1791688201",
           "preference_145_1791346523",
-          "task_o1sup_1791751891814",
-          "preference_320_1791457650"
+          "task_o1sup_1791751891814"
         ],
         "n_hits": 492
       },
@@ -92,7 +90,6 @@
         "query": "插件 目录",
         "baseline_top5": [
           "preference_drain_137_1791684701",
-          "preference_320_1791457650",
           "task_o1sup_1791751891814"
         ],
         "n_hits": 659
@@ -100,10 +97,7 @@
       {
         "query": "用户 偏好",
         "baseline_top5": [
-          "preference_drain_152_1791702783",
-          "preference_142_1791687192",
-          "preference_201_1791627642",
-          "preference_119_1791677567"
+          "preference_drain_152_1791702783"
         ],
         "n_hits": 661
       }

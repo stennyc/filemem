@@ -318,8 +318,10 @@ DECAY_DEFAULTS = {
         # (search_files raw dump `{"total_count":`, patch/terminal echo
         # `{"success":`) — same multilingual table, first batch identical.
         "tool_dump_openers": {
-            "en": ["Fetch finished", "{\"total_count\":", "{\"success\":"],
-            "zh": ["Fetch finished", "{\"total_count\":", "{\"success\":"],
+            "en": ["Fetch finished", "{\"total_count\":", "{\"success\":",
+                   "⏸ [", "✔ [", "⏱ ["],
+            "zh": ["Fetch finished", "{\"total_count\":", "{\"success\":",
+                   "⏸ [", "✔ [", "⏱ ["],
         },
         # P0-3: process-fragment anchors (startswith semantics, 全句开头
         # 锚点 — substring matching is deliberately NOT done, 零误杀).

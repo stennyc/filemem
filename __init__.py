@@ -372,13 +372,16 @@ _TASK_STEP_RE = re.compile(
 
 
 def ingress_reject_class(content: Optional[str],
-                        decay_cfg: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """P0-1: classify content against the three shared-store contamination
+                        decay_cfg: Optional[Dict[str, Any]] = None,
+                        exempt_structural: bool = False) -> Optional[str]:
+    """P0-1: classify content against the shared-store contamination
     classes. Returns the reject-class string
-    (``host_instruction_block`` / ``raw_tool_output`` / ``whole_task_prompt``)
+    (``host_instruction_block`` / ``raw_tool_output`` /
+    ``whole_task_prompt`` / ``host_relay_block`` / ``structural_opener``)
     when the content must NOT enter the memory pool, else None to pass.
-    Order (a)->(b)->(c)->None. Pure rule + stdlib re/len, zero LLM; never
-    raises on any input (the caller's fail-open contract is enforced upstream).
+    Order (a)->(b)->(b2)->(c)->(d)->None. Pure rule + stdlib re/len, zero
+    LLM; never raises on any input (the caller's fail-open contract is
+    enforced upstream).
 
     P0-3 (写侧 ingress 切同表): the ``raw_tool_output`` leg (b) is now
     「3 键恒活 (the code default — ``_looks_like_tool_dump`` + the
@@ -412,6 +415,22 @@ def ingress_reject_class(content: Optional[str],
     if s.startswith(_TOOL_OUTPUT_PREFIX) or _looks_like_tool_dump(s) \
             or _noise_table_hit(s, decay_cfg):
         return "raw_tool_output"
+    # (b2) structural opener leg (P4, owner 2026-10-15 源头过滤): a line
+    # that OPENS with { or [ (after lstrip) is a JSON-dump / room-transcript
+    # skeleton / system scaffolding — M1 doctrine, single source
+    # _NONPROSE_OPENERS shared with _is_structural_noise + the M3 purge.
+    # CODE DEFAULT: always live, independent of the P0-3 config tables
+    # (same posture as the 3-key code leg and egress leg ① — a missing or
+    # corrupted decay block never disables this leg). A real fact may QUOTE
+    # {/[ mid-sentence — only the line-opening test rejects (零误杀).
+    # Exempted ONLY for the P2 canary synthetic room turn (exempt_structural,
+    # passed by the provider during a _turn_canary run): that double-stamped
+    # item is the self-test positive-leg audit dependency. Placed AFTER the
+    # (b) table legs so table-classified rows keep their raw_tool_output
+    # class (zero P0-3 regression); the new class catches exactly the `{[`
+    # rows the tables missed (multi-key dumps, [Group chat skeletons).
+    if not exempt_structural and s.lstrip()[:1] in _NONPROSE_OPENERS:
+        return "structural_opener"
     # (c) whole task prompt: >=1000 chars AND >=3 step-number / step-list
     # markers (a real *list*, not a single passing "Step 1" mention).
     if len(s) >= _TASK_PROMPT_MIN_CHARS:
@@ -826,9 +845,24 @@ def _egress_noise_cut(content: str, decay_cfg: Optional[Dict[str, Any]]) -> bool
        never caught, 零误杀).
 
     A missing/malformed block is a fail-soft pass-through for its rules
-    (① is always active — it is pure code, not config)."""
+    (① is always active — it is pure code, not config).
+
+    P4 structural leg ⑥ (owner 2026-10-15, 源头过滤 read-face half): a
+    line that OPENS with `{`/`[` is structural (JSON-dump / room
+    skeleton / system scaffolding — M1 doctrine, single source
+    `_NONPROSE_OPENERS`, the SAME primitive the write-side
+    ingress (b2) leg rejects, so the two faces can never drift apart).
+    UNCONDITIONAL (code default, like ① — no length gate, no confirmed
+    gate, no cfg dependency): the P2 length-gated leg ② only caught
+    >max_chars rows, so the short room-skeleton rows (the 71-row census)
+    kept re-injecting on the auto-inject face; now every `{[`-opening row
+    is cut there. Mid-text `{[` quotes are never cut (the line-opening
+    test only — 零误杀)."""
     s = (content or "").strip()
     if _looks_like_tool_dump(s):
+        return True
+    # ⑥ P4 structural leg: line-opening {/[ = never a durable fact.
+    if s[:1] in _NONPROSE_OPENERS:
         return True
     cfg = decay_cfg or {}
     # P0-3 fail-soft hardening: a block shape the legs never agreed on
@@ -6267,8 +6301,14 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # provider's merged decay block is the table source, and a missing
         # block (decay_cfg=None) degrades to the P0-1 code-only gate.
         try:
+            # P4: the P2 canary synthetic room turn is the ONLY structural
+            # exemption (its double-stamped item is the self-test
+            # positive-leg audit dependency). Ordinary room meta turns land
+            # NOTHING — the structural leg rejects them at source.
+            exempt = bool(getattr(self, "_turn_canary", False))
             reject_class = ingress_reject_class(
-                content, getattr(self, "_decay", None))
+                content, getattr(self, "_decay", None),
+                exempt_structural=exempt)
         except Exception as e:  # classifier bug -> fail-open (row passes)
             logger.warning(
                 f"FileMem: ingress gate classifier failed ({e}); "

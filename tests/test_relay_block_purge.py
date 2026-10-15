@@ -153,12 +153,17 @@ def _write_memory_row(p, content: str, *, sp=None, confirmed=False,
 
 def test_relay_block_is_rejected_at_ingress(tmp_path):
     """RED pre-A-leg: a host relay block passed ingress (None) and landed in
-    the pool. After the (d) leg it must be classified host_relay_block and
-    therefore NOT written."""
-    assert ingress_reject_class(RELAY_BLOCK) == "host_relay_block"
+    the pool. After the (d) leg it must be rejected (classified host_relay
+    block OR — P4 2026-10-15: the (b2) structural leg now runs BEFORE (d)
+    and this fixture OPENS with `[ASYNC DELEGATION` (a `[` structural
+    opener) so it classifies structural_opener instead — either class is a
+    REJECT verdict, the acceptance point is "kept out of the pool")."""
+    cls = ingress_reject_class(RELAY_BLOCK)
+    assert cls in ("host_relay_block", "structural_opener"), \
+        f"the relay block must be rejected at ingress, got {cls!r}"
     p = _make_provider(tmp_path)
     res = p._ingress_rejection(RELAY_BLOCK, origin="ingress_reject")
-    assert res == "host_relay_block", \
+    assert res in ("host_relay_block", "structural_opener"), \
         "the relay block must be rejected at the write ingress"
     assert _read_all(p) == [], "a rejected relay block must land 0 rows"
 
