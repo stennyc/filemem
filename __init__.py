@@ -13307,12 +13307,13 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
             return False
 
     def _persist_bringback_asked(self, session_id: str) -> None:
-        """A-fix: append one {session_id, ts} line to the ledger. Idempotent
-        within a single provider lifetime via the in-memory dict (only called
-        on the first fire / answer for a sid), but a rebuilt provider re-runs
-        the read — so read-then-append runs under the same _shard_lock to
-        keep concurrent instances from duplicating a mark (mirrors the D
-        last_closed idempotency pattern). Fail-soft: a disk hiccup must
+        """A-fix: append one {session_id, ts} line to the ledger. Idempotent at
+        the LEDGER level: the read-then-append runs under the same _shard_lock
+        and the persisted-read check inside the lock dedupes regardless of
+        which call-site (footer-fire or P4-tool re-invocation) triggered it —
+        a second mark for the same sid finds the row already present and
+        returns early, never appending a duplicate. Mirrors the D
+        last_closed idempotency pattern. Fail-soft: a disk hiccup must
         never raise into the prefetch face (in-memory gate already held)."""
         p = self._bringback_persisted_gate_path()
         sid = session_id or getattr(self, "session_id", None)
@@ -13366,10 +13367,13 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
             return
         try:
             if not ledger_path.exists():
-                # Record the empty state too: a rebuilt provider must not
-                # re-scan a file that never existed (the gate is legitimately
-                # 'unasked' and the footer still fires on first prefetch).
-                seen[key] = True
+                # A-fix reviewer minor (2026-10-16): do NOT cache the
+                # absent-file state as a permanent tombstone. A sibling
+                # provider (or the footer-fire path of THIS provider running
+                # on a different thread) may create the ledger between this
+                # hydrate and the next; caching 'seen' here would make this
+                # instance miss that mark forever and re-fire the footer.
+                # Re-checking a missing file is one exists() per call — cheap.
                 return
             for line in ledger_path.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
@@ -13450,6 +13454,16 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                 % sid)
             st = self._bringback_footer_state()
             st[sid] = True  # one-shot held: 子进程不再重弹
+            # A-fix (owner 2026-10-16, reviewer major): persist the subagent
+            # suppress mark too — a REBUILT subagent provider whose
+            # _last_platform is not yet re-established would fall through to
+            # the ordinary main-session path; without the ledger mark it would
+            # re-fire the footer (the original bug, re-exposed on
+            # subagent+rebuild). A redundant subagent mark in the shared
+            # ledger is harmless: the subagent gate re-checks first and still
+            # suppresses, and the ordinary path's 'already asked' read just
+            # stays silent for a sid that was never meant to ask anyway.
+            self._persist_bringback_asked(sid)
             return ""
         st = self._bringback_footer_state()
         if st.get(sid, False):

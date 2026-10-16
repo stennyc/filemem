@@ -807,3 +807,85 @@ def test_a_persisted_gate_survives_no_target_session(tmp_path):
     assert p1._bringback_clarify_footer("s_notarget") == ""
     p2 = _fresh_shell(tmp_path, sid="s_notarget", profile="default")
     assert p2._bringback_clarify_footer("s_notarget") == ""
+
+
+def test_a_subagent_suppress_mark_persists(tmp_path):
+    """Reviewer major (2026-10-16): the P1-3 subagent gate suppressed the
+    footer but only held it in-memory; a REBUILT subagent provider whose
+    _last_platform is not yet re-established would fall through to the
+    ordinary main-session path and RE-FIRE the footer — the original bug,
+    re-exposed on subagent+rebuild. The subagent suppress branch must
+    persist its gate mark like the other branches."""
+    p1 = _provider_with_prev_closed(tmp_path)
+    p1._last_platform = "subagent"  # P1-3 gate live
+    assert p1._bringback_clarify_footer("s_sub") == ""  # suppressed (control)
+    # The mark must be in the persisted ledger (the rebuild survival path):
+    assert p1._bringback_persisted_asked("s_sub") is True, (
+        "subagent suppress must persist its gate mark so a rebuilt provider "
+        "(with _last_platform unset -> ordinary path) cannot re-fire it")
+
+
+def test_a_concurrent_persist_same_sid_single_row(tmp_path):
+    """Reviewer major: mirror test_d_last_closed_concurrent... for the
+    A-fix persist path — N threads x M provider instances, all sharing one
+    REAL _shard_lock (flock), calling _persist_bringback_asked('s_z') in
+    parallel must land EXACTLY ONE ledger row (no duplicate from the
+    read-decision-write TOCTOU)."""
+    import json as _json
+    import threading as _th
+    p = _make_provider(tmp_path, sid="s_z", profile="default")
+    _real_lock = _th.Lock()  # stand-in for the flock's mutual exclusion
+
+    def _locked(path):
+        import contextlib
+
+        @contextlib.contextmanager
+        def _ctx():
+            with _real_lock:
+                yield
+        return _ctx()
+
+    p._shard_lock = _locked
+    n_threads = 8
+    errors: list = []
+
+    def _persist():
+        try:
+            p._persist_bringback_asked("s_z")
+        except Exception as e:  # pragma: no cover - fail-soft never raises
+            errors.append(e)
+
+    threads = [_th.Thread(target=_persist) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, f"A concurrent raised: {errors}"
+    ledger = p._bringback_persisted_gate_path()
+    assert ledger is not None
+    rows = [
+        _json.loads(l) for l in ledger.read_text().splitlines() if l.strip()
+    ]
+    sids = [r["session_id"] for r in rows]
+    assert sids.count("s_z") == 1, (
+        f"A concurrent: s_z marked {sids.count('s_z')}x, expected exactly 1")
+
+
+def test_a_hydrate_missing_file_rechecks_next_call(tmp_path):
+    """Reviewer minor: a rebuilt provider that hydrates BEFORE a sibling
+    provider's mark lands must not cache 'file absent' as a permanent
+    tombstone — a LATER hydrate call (same instance, file now exists with
+    a mark from the sibling) must still fold the mark in, so the footer
+    does not re-fire on this instance's later turns."""
+    p1 = _provider_with_prev_closed(tmp_path)
+    p2 = _fresh_shell(tmp_path, sid="s_sib", profile="default")
+    # p2 hydrates while the ledger does not exist yet (p1 has not marked):
+    p2._bringback_footer_state()
+    # p1 now fires its footer -> persists a mark for s_cur:
+    assert "带回账本" in p1._bringback_clarify_footer("s_cur")
+    # p2's NEXT gate read must still see p1's mark despite the earlier
+    # empty-state cache (the fix: do NOT cache the absent-file state).
+    st = p2._bringback_footer_state()
+    assert st.get("s_cur") is True, (
+        "a later hydrate must pick up a mark that landed after this "
+        "instance's first (empty) hydrate")
