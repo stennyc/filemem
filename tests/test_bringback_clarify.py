@@ -748,3 +748,62 @@ def test_g2_normalize_named_profiles_preserved():
     # A named value is NOT collapsed to None:
     assert _normalize_profile_stamp("coder") is not None
     assert _normalize_profile_stamp("default") is not None
+
+
+# ── (9) A-fix (owner 2026-10-16): persisted one-shot gate ─────────────────────
+# A provider rebuilt mid-session (preflight compression / gateway cold-start)
+# loses its in-memory _bringback_footer_asked dict, so the footer RE-FIRED in
+# a long session. Fix: the gate hydrates from a persisted per-sid ledger
+# (bringback_asked.jsonl) so 'asked once' survives provider rebuilds.
+
+
+def _fresh_shell(tmp, sid="s_cur", profile="default"):
+    """Simulate a provider REBUILD for the same session: a brand-new provider
+    instance sharing the same tmp storage_dir (the in-memory gate dict is
+    freshly empty, exactly like post-compression provider re-init)."""
+    return _make_provider(tmp, sid=sid, profile=profile)
+
+
+def test_a_rebuild_footer_suppressed_by_persisted_gate(tmp_path):
+    """A: provider #1 fires the footer (marks asked), provider #2 — a rebuilt
+    instance for the SAME session (fresh in-memory dict) — must NOT re-fire:
+    the persisted ledger hydrates the gate before the footer decision."""
+    p1 = _provider_with_prev_closed(tmp_path)
+    foot1 = p1._bringback_clarify_footer("s_cur")
+    assert "带回账本" in foot1  # first provider: footer fires (control)
+    p2 = _fresh_shell(tmp_path, sid="s_cur", profile="default")
+    foot2 = p2._bringback_clarify_footer("s_cur")
+    assert foot2 == "", (
+        f"rebuilt provider must not re-fire the footer (persisted gate); got: "
+        f"{foot2[:80]!r}")
+
+
+def test_a_mark_choice_persisted_suppresses_rebuild(tmp_path):
+    """A: answering via the P4 tool also lands the persisted gate mark, so a
+    rebuilt provider never re-asks an answered session."""
+    p1 = _provider_with_prev_closed(tmp_path)
+    p1.handle_tool_call("filemem_set_bringback",
+                        {"choice": "clean_start", "session_id": "s_cur"})
+    p2 = _fresh_shell(tmp_path, sid="s_cur", profile="default")
+    assert p2._bringback_clarify_footer("s_cur") == ""
+
+
+def test_a_new_session_reasks_despite_shared_ledger(tmp_path):
+    """The persisted gate is PER-SESSION: a genuinely new session id is NOT
+    silenced by another session's mark (the bring-back face stays per-session;
+    the persistence only closes the rebuild hole, not the session boundary)."""
+    p1 = _provider_with_prev_closed(tmp_path)
+    p1._bringback_clarify_footer("s_cur")  # fires + persists s_cur
+    p2 = _fresh_shell(tmp_path, sid="s_new", profile="default")
+    foot = p2._bringback_clarify_footer("s_new")
+    assert "带回账本" in foot, "new session must re-ask (persisted gate is per-sid)"
+
+
+def test_a_persisted_gate_survives_no_target_session(tmp_path):
+    """Fail-soft: a rebuilt provider whose session has no fresh last_closed
+    target yields '' for the USUAL reason (no target), independent of the
+    persisted gate — both gates are per-sid and neither raises."""
+    p1 = _make_provider(tmp_path, sid="s_notarget", profile="default")
+    assert p1._bringback_clarify_footer("s_notarget") == ""
+    p2 = _fresh_shell(tmp_path, sid="s_notarget", profile="default")
+    assert p2._bringback_clarify_footer("s_notarget") == ""

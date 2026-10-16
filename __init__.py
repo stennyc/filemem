@@ -13265,21 +13265,138 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
     # bring-back target or already-asked or no storage_dir => "" (context
     # untouched) — a foot-degradation must never raise into the prefetch face.
 
+    def _bringback_persisted_gate_path(self) -> Optional[Path]:
+        """A-fix (owner 2026-10-16): storage_dir/bringback_asked.jsonl — the
+        persisted one-shot ledger. None when no storage_dir (fixture shell) —
+        the gate degrades to in-memory-only (today's behavior) and must never
+        raise into the prefetch face."""
+        sd = getattr(self, "storage_dir", None)
+        if sd is None:
+            return None
+        try:
+            sd = Path(sd)
+        except Exception:
+            return None
+        return sd / "bringback_asked.jsonl"
+
+    def _bringback_persisted_asked(self, session_id: str) -> bool:
+        """A-fix: True when the persisted ledger already holds a mark for
+        THIS session id. Fail-soft: no ledger file / no storage_dir / a
+        corrupt line -> False (the in-memory gate stays authoritative,
+        same as today)."""
+        p = self._bringback_persisted_gate_path()
+        if p is None or not session_id:
+            return False
+        try:
+            if not p.exists():
+                return False
+            wanted = set()
+            for line in p.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                s = row.get("session_id")
+                if s:
+                    wanted.add(s)
+            return session_id in wanted
+        except Exception:
+            return False
+
+    def _persist_bringback_asked(self, session_id: str) -> None:
+        """A-fix: append one {session_id, ts} line to the ledger. Idempotent
+        within a single provider lifetime via the in-memory dict (only called
+        on the first fire / answer for a sid), but a rebuilt provider re-runs
+        the read — so read-then-append runs under the same _shard_lock to
+        keep concurrent instances from duplicating a mark (mirrors the D
+        last_closed idempotency pattern). Fail-soft: a disk hiccup must
+        never raise into the prefetch face (in-memory gate already held)."""
+        p = self._bringback_persisted_gate_path()
+        sid = session_id or getattr(self, "session_id", None)
+        if p is None or not sid:
+            return
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with self._shard_lock(p):
+                if self._bringback_persisted_asked(sid):
+                    return  # another instance already marked this sid
+                with open(p, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(
+                        {"session_id": sid, "ts": _utcnow().isoformat()},
+                        ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.warning(f"FileMem: bringback gate persist failed: {e}")
+
     def _bringback_footer_state(self) -> Dict[str, bool]:
-        """Session-keyed one-shot gate for the bring-back footer (in-memory).
-        A cached provider is reused across sessions, so 'asked once' must be
-        keyed by session_id, not by instance."""
+        """Session-keyed one-shot gate for the bring-back footer (in-memory +
+        persisted ledger, A-fix owner 2026-10-16). A cached provider is reused
+        across sessions, so 'asked once' must be keyed by session_id, not by
+        instance. The in-memory dict is the fast path; on every READ of the
+        gate we hydrate the persisted ledger for this provider's sessions
+        (cheap existence check, deduped against what's already known), so a
+        REBUILT provider (preflight compression / gateway cold-start) does
+        not silently re-ask a session whose first provider already asked it.
+        Fail-soft: any ledger hiccup degrades to in-memory-only (today's
+        behavior), never raising into the prefetch face."""
         st = getattr(self, "_bringback_footer_asked", None)
         if not isinstance(st, dict):
             st = {}
             self._bringback_footer_asked = st
+        # A-fix: hydrate from the persisted ledger (once per storage_dir).
+        self._bringback_hydrate_persisted(st)
         return st
+
+    def _bringback_hydrate_persisted(self, st: Dict[str, bool]) -> None:
+        """A-fix: fold persisted marks into the in-memory gate dict, but only
+        for sids not already known (an in-memory mark always wins — it is the
+        same session's live knowledge; re-folding a known sid is wasted work
+        and a marker for gate state being reset mid-session). Fail-soft."""
+        ledger_path = self._bringback_persisted_gate_path()
+        if ledger_path is None:
+            return
+        seen = getattr(self, "_bringback_hydrated_paths", None)
+        if not isinstance(seen, dict):
+            seen = {}
+            self._bringback_hydrated_paths = seen
+        key = str(ledger_path)
+        if seen.get(key):
+            return
+        try:
+            if not ledger_path.exists():
+                # Record the empty state too: a rebuilt provider must not
+                # re-scan a file that never existed (the gate is legitimately
+                # 'unasked' and the footer still fires on first prefetch).
+                seen[key] = True
+                return
+            for line in ledger_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                s = row.get("session_id")
+                if s and s not in st:
+                    st[s] = True
+            seen[key] = True
+        except Exception:
+            # Fail-soft: unreadable ledger -> in-memory gate stays authoritative
+            # (today's behavior); do NOT poison the cache so a next call can
+            # retry once the hiccup clears.
+            logger.warning("FileMem: bringback gate hydration failed; "
+                           "falling back to in-memory gate only")
 
     def _mark_bringback_footer_asked(self, session_id: str) -> None:
         st = self._bringback_footer_state()
         sid = session_id or getattr(self, "session_id", None)
         if sid:
             st[sid] = True
+            # A-fix: persist the mark so a rebuilt provider sees it.
+            self._persist_bringback_asked(sid)
 
     def _is_subagent_session(self) -> bool:
         """P1-3 子进程闸谓词（owner 2026-10-14）：当前 session 是否为
@@ -13351,6 +13468,10 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         if prev_sid is None:
             return ""  # no per-profile last_closed stamp -> nothing to bring back
         st[sid] = True  # mark asked NOW so a re-fetch this turn does not re-fire
+        # A-fix (owner 2026-10-16): persist the mark so a REBUILT provider
+        # (preflight compression / gateway cold-start) sees it via the
+        # ledger hydrate on its next _bringback_footer_state() read.
+        self._persist_bringback_asked(sid)
         # P1-2 修复 1（owner 2026-10-14）: carry the PREVIOUS session's topic
         # (its first user message via _session_title_hint, fail-soft to a bare
         # id) so the model/owner sees WHICH topic is about to be crossed —
