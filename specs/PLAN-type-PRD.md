@@ -176,6 +176,35 @@ distill 同姿态，host LLM 不坐锁内）。
 LLM pass 同姿态）。命中推 PENDING marker 走 clarify 通道，下一 turn 的
 [记忆报告] 列出，用户定存/不存。零自动落盘（owner 裁决，slice-4 继承）。
 
+**挂点 B'（slice-6 F5，owner 2026-10-17 "5 步链"）**：owner 点破——slice-5
+的挂点 B 只喂**assistant 转述**，LLM 判的是"PRD 落地了"一句话，不是 agent
+写进文件里的那份**完整 PRD 正文**（步骤缩水、文件头 18KB 的内容全没喂）。
+修复 = owner 的 5 步链：`llm 捕获 -> 分析会话内容和文件落盘路径 -> 读文件头
+-> 确认是 plan -> plan 文件内容入 plan 记忆`。
+
+三段独立实现（各自独立锚，不混）：
+
+1. **捕获 + 分析（`_extract_plan_write_paths(history)`）**：扫宿主 transcript
+   的 `role=assistant` 行 `tool_calls`（宿主真实结构，`agent_runtime_helpers.py`
+   L127/L156/L133：`function.name` + `function.arguments`，arguments 可能是
+   JSON 字符串或 dict），取 `write_file`/`patch`/`write`/`create_file`/
+   `append_file` 的 `path` 参数，**只留文件名或所在目录名带
+   `_PLAN_PATH_FEATURES` 特征词**（plan/prd/spec/roadmap/milestone/execution/
+   action-plan/design-doc/refactor，owner 裁决"肯定是特征"，非全目录扫描），
+   按目录去重（owner 知识库："记录文件所在文件夹路径即可"）。**宿主
+   agent/ 零 diff**——只读宿主已落盘的 transcript。
+2. **读文件头 + 确认（`_plan_probe_file(path)`）**：读候选文件前 ~400 字
+   （步骤/done-when 段），连同路径 tag 喂同一个 budget-gated `probe_plan`
+   LLM 面判"是不是多步可推进 plan"（LLM 有最终判定权，pre-screen 只是
+   成本闸）。命中产 PENDING marker（带 `source_path`）；文件不存在 / 超预算
+   / 宿主失败 -> None（fail-soft，不阻塞 turn-close 路径，不发起 LLM 调用）。
+3. **入 plan 记忆**：现成 clarify 消费面（`filemem_review_drafts
+   action=plan_probe verdict=save -> filemem_plan create`），**零改动**——
+   仍是用户点头才落盘，零自动落盘（slice-4 裁决不变）。
+
+`sync_turn` 挂点逻辑：文件探针优先（有 spec/plan 特征写路径就喂文件正文），
+没产出 marker 才回退 slice-5 文本探针（裸"PRD 落地了"转述仍能被接住）。
+
 **判定**：`_plan_probe` 是唯一的 plan 候选 LLM 面。预算门（per-session
 cap，超 cap 不发 LLM 调用）+ 双层 pre-screen（slice-5 F4，**任一层命中
 即过闸**——两层是 OR 不是 AND：AND 门会挂掉 slice-4 既有行为，plan-signal
@@ -190,10 +219,17 @@ cap，超 cap 不发 LLM 调用）+ 双层 pre-screen（slice-5 F4，**任一层
 - **两层都 miss** -> `prescreen_skip` -> 不发 LLM 调用（成本红线，"宁漏
   勿炸"只适用于双 miss 情形）。判定记在 `self._plan_probe_last_decision`
   （"prescreen_pass"/"prescreen_skip"），`_plan_probe_last_seen` 记被探测
-  的原文，供活路审计。命中 LLM 回 `probe=true` + 结构化的 `{title, steps, done_when}` 时，
-产一个 PENDING PROBE marker（**不写行**），经 clarify 通道
-（`_push_pending_confirm(kind="plan_probe")`）在下一 turn 的 [记忆报告] 列出，
-问用户"是否存为持久 plan 记忆"。
+  的原文，供活路审计。命中 LLM 回 `probe=true` + 结构化的 `{title, steps,
+  done_when}` 时，产一个 PENDING PROBE marker（**不写行**），经 clarify
+  通道（`_push_pending_confirm(kind="plan_probe")`）在下一 turn 的 [记忆
+  报告] 列出，问用户"是否存为持久 plan 记忆"。
+
+**slice-6 新增（F5 挂点 B' 的判定层）**：`_extract_plan_write_paths` 的
+**特征词表** `_PLAN_PATH_FEATURES`（模块级，plan/spec 文件路径特征，只匹配
+**文件名 + 直接父目录**，不匹配整条绝对路径——避免上层目录名误命中）是
+挂点 B' 的路径提取门；`_plan_probe_file` 的输入是**文件正文前 400 字 +
+路径 tag**，LLM 判的是原文件不是转述。`marker["source_path"]` 记录来源
+文件路径，clarify 消费面落 plan 行时可携带。
 
 **clarify 内容**：
 
@@ -683,7 +719,10 @@ plan 行 metadata 内 `progress_log[]`（保留最近 10 条）：
 | `__init__.py` 新 | `_PLAN_LAND_SIGNALS`（§2 slice-5 F4：spec 落盘结构词表，pre-screen layer A） |
 | `__init__.py` 新 | `_plan_probe` + `_plan_probe_push`（§2 slice-4 的 probe + clarify 面；slice-5 F4 改双层 pre-screen） |
 | `__init__.py` `_save_memory` | **slice-4**：auto task/decision 行出口挂 probe（挂点 A，post-lock，与 distill 同段） |
-| `__init__.py` `sync_turn` | **slice-5 F4**：轮末 assistant 文本挂 probe（挂点 B，turn-close B4 fallback 之后，活路） |
+| `__init__.py` `sync_turn` | **slice-5 F4**：轮末 assistant 文本挂 probe（挂点 B，turn-close B4 fallback 之后，活路）；**slice-6 F5**：挂点 B' 升级——先走 `_extract_plan_write_paths` + `_plan_probe_file`（读文件正文喂 LLM），无文件命中才回退 slice-5 文本探针 |
+| `__init__.py` 新 | `_PLAN_PATH_FEATURES`（§2 slice-6 F5：plan/spec 文件路径特征词表，只匹配文件名+直接父目录，非全目录扫描） |
+| `__init__.py` 新 | `_extract_plan_write_paths`（§2 slice-6 F5：宿主 transcript tool_calls 提 plan/spec 写路径，特征门 + 目录去重，宿主 agent/ 零 diff） |
+| `__init__.py` 新 | `_plan_probe_file`（§2 slice-6 F5：读候选文件头 ~400 字喂 probe LLM 面，命中产带 source_path 的 PENDING marker，fail-soft 零落盘） |
 | `__init__.py` `filemem_review_drafts` | **slice-4**：`action="plan_probe"` 消费分支（save -> `_plan_create`，dismiss -> 不写） |
 | `__init__.py` 新 | `filemem_plan` 工具（list/create/advance + 9 op，§6） |
 | `__init__.py` 新 | plan 行 upsert 语义（同 plan_id 合并）+ anchor 强制校验 |
