@@ -1801,6 +1801,29 @@ def _o1_valid_until_for_scope(scope: Optional[str], created_at_iso: str) -> Opti
     return datetime(d.year, d.month, d.day, 23, 59, 59).isoformat()
 
 
+import re as _re_mod
+_SESSION_ID_SHAPE_RE = _re_mod.compile(
+    r"\b(\d{8}_\d{6}_[0-9a-f]{6})\b")  # YYYYMMDD_HHMMSS_hex6, the host session-id form
+
+
+def _extract_user_named_sid(user_query: Optional[str],
+                           closed_sids: Optional[set]) -> Optional[str]:
+    """HANDOFF owner ④ (2026-10-17): the user's EXPLICIT recall of a session,
+    detected as a session-id-shaped token in their message. Returns the token
+    ONLY when it is BOTH session-id-shaped AND in the known closed-set for
+    this profile (fail-soft: an unknown / foreign / typo'd token must NOT
+    suppress the footer — 不误伤, owner C3). Zero LLM, pure regex + set
+    membership. closed_sids=None -> None (no known set -> no suppression
+    path, footer keeps today's behavior)."""
+    if not user_query or not closed_sids:
+        return None
+    for m in _SESSION_ID_SHAPE_RE.finditer(user_query):
+        tok = m.group(1)
+        if tok in closed_sids:
+            return tok
+    return None
+
+
 def _row_is_lapsed(row: Dict[str, Any], now: Optional["datetime"] = None) -> bool:
     """(b) read-side validity-lapse predicate (pure, zero LLM, fail-open).
 
@@ -3465,6 +3488,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             self._audit_recall(0, reason_trivial=True, reinforced=0, durable_hits=0)
             # Session-level surface: pending historical drafts are announced
             # even on a trivial first turn (once per session via the flag).
+            # owner ①: a trivial prompt is NOT a recall intent — keep the
+            # trivial path byte-stable (no handoff summary there; a dead
+            # session pinned by the user is reached via a REAL prefetch
+            # query, where the 0-hit tail injection fires).
             return self._pending_draft_notice("", session_id=session_id)
 
         # P3: remember this turn's query so the snapshot write at the tail
@@ -3480,6 +3507,27 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # decay axis (sub-minute age deltas are below the lambda resolution
         # that ever changes an RRF rank), so no new drift class is introduced.
         self._f2_time_anchor = datetime.now(timezone.utc)
+
+        # HANDOFF owner re-spec ② (白底短路, 2026-10-17): when this session has
+        # an EXPLICIT valid pin whose <sid>.jsonl yields a dedup'd
+        # conversation, the auto face is a WHITE SHEET — it carries ONLY the
+        # freshly-generated handoff summary + the pending-draft notice, and
+        # NO other memory injection (no P3 frozen snapshot, no recall block
+        # of confirmed / global / cross-session rows, no search recall hits).
+        # Short-circuit BEFORE the P3 replay block so a stale frozen block
+        # from a prior turn cannot leak other-session memory into a
+        # white-sheet session. Fail-soft: _bringback_white_sheet_active
+        # returns False on any hiccup -> today's normal prefetch (P3 replay
+        # + recall + footer + tail) runs unchanged, so a pin with no
+        # material NEVER produces an empty face.
+        if self._bringback_white_sheet_active(session_id):
+            logger.info(
+                f"FileMem: white-sheet handoff for session={session_id} — "
+                f"auto face carries ONLY the pinned session's handoff "
+                f"summary (recall block + P3 snapshot excluded)")
+            _white_sheet = self._handoff_pin_tail_summary(session_id)
+            return self._pending_draft_notice(
+                _white_sheet, session_id=session_id)
 
         # P3 cold-start replay: on a (re-)initialized provider for a session that
         # already has a saved injection block, replay that block verbatim on the
@@ -3522,7 +3570,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     # (L3537), and a session that cold-starts through the P3
                     # replay branch would NEVER surface the bring-back question.
                     return self._pending_draft_notice(
-                        _snap + self._bringback_clarify_footer(session_id),
+                        _snap + self._bringback_clarify_footer(
+                            session_id, user_query=query),
                         session_id=session_id)
                 # Every line cut by isolation: fall through to a live
                 # re-prefetch (0-hit or a freshly-scoped pool), which re-freezes
@@ -3751,7 +3800,9 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             # here: the _last_recall_stats still carried the PREVIOUS
             # call's counters, and a 0-hit recall reinforced nothing.
             self._audit_recall(0, reason_trivial=False, reinforced=0, durable_hits=0)
-            return self._pending_draft_notice("", session_id=session_id)
+            return self._pending_draft_notice(
+                self._handoff_pin_tail_summary(session_id),
+                session_id=session_id)
 
         # v2 egress (P2 self-test cut): items stamped metadata.self_test are
         # NEVER composed into the token-spend surface. Data stays on disk
@@ -3778,7 +3829,14 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             # here: the _last_recall_stats still carried the PREVIOUS
             # call's counters, and a 0-hit recall reinforced nothing.
             self._audit_recall(0, reason_trivial=False, reinforced=0, durable_hits=0)
-            return self._pending_draft_notice("", session_id=session_id)
+            # HANDOFF owner ② (pin -> auto-face TAIL): a pinned dead session
+            # may have zero recall HITS (its rows are not in this profile's
+            # live pool) yet the handoff summary is still the life-line — it
+            # rides the tail even on a 0-hit early exit (the auto face still
+            # renders; nothing else to lose). Fail-soft: '' when no valid pin.
+            return self._pending_draft_notice(
+                self._handoff_pin_tail_summary(session_id),
+                session_id=session_id)
 
         _mem_dir = getattr(self, "memories_dir", None)
         _conc_lock_target = (
@@ -3801,7 +3859,9 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             # here: the _last_recall_stats still carried the PREVIOUS
             # call's counters, and a 0-hit recall reinforced nothing.
             self._audit_recall(0, reason_trivial=False, reinforced=0, durable_hits=0)
-            return self._pending_draft_notice("", session_id=session_id)
+            return self._pending_draft_notice(
+                self._handoff_pin_tail_summary(session_id),
+                session_id=session_id)
 
         # SEC-1-2 injection-face trust gate (pure, zero LLM): after egress,
         # BEFORE reinforce_recall — a dropped row must NEVER bump
@@ -3905,7 +3965,9 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             # here: the _last_recall_stats still carried the PREVIOUS
             # call's counters, and a 0-hit recall reinforced nothing.
             self._audit_recall(0, reason_trivial=False, reinforced=0, durable_hits=0)
-            return self._pending_draft_notice("", session_id=session_id)
+            return self._pending_draft_notice(
+                self._handoff_pin_tail_summary(session_id),
+                session_id=session_id)
 
         # P0-2 denoise ①: cap the AUTO-inject row count (top-N by the existing
         # fused rank = `results` order). A wide recall pool is NOT a
@@ -4024,7 +4086,17 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # Rides the return face only — appended AFTER the snapshot freeze so it
         # never leaks into a cold-start replay block. Fail-soft: '' when no
         # target / already-asked / no storage_dir (context unchanged).
-        context = context + self._bringback_clarify_footer(session_id)
+        context = context + self._bringback_clarify_footer(
+            session_id, user_query=query)
+        # HANDOFF owner ② (pin -> auto-face TAIL): an EXPLICIT valid pin's
+        # handoff summary (LLM or deterministic-segment fallback) rides the
+        # very tail of the auto face — AFTER the recall block + clarify
+        # footer, as a distinct marker-delimited section. It is NOT pinned
+        # to the top of the confirmed rows, NOT a new confirmed row, and it
+        # never touches the search face (M4). Fail-soft: '' when no valid
+        # pin / no materials — the recall+footer face is byte-identical to
+        # today in that case (owner T4 byte-level regression sentinel).
+        context = context + self._handoff_pin_tail_summary(session_id)
         return self._pending_draft_notice(context, session_id=session_id)
 
     # ── P3 cache-stability: last-injection snapshot ─────────────────────────────
@@ -4735,13 +4807,31 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             if len(content) > 100:
                 content = content[:100] + "…"
             level = it.get("level", "L0")
-            lines.append(f"  {i}. [{level}] {content}")
+            kind = it.get("kind", "l0")
+            # t_plan_slice4: plan-probe panel entries (kind="plan_probe") show
+            # their synthetic id so the consumption call can address them.
+            if kind == "plan_probe":
+                lines.append(
+                    f"  {i}. [{level}] {content}  "
+                    f"(probe id: {it.get('id')})")
+            else:
+                lines.append(f"  {i}. [{level}] {content}")
+        # t_plan_slice4: a mixed batch with plan-probe entries needs a second
+        # disposal path (action="plan_probe" verdict=save/dismiss) — the L0 /
+        # draft rows still use action="confirm"/"discard". Branch on presence
+        # rather than on a single uniform footer.
+        _has_probe = any(it.get("kind") == "plan_probe" for it in pending)
+        _disposal = "请调用 clarify（确认保存/丢弃/取消），确认后调 " \
+                    'filemem_review_drafts(action="confirm"/"discard") 批量处置。'
+        if _has_probe:
+            _disposal += (" 检测到多步计划（plan_probe 条目）：确认存为持久 plan 用 "
+                          'filemem_review_drafts(action="plan_probe", verdict="save", '
+                          'memory_id=<probe id>)；不存用 verdict="dismiss"（两者都消耗面板条目）。')
         return (
             "\n\n[记忆报告] 以下记忆将保存/已自动生成，可批量处置：\n"
             + "\n".join(lines)
             + f"\n{self.LEVEL_LEGEND}\n"
-            + "请调用 clarify（确认保存/丢弃/取消），确认后调 "
-              'filemem_review_drafts(action="confirm"/"discard") 批量处置。'
+            + _disposal
         )
 
     def _draft_content_dup_in_session(
@@ -6075,6 +6165,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             return ""  # Return empty to indicate queued, not lost
 
         _distill_target = None
+        _probe_target = None
         # t_090d6f3d: pre-lock, budget-gated host-LLM reclassify of a regex
         # `fact`-miss (spike-3 hybrid). `_detect_type` is the PURE regex
         # verdict (zero LLM); when it lands on `fact` the item is a strong-
@@ -6304,6 +6395,20 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                                        getattr(self, "_turn_active_sid", None)
                                        or self.session_id or "default")
 
+                # t_plan_slice4: plan-probe target — a NEW auto-extracted
+                # task/decision row that carried a regex plan-signal is a
+                # candidate for the plan-PROBE face (the LLM decides whether
+                # it is a genuine multi-step PRD worth a confirmed plan row).
+                # Runs post-lock + out-of-lock (same posture as distill): a
+                # host LLM call never sits inside a held flock, and the probe
+                # NEVER lands a row itself (it emits a pending marker the
+                # clarify channel lists; a confirmed user nod is the only
+                # writer). manual / confirmed_draft writes are user-confirmed
+                # already — not re-probed.
+                _probe_target = None
+                if source == "auto" and mem_type in ("task", "decision"):
+                    _probe_target = content
+
                 self._last_save_time = now
                 _return_id = item.id
 
@@ -6316,6 +6421,20 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                                     _distill_target[2], session_id=_distill_target[3])
             except Exception as e:
                 logger.warning(f"FileMem: single-save distill failed for {_distill_target[1]}: {e}")
+
+        # t_plan_slice4: plan-probe OUTSIDE the lock (budget-gated + fail-soft,
+        # same posture as distill above). A hit pushes the pending marker
+        # through the clarify channel; a miss / no-runtime / over-budget is a
+        # silent no-op (the task/decision row already landed on disk).
+        if _probe_target is not None:
+            try:
+                _marker = self._plan_probe(_probe_target)
+                if _marker is not None:
+                    self._plan_probe_push(_marker)
+                    logger.info(f"FileMem: plan-probe marker pushed "
+                                f"(title={_marker.get('title')!r})")
+            except Exception as e:
+                logger.warning(f"FileMem: plan-probe failed (row already saved): {e}")
 
         if source == "auto":
             self._session_save_count += 1
@@ -6490,12 +6609,27 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         intentionally regex-only (zero LLM) — a fact-miss MAY be upgraded by
         the budget-gated host-LLM fallback (``_reclassify_type_llm``), which
         runs at the save door, NOT in here.
+
+        SLICE-4 (owner ruling 2026-10-17): ``plan`` is NO LONGER a verdict.
+        The plan shard is reserved for confirmed PRD rows created ONLY via
+        the probe + clarify face (``_plan_probe`` -> user nod ->
+        ``filemem_plan(action="create")``). The ``_MEMORY_TYPE_REGEX`` plan
+        row survives as a pre-screen signal for that probe face, but a regex
+        plan-hit routes to ``task`` here (ordered steps to complete are a
+        task; a settled plan is a decision) — a regex hit can never land a
+        row in plan.json by itself.
         """
         content_lower = (content or "").lower()
-        for mem_type in ("preference", "decision", "task", "plan"):
+        for mem_type in ("preference", "decision", "task"):
             for pattern in _MEMORY_TYPE_REGEX.get(mem_type, ()):
                 if re.search(pattern, content_lower):
                     return mem_type
+        # plan pre-screen signal (slice 4): NOT a verdict. A plan-shaped
+        # content routes to task (the ordered-steps home); the probe face
+        # (_plan_probe) decides whether it is worth a confirmed plan row.
+        for pattern in _MEMORY_TYPE_REGEX.get("plan", ()):
+            if re.search(pattern, content_lower):
+                return "task"
         return "fact"
 
     def _add_draft(self, content: str, level: str = "L0") -> str:
@@ -6846,10 +6980,147 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # Count the call against the budget (a call happened, whatever the verdict).
         budget[sid] = budget.get(sid, 0) + 1
         verdict = res.get("type")
-        if verdict in ("preference", "decision", "task", "plan"):
+        # I1: the upgrade face may only land preference/decision/task. A
+        # 'plan' verdict is dropped (the regex `fact` verdict stands) — a plan
+        # row is created ONLY via the confirmed filemem_plan face (PRD §6),
+        # never via the auto-save door. (Even though classify_type already
+        # hardens its own valid set, this caller-side guard is the load-
+        # bearing one: it is what actually decides where the row lands.)
+        if verdict in ("preference", "decision", "task"):
             return verdict
-        # LLM agreed with fact / returned an invalid verdict -> no override.
+        # LLM agreed with fact / returned an invalid verdict / said plan ->
+        # no override.
         return None
+
+    def _plan_probe(self, content: str) -> Optional[Dict[str, Any]]:
+        """t_plan_slice4: budget-gated host-LLM plan-PROBE face.
+
+        The ONLY LLM face allowed to raise a plan candidate. It is the
+        accuracy layer behind the deterministic pre-screen (a regex
+        plan-signal on content that just landed as a task/decision row): the
+        LLM decides whether the content is a genuine MULTI-STEP plan the
+        agent itself authored (a PRD / execution sequence / repair roadmap
+        with >= 3 ordered steps + a done-when criterion). A hit emits a
+        PENDING PROBE marker (a structured dict: kind/title/steps/
+        done_when) — it NEVER writes a row. The caller pushes the marker
+        through the clarify channel (_push_pending_confirm kind="plan_probe")
+        so the user is asked "save this detected plan/PRD to memory?"; only
+        a confirmed nod lands a PRD-shaped row via filemem_plan(action=
+        "create"). No auto-land, ever (owner ruling 2026-10-17).
+
+        Budget gate (the "avoid per-item LLM cost explosion" red line): a
+        per-session cap _plan_probe_limit (default 3, tunable via
+        decay.json plan_probe.llm_per_session; 0 / a missing/invalid budget
+        = feature off). Over-cap returns None WITHOUT issuing a call. The
+        decay plan_probe.enable flag is the clean rollback switch
+        (False = face off, byte-identical to the pre-slice-4 save door).
+
+        Fail-soft (never blocks the save): no main_runtime / over-cap / any
+        host failure / a miss -> None. The probe LLM call runs OUTSIDE the
+        write lock (the caller invokes it pre-lock, mirroring the
+        _reclassify_type_llm posture), so a slow host call never sits inside
+        a held flock.
+        """
+        # Decay rollback switch (clean off): a malformed/absent block
+        # defaults to enabled so the feature ships on; enable=False = off.
+        mt_cfg = (getattr(self, "_decay", None) or {}).get("plan_probe") or {}
+        if not mt_cfg.get("enable", True):
+            return None
+        limit = getattr(self, "_plan_probe_limit", 3)
+        if not isinstance(limit, int) or limit <= 0:
+            return None
+        main_runtime = self._live_main_runtime()
+        if not main_runtime:
+            return None  # standalone / non-host: zero call
+        sid = getattr(self, "_turn_active_sid", None) or self.session_id or "default"
+        budget = getattr(self, "_plan_probe_budget", None)
+        if not isinstance(budget, dict):
+            budget = {}
+            self._plan_probe_budget = budget
+        if budget.get(sid, 0) >= limit:
+            # Over-cap: no call, no marker (audit-trail verdict, not load-
+            # bearing — the content row already landed on disk as task).
+            logger.info(f"FileMem: plan-probe budget hit ({sid} >= {limit}), "
+                        f"skipping probe")
+            return None
+        # Deterministic pre-screen: ONLY probe content that already carried a
+        # regex plan-signal (the caller only routes task/decision rows, and
+        # even those only if _detect_type saw the plan pre-screen row). A
+        # zero-signal content is NOT worth an LLM call (cost red line).
+        content_lower = (content or "").lower()
+        has_signal = any(re.search(pat, content_lower)
+                         for pat in _MEMORY_TYPE_REGEX.get("plan", ()))
+        if not has_signal:
+            return None
+        try:
+            llm = _load_llm_caller()
+            res = llm.probe_plan(main_runtime, content)  # fail-soft inside
+            self._append_llm_call_telemetry(llm, "probe_plan")
+        except Exception as e:
+            # A loader / host failure must NOT block the save. Charge the
+            # ATTEMPT against the session budget so a persistent host-down
+            # cannot retry the LLM call on every plan-signal auto-save until
+            # the budget is exhausted by failed calls — "charge the attempt,
+            # not the success" (mirrors the _reclassify_type_llm "a call
+            # happened -> charge it" posture; the avoid-LLM-cost-explosion
+            # red line).
+            budget[sid] = budget.get(sid, 0) + 1
+            logger.warning(f"FileMem: plan-probe loader failed ({e}); skipping")
+            return None
+        # A successful call also charges the budget (a call happened,
+        # whatever the verdict).
+        budget[sid] = budget.get(sid, 0) + 1
+        if not res.get("probe"):
+            return None
+        marker = {
+            "kind": "plan_probe",
+            "title": res.get("title") or (content or "").strip()[:80],
+            "steps": list(res.get("steps") or []),
+            "done_when": res.get("done_when") or "all steps done",
+            "source_content": (content or "").strip()[:400],
+            "ts": _utcnow().isoformat(),
+        }
+        return marker
+
+    def _plan_probe_push(self, marker: Dict[str, Any]) -> None:
+        """t_plan_slice4: push a PENDING plan-probe marker through the
+        clarify channel so the NEXT turn's [记忆报告] can list it (one per
+        line, with its id) and the user decides save / dismiss. Mirrors the
+        L0-auto save face's _push_pending_confirm(kind="l0") posture — the
+        probe marker is a NEW kind="plan_probe" entry; consumption happens
+        in _tool_review_drafts(action="plan_probe", verdict="save"|"dismiss")
+        -> a confirmed "save" lands a PRD-shaped row via filemem_plan
+        (action="create"). No auto-land (owner ruling 2026-10-17)."""
+        sid = getattr(self, "_turn_active_sid", None) or self.session_id or "default"
+        # A synthetic panel id: the probe marker has no row yet (the whole
+        # point — it lands ONLY on a confirmed nod), so the panel entry's id
+        # is a stable synthetic handle derived from the marker's content,
+        # not a real memory row id.
+        import hashlib as _hl
+        probe_id = "plan_probe_" + _hl.md5(
+            (marker.get("title", "") + "\n" + "\n".join(marker.get("steps") or [])).encode("utf-8")
+        ).hexdigest()[:12]
+        # The clarify panel shows the steps one-per-line (the user's decision
+        # surface), not a JSON blob.
+        panel_content = "\n".join(
+            [f"[plan-probe] {marker.get('title')}"]
+            + [f"  step {i+1}: {s}" for i, s in enumerate(marker.get("steps") or [])]
+            + [f"  done-when: {marker.get('done_when')}"]
+        )
+        # Carry the structured marker so the consumption face can recover it
+        # without re-running the LLM. _push_pending_confirm stores the
+        # `content` string; we side-stamp the marker onto the panel entry by
+        # a second, marker-keyed store (bounded like the panel itself).
+        self._plan_probe_markers = getattr(self, "_plan_probe_markers", {})
+        self._plan_probe_markers.setdefault(sid, {})[probe_id] = marker
+        # Growth bound: cap the per-session marker table like the panel.
+        cap = getattr(self, "_pending_confirm_cap", 50)
+        tbl = self._plan_probe_markers[sid]
+        if len(tbl) > cap:
+            for stale in list(tbl.keys())[:len(tbl) - cap]:
+                tbl.pop(stale, None)
+        self._push_pending_confirm(sid, probe_id, "L0", panel_content,
+                                   kind="plan_probe")
 
     def _update_memory_metadata(self, mem_type: str, item_id: str,
                                 metadata: Dict[str, Any]) -> None:
@@ -8349,7 +8620,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         "type": {
                             "type": "string",
                             "enum": ["preference", "fact", "decision", "task", "plan"],
-                            "description": "Type of memory"
+                            "description": "Type of memory. READ/SEARCH-compatible shard selector (filemem_search / filemem_read / filemem_supersede key on it). On the WRITE face (filemem_write) this is a HINT, not a directive: the row's actual shard is decided by content-based type detection, so passing type='plan' does NOT land a row in plan.json (the plan shard is written ONLY via the probe+clarify confirm chain / filemem_plan, slice-4 owner ruling 2026-10-17)."
                         },
                         "content": {
                             "type": "string",
@@ -8491,18 +8762,23 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             },
             {
                 "name": "filemem_review_drafts",
-                "description": "Review session memory drafts. action=\"preview\" lists pending entries by content and id (internal storage filenames are never exposed); action=\"confirm\"/\"discard\" dispose of pending entries in bulk. Pass target=<owner id> to act on a HISTORICAL session's drafts (internal addressing only — do NOT surface draft filenames to the user); omit target to act on the current session's drafts.",
+                "description": "Review session memory drafts. action=\\\"preview\\\" lists pending entries by content and id (internal storage filenames are never exposed); action=\\\"confirm\\\"/\\\"discard\\\" dispose of pending entries in bulk. Pass target=<owner id> to act on a HISTORICAL session's drafts (internal addressing only — do NOT surface draft filenames to the user); omit target to act on the current session's drafts. SLICE-4 (owner 2026-10-17): action=\\\"plan_probe\\\" + verdict=\\\"save\\\"|\\\"dismiss\\\" is the user's nod on a pending plan-probe panel entry (the [记忆报告] lists it as a 'plan_probe_<hash>' id) — 'save' lands a PRD-shaped plan row via filemem_plan(action='create'); 'dismiss' writes nothing.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["preview", "confirm", "discard"],
-                            "description": "Action to take on drafts: preview is read-only; confirm/discard are batch disposals"
+                            "enum": ["preview", "confirm", "discard", "plan_probe"],
+                            "description": "Action to take on drafts: preview is read-only; confirm/discard are batch disposals; plan_probe is the user's save/dismiss verdict on a pending plan-probe panel entry (t_plan_slice4)"
+                        },
+                        "verdict": {
+                            "type": "string",
+                            "enum": ["save", "dismiss"],
+                            "description": "plan_probe only: the user's decision on the pending plan-probe panel entry — 'save' lands a PRD-shaped plan row via filemem_plan(action='create'); 'dismiss' writes nothing (the panel entry is consumed either way)."
                         },
                         "memory_id": {
                             "type": "string",
-                            "description": "Specific memory ID to act on (optional)"
+                            "description": "Specific memory ID to act on (optional). For action='plan_probe' this is the probe panel id from the [记忆报告] panel ('plan_probe_<hash>')."
                         },
                         "limit": {
                             "type": "integer",
@@ -8523,6 +8799,11 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     "choice='bring_back' pins the previous closed session's CONFIRMED summaries to the "
                     "TOP of this session's auto-inject face (reorder only — no new rows; a confirmed "
                     "prev-session row is already kept by the confirmed-global leg). "
+                    "Optional pin_session_id names a SPECIFIC closed session to pin instead of the "
+                    "auto 'last closed' target (the life-line for deadlocked old sessions — the pin "
+                    "bypasses the 30-min freshness window; only honored under choice='bring_back'; "
+                    "a pin with no matching closed stamp or from a foreign profile falls through to "
+                    "the auto target, reported honestly). "
                     "'clean_start' = V2 default (confirmed global skeleton + this session's own rows). "
                     "'fresh' = this session injects NOTHING on the auto face (even the confirmed "
                     "skeleton is folded out); a truly clean start. "
@@ -8542,9 +8823,53 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                                            "topic_mismatch=fold cross-session CONFIRMED rows (other sessions' stamped "
                                            "confirmed lines) out of auto-inject while keeping the global confirmed "
                                            "skeleton + this session's own rows (owner 裁决 2=A, P1-2 2026-10-14)."
+                        },
+                        "pin_session_id": {
+                            "type": "string",
+                            "description": "Optional: pin THIS specific closed session's confirmed rows to the top "
+                                           "instead of the auto 'last closed' target (e.g. a deadlocked session from "
+                                           "days ago — an explicit pin bypasses the 30-min freshness window). Only "
+                                           "honored when choice='bring_back'; a pin with no closed stamp for this "
+                                           "profile (typo / never closed / foreign profile) falls through to the auto "
+                                           "target and is reported via pin_note."
                         }
                     },
                     "required": ["choice"]
+                }
+            },
+            {
+                "name": "filemem_handoff_extract",
+                "description": ("Extract a handoff summary from a DEAD / deadlocked session so a "
+                    "NEW session can continue its work (the life-line for the 474k "
+                    "'Compression refused' class). Materials: the source session's "
+                    "supercompress compact ledger (<home>/supercompress_store/<sid>.compact.json) "
+                    "+ its filemem rows (<store>/sessions/<sid>.jsonl) +, ONLY when "
+                    "focus is set, focus-matching lines from its raw transcript "
+                    "(never by default — no full-raw regeneration). The LLM summary "
+                    "degrades to a deterministic segment concatenation (llm_used=false, "
+                    "audit-visible) when no host main_runtime. Output: "
+                    "handoffs/<sid>.json (per-source artifact, REPLACED on re-extract) "
+                    "+ exactly one unconfirmed decision row (session_id stamp = THIS "
+                    "session, the generator; it auto-injects next session only after "
+                    "the normal confirm chain — 不串脏). Zero host changes."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "The SOURCE session to hand off from (a closed / "
+                                           "deadlocked session id, e.g. 20261015_142319_4bb2e8)."
+                        },
+                        "focus": {
+                            "type": "string",
+                            "description": "Optional: pull focus-matching lines from the source "
+                                           "session's RAW transcript into the material bundle. "
+                                           "Absent / empty = raw transcript stays OUT (the 474k "
+                                           "lesson — the default bundle is compact ledger + "
+                                           "filemem rows only)."
+                        }
+                    },
+                    "required": ["session_id"]
                 }
             },
             {
@@ -8858,50 +9183,6 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 "file_path": _verify_file_path,
                 "test_pass": _verify_test_pass,
                 "relocate": _relocate}
-
-    def _plan_commit_signal(self, content: str) -> bool:
-        """PLAN-type PRD §2: write-door commit-signal predicate (pure, zero LLM).
-
-        Decides whether a plan-typed save should fire the "store this plan?"
-        clarify. Returns True ONLY when the content is BOTH plan-typed
-        (matches the plan strong-signal regex rows) AND carries a commit
-        signal. A plan still under discussion (no commit phrase) or a
-        non-plan content with a commit phrase returns False.
-
-        This is the trigger gate for the write-door clarify (§2 of the PRD):
-        when True and the save target is the plan shard, the caller routes
-        the save through the host clarify face ("save this plan?") before it
-        lands. No commit signal -> the content lands as an L0 draft / task
-        shard instead of a plan shard (PRD §2). Fail-soft: any shape hiccup
-        -> False (a gate bug must never block a save, never misfire)."""
-        text = (content or "").lower()
-        if not text:
-            return False
-        # Plan strong-signal check: does this look like a structured plan?
-        plan_hit = False
-        for pattern in _MEMORY_TYPE_REGEX.get("plan", ()):
-            try:
-                if re.search(pattern, text):
-                    plan_hit = True
-                    break
-            except Exception:
-                continue
-        if not plan_hit:
-            return False
-        # Commit-signal check: is this the final / landed version?
-        _COMMIT_SIGNALS = (
-            # English
-            "final version", "final plan", "settled plan", "confirmed plan",
-            "here's the plan", "the plan is", "landing the plan",
-            "定稿", "最终版", "落地方案", "就按这个", "方案定了",
-            # Chinese
-            "定稿", "最终版", "落地方案", "确认方案", "这就是计划",
-            "方案定了", "就按这个", "定了",
-        )
-        for sig in _COMMIT_SIGNALS:
-            if sig in text:
-                return True
-        return False
 
     def _plan_validate_anchor(self, anchor: Any, step_status: str) -> str:
         """PLAN-type PRD §1.5: a step marked 'done' MUST carry an anchor
@@ -9399,6 +9680,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 return self._tool_review_drafts(args)
             elif tool_name == "filemem_set_bringback":
                 return self._tool_set_bringback(args)
+            elif tool_name == "filemem_handoff_extract":
+                return self._tool_handoff_extract(args)
             elif tool_name == "filemem_plan":
                 return self._tool_plan(args)
             else:
@@ -10352,6 +10635,129 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     "memory_id": str(memory_id),
                 })
 
+        # ── t_plan_slice4: plan-probe consumption path ─────────────────────
+        # The plan-probe face (_plan_probe + _plan_probe_push @ the save door)
+        # detected a multi-step plan the agent itself authored and pushed a
+        # PENDING marker through the clarify channel (kind="plan_probe").
+        # Consumption is the user's DECISION:
+        #   * "save": the marker's title/steps/done_when land a PRD-shaped
+        #     plan row via filemem_plan(action="create") — the confirmed,
+        #     L2/no-TTL, plan_state-stamped row the PRD describes. This is
+        #     the ONLY door that writes to the plan shard (owner ruling
+        #     2026-10-17: the LLM classifier face must never land a plan
+        #     row; the probe + user nod is the confirm chain).
+        #   * "dismiss": nothing is written to plan.json. The marker is
+        #     dropped; the panel entry is consumed (stops re-reporting).
+        # memory_id = the synthetic probe id (the panel entry's "id" field,
+        # "plan_probe_<hash>"). The marker (title/steps/done_when) is
+        # recovered from the side-stamped _plan_probe_markers table.
+        if action == "plan_probe":
+            verdict = args.get("verdict")
+            if not memory_id:
+                return json.dumps({
+                    "success": False,
+                    "error": "plan_probe requires memory_id (the probe panel "
+                              "id from the [记忆报告] panel, "
+                              "'plan_probe_<hash>')",
+                })
+            if verdict not in ("save", "dismiss"):
+                return json.dumps({
+                    "success": False,
+                    "error": f"plan_probe verdict must be 'save' or "
+                              f"'dismiss', got {verdict!r}",
+                })
+            sid = self.session_id or "default"
+            sp = getattr(self, "source_profile", None)
+            new_iso = _utcnow().isoformat()
+            # Recover the marker from the side-stamped table (bounded; the
+            # probe face side-stamps it when it pushes the panel entry).
+            markers = getattr(self, "_plan_probe_markers", None) or {}
+            marker = (markers.get(sid) or {}).get(str(memory_id))
+            if marker is None:
+                # Fail-soft: marker table is in-memory; a gateway restart or
+                # cross-profile consumption loses it. The panel entry may
+                # still be recoverable (its content string carries the steps),
+                # but without the structured marker we CANNOT safely land a
+                # PRD row (the create face needs concrete steps). Reject the
+                # save (no write) but still consume the panel (stops the
+                # re-reporting loop) — 不吞脏.
+                if verdict == "save":
+                    self._consume_pending_confirm(sid, ids=[str(memory_id)],
+                                                   kind="plan_probe")
+                    return json.dumps({
+                        "success": False,
+                        "error": f"plan-probe marker {memory_id!r} not found "
+                                  f"(in-memory table lost — gateway restart "
+                                  f"or cross-profile); nothing written, panel "
+                                  f"consumed",
+                    })
+                else:
+                    self._consume_pending_confirm(sid, ids=[str(memory_id)],
+                                                   kind="plan_probe")
+                    return json.dumps({
+                        "success": True,
+                        "action": "plan_probe",
+                        "verdict": "dismiss",
+                        "memory_id": str(memory_id),
+                        "note": "marker already gone; panel consumed",
+                    })
+            if verdict == "save":
+                # Land a PRD-shaped plan row via the filemem_plan create face.
+                # _plan_create builds the full row (plan_state=L2/no-TTL,
+                # auto-id'd pending steps, three stamps) and appends to
+                # plan.json under the shard lock — the ONLY writer of the
+                # plan shard.
+                create_res = self._plan_create({
+                    "title": marker.get("title"),
+                    "steps": marker.get("steps") or [],
+                    "done_when": marker.get("done_when"),
+                    "topic": "plan_probe",
+                })
+                if not create_res.get("success"):
+                    # A create failure (e.g. missing steps) must NOT consume
+                    # the panel — re-report next turn, retryable.
+                    return json.dumps({
+                        "success": False,
+                        "error": f"plan_probe save failed: {create_res.get('error')}"
+                    })
+                # Audit row on the same append-only channel as the other faces.
+                self._append_consolidation_event({
+                    "ts": new_iso,
+                    "action": "plan_probe_saved",
+                    "probe_id": str(memory_id),
+                    "plan_id": create_res.get("plan_id"),
+                    "title": marker.get("title"),
+                    "steps": len(marker.get("steps") or []),
+                    "source_profile": sp,
+                })
+                self._consume_pending_confirm(sid, ids=[str(memory_id)],
+                                               kind="plan_probe")
+                return json.dumps({
+                    "success": True,
+                    "action": "plan_probe",
+                    "verdict": "save",
+                    "memory_id": str(memory_id),
+                    "plan_id": create_res.get("plan_id"),
+                    "title": marker.get("title"),
+                    "steps": len(marker.get("steps") or []),
+                })
+            else:  # dismiss
+                self._append_consolidation_event({
+                    "ts": new_iso,
+                    "action": "plan_probe_dismissed",
+                    "probe_id": str(memory_id),
+                    "title": marker.get("title"),
+                    "source_profile": sp,
+                })
+                self._consume_pending_confirm(sid, ids=[str(memory_id)],
+                                               kind="plan_probe")
+                return json.dumps({
+                    "success": True,
+                    "action": "plan_probe",
+                    "verdict": "dismiss",
+                    "memory_id": str(memory_id),
+                })
+
         # ── Historical-draft target path ───────────────────────────────────
         if target:
             # Accept either a bare owner id or a full filename.
@@ -10635,6 +11041,14 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         session' (no crash); the choice ALWAYS lands so the footer's one-shot
         gate can mark it asked.
 
+        HANDOFF face 2 (owner 2026-10-17): optional pin_session_id — pin a
+        NAMED closed session instead of the auto last-closed target (the
+        deadlocked-session life-line: an explicit pin bypasses the 30-min
+        freshness window; a pin with no closed stamp for this profile
+        (typo / foreign profile) falls through to the auto target and is
+        reported via pin_note). Only honored when choice == 'bring_back';
+        under any other choice the pin param is ignored (no side effect).
+
         NOTE: this choice only gates the AUTO-INJECT face. The SEARCH face
         (filemem_search / M4) recalls across sessions unconditionally — any
         choice (including 'fresh') NEVER makes an old session unretrievable
@@ -10648,28 +11062,385 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         if not sid:
             return json.dumps({"success": False,
                               "error": "unknown session_id (bring-back choice not recorded)"})
-        self._set_bringback_choice(sid, choice)
+        # HANDOFF face 2: the optional named pin (only stored under
+        # bring_back; under other choices it is ignored + noted, not
+        # persisted — no side effect outside bring_back).
+        pin_requested = (args.get("pin_session_id") or "").strip() or None
+        # HANDOFF owner ④ (C-gate bridge): when the model's tool call did NOT
+        # carry an explicit pin_session_id, fall back to the pin intent the
+        # C-gate recorded in _pending_user_pins (the user's own message named
+        # a known closed session, which suppressed the clarify footer). This
+        # closes the "recorded but never consumed" gap (reviewer 2026-10-17):
+        # the C-gate's fire-and-forget intent now actually lands the pin.
+        # An explicit model-supplied pin always wins (args get first).
+        if not pin_requested:
+            pending = self._get_pending_user_pin(sid)
+            if pending:
+                pin_requested = pending
+        pin_stored = None
+        if choice == "bring_back" and pin_requested:
+            pin_stored = pin_requested
+        self._set_bringback_choice(sid, choice, pin_session_id=pin_stored)
         # Mark the footer one-shot gate so it does not re-ask this session.
         self._mark_bringback_footer_asked(sid)
+        # C-gate bridge bookkeeping: an explicit pin (args OR the C-gate's
+        # recorded intent) has now been honored by this call — drop the
+        # pending intent so a later call in the same session does not
+        # silently re-pin the same dead session (one-shot, like the footer).
+        if pin_requested:
+            self._clear_pending_user_pin(sid)
         # For bring_back, confirm the pin target actually exists (per-profile
         # last_closed stamp). If no target, the pin is a no-op — report it
         # honestly. fresh/clean_start carry no pin target.
         pin_target = (self._resolve_bringback_session_id(sid)
                       if choice == "bring_back" else None)
+        # Honest pin report (face 2): did the NAMED pin land, or did it fall
+        # through to the auto leg?
+        pin_note = None
+        if choice == "bring_back" and pin_requested:
+            pin_valid = self._last_closed_session_exists_for_profile(pin_requested)
+            if pin_valid:
+                pin_note = ("pinned requested session "
+                            f"{pin_requested} (bypasses the freshness window)")
+            else:
+                pin_note = (f"requested pin {pin_requested} has no closed "
+                            "stamp for this profile (typo / never closed / "
+                            "foreign profile) — fell back to the auto "
+                            "'last closed' target")
+        note = ("auto-inject face updated ("
+                + ("fresh: nothing auto-injected this session"
+                   if choice == "fresh"
+                   else "bring-back pinning "
+                        + (pin_target or "none (no previous closed session)")
+                        + (")" if choice == "bring_back" else ""))
+                + "); search face (filemem_search) is always unaffected.")
+        if pin_note and choice == "bring_back":
+            note += f" {pin_note}"
         return json.dumps({
             "success": True,
             "session_id": sid,
             "choice": choice,
             "bring_back_active": (choice == "bring_back"),
             "fresh": (choice == "fresh"),
-            "pin_target": pin_target,  # previous closed session id, or None
-            "note": ("auto-inject face updated ("
-                      + ("fresh: nothing auto-injected this session"
-                         if choice == "fresh"
-                         else "bring-back pinning "
-                              + (pin_target or "none (no previous closed session)")
-                              + (")" if choice == "bring_back" else ""))
-                      + "); search face (filemem_search) is always unaffected."),
+            "pin_target": pin_target,  # resolved pin (named or auto), or None
+            "pin_requested": pin_requested,  # the user's named pin, if any
+            "pin_note": pin_note,
+            "note": note,
+        })
+
+    # ── HANDOFF face 1 (specs/HANDOFF-PRD.md, 2026-10-17 owner direction) ─────
+    # The life-line for deadlocked super-long sessions: name a dead /
+    # deadlocked source session -> gather its compact ledger + filemem rows
+    # (+ focus-matched raw lines ONLY when focus is set) -> LLM handoff
+    # summary (deterministic segment-concat fallback when no host LLM) ->
+    # handoffs/<sid>.json artifact + ONE unconfirmed decision row stamped
+    # with the GENERATOR session. Zero host changes (the 474k host guard
+    # stays off-limits unless the owner signs off a host edit separately).
+    # 叠加不替换: the auto face's two legs + the search face are untouched;
+    # this face only ADDS material + one decision row through the normal
+    # confirm chain.
+
+    def _handoff_dir(self) -> Optional[Path]:
+        """The per-source handoff artifact dir (<store>/handoffs). None when
+        no storage_dir (fixture shell that never initialize()'d) — the face
+        degrades to no-artifact (the row write still works) and must never
+        raise into the tool face."""
+        sd = getattr(self, "storage_dir", None)
+        if sd is None:
+            return None
+        try:
+            sd = Path(sd)
+        except Exception:
+            return None
+        return sd / "handoffs"
+
+    def _handoff_compact_ledger_path(self, source_sid: str) -> Optional[Path]:
+        """The source session's supercompress compact ledger:
+        <home>/supercompress_store/<sid>.compact.json (hermetis_home is the
+        per-profile home the provider was initialized with; the live layout
+        keeps one supercompress_store per home, e.g.
+        ~/.hermes/profiles/coder/supercompress_store/ for the coder profile).
+        None when hermetis_home is unset (the fixture shell keeps this path
+        resolvable by pointing hermetis_home at the tmp root, which is what
+        the H-series tests do — same deterministic posture as storage_dir)."""
+        home = getattr(self, "hermetis_home", None)
+        if home is None:
+            return None
+        try:
+            home = Path(home)
+        except Exception:
+            return None
+        return home / "supercompress_store" / f"{source_sid}.compact.json"
+
+    def _gather_handoff_materials(self, source_sid: str,
+                                  focus: str) -> Dict[str, Any]:
+        """Gather the handoff material bundle for one source session.
+
+        Bundle = (1) the compact ledger's P0/P1 segments (small, structured,
+        the task-state source of truth), (2) this profile's filemem rows for
+        the session (confirmed-first; a row stamped with a FOREIGN profile is
+        excluded — 不串 profile, the same _normalize_profile_stamp gate the
+        last_closed ledger uses), (3) ONLY when focus is non-empty,
+        focus-matching lines from the raw transcript (the 474k lesson: the
+        default bundle NEVER touches the raw text — no full-raw
+        regeneration). Returns {compact_segments, filemem_rows,
+        raw_lines, focus}; any missing source degrades to an empty part,
+        never raises (a dead session may have lost its raw trace; the
+        ledger + rows are the floor)."""
+        materials: Dict[str, Any] = {
+            "compact_segments": [], "filemem_rows": [],
+            "raw_lines": [], "focus": (focus or "").strip(),
+        }
+        # (1) compact ledger
+        lp = self._handoff_compact_ledger_path(source_sid)
+        if lp is not None and lp.exists():
+            try:
+                ledger = json.loads(lp.read_text(encoding="utf-8"))
+                segs = ledger.get("entries") or []
+                materials["compact_segments"] = [
+                    (s.get("text") or "").strip() for s in segs
+                    if isinstance(s, dict) and (s.get("text") or "").strip()
+                ]
+            except Exception as e:
+                logger.warning(
+                    f"FileMem: handoff compact ledger unreadable for "
+                    f"{source_sid} ({e}); degrading to rows-only")
+        # (2) filemem rows for the source session (this profile's rows only)
+        rp = getattr(self, "sessions_dir", None)
+        cur_sp = _normalize_profile_stamp(getattr(self, "source_profile", None))
+        if rp is not None:
+            sf = Path(rp) / f"{source_sid}.jsonl"
+            if sf.exists():
+                for line in sf.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue  # corrupt line is skipped, not fatal
+                    if not isinstance(row, dict):
+                        continue
+                    row_sp = _normalize_profile_stamp(row.get("source_profile"))
+                    if row_sp != cur_sp:
+                        continue  # foreign-profile row: 不串 profile
+                    materials["filemem_rows"].append(row)
+        # (3) focus-matched raw lines ONLY when focus is set
+        if materials["focus"]:
+            home = getattr(self, "hermetis_home", None)
+            if home is not None:
+                raw = Path(home) / "supercompress_store" / f"{source_sid}.jsonl"
+                if raw.exists():
+                    needle = materials["focus"].lower()
+                    for line in raw.read_text(encoding="utf-8").splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        low = line.lower()
+                        if needle in low:
+                            materials["raw_lines"].append(line)
+        return materials
+
+    def _handoff_fallback_summary(self, materials: Dict[str, Any],
+                                  source_sid: str) -> str:
+        """Deterministic fallback when no host LLM is available: the compact
+        segments concatenated (the task-state floor, 不吞脏), then the
+        session's confirmed filemem rows, then any focus-matched raw lines.
+        Audit-visible: the artifact carries llm_used=False so the continuing
+        session knows it is a mechanical extraction, not a curated one."""
+        parts = [f"[HANDOFF fallback: session {source_sid} — LLM unavailable, "
+                 f"deterministic segment concatenation]"]
+        parts.extend(materials.get("compact_segments") or [])
+        for row in materials.get("filemem_rows") or []:
+            content = (row.get("content") or "").strip()
+            if content:
+                parts.append(f"[filemem/{row.get('type', 'fact')}] {content}")
+        for line in materials.get("raw_lines") or []:
+            # raw transcript lines are jsonl: surface the human content, not
+            # the escaped JSON shell (audit-readable fallback).
+            parsed = None
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    parsed = obj.get("content")
+            except Exception:
+                parsed = None
+            parts.append(f"[raw/focus] {parsed if parsed is not None else line}")
+        return "\n\n".join(p for p in parts if p)
+
+    def _handoff_material_bundle(self, materials: Dict[str, Any],
+                                 source_sid: str,
+                                 focus: str) -> str:
+        """The text handed to the LLM face (structured, bounded)."""
+        lines = [f"SOURCE SESSION: {source_sid}"]
+        if focus:
+            lines.append(f"FOCUS AREA: {focus}")
+        lines.append("")
+        lines.append("## Compact ledger segments (task state)")
+        for seg in (materials.get("compact_segments") or [])[:50]:
+            lines.append(seg)
+        lines.append("")
+        lines.append("## Confirmed filemem rows (decisions / preferences)")
+        for row in (materials.get("filemem_rows") or [])[:50]:
+            lines.append(f"- [{row.get('type', 'fact')}] "
+                        f"{(row.get('content') or '').strip()}")
+        if materials.get("raw_lines"):
+            lines.append("")
+            lines.append("## Focus-matched raw lines")
+            for ln in (materials.get("raw_lines") or [])[:50]:
+                lines.append(ln)
+        return "\n".join(lines)
+
+    def _write_handoff_row(self, source_sid: str, summary: str,
+                           generator_sid: str) -> Optional[str]:
+        """Land EXACTLY ONE unconfirmed decision row for this (generator,
+        source) pair — re-extraction REPLACES the row (one live handoff per
+        pair, not a log). The row's session_id stamp = the GENERATOR session
+        (the handoff act is THIS session's decision); the source sid rides
+        in the content header. Written through the shard RMW path under
+        _shard_lock (the same door _save_memories uses), metadata stamped
+        confirmed=False so the confirmed-global leg only auto-injects it
+        after the normal confirm chain (不串脏). Fail-soft: a disk hiccup
+        logs + returns None, never raises into the tool face."""
+        try:
+            mem_file = Path(self.memories_dir) / "decision.json"
+            with self._shard_lock(mem_file):
+                items = self._read_memories_file(mem_file)
+                # replace: drop any prior handoff row for this source session
+                marker = f"HANDOFF:{source_sid}"
+                items = [it for it in items
+                         if marker not in str(it.get("content", ""))]
+                row_id = f"handoff_{source_sid}_{_utcnow().timestamp():.0f}"
+                meta = self._self_test_meta(
+                    {"source_profile": getattr(self, "source_profile", None),
+                     "confirmed": False,
+                     "handoff_source_session": source_sid,
+                     "handoff_generated_by": generator_sid})
+                _stamp_origin_in_meta(meta, "manual")
+                items.append({
+                    "id": row_id,
+                    "type": "decision",
+                    "content": f"{marker} 交接摘要（source session "
+                               f"{source_sid}；由 {generator_sid} 生成）\n"
+                               f"{summary}",
+                    "level": "L0",
+                    "source": "manual",
+                    "created_at": _utcnow().isoformat(),
+                    "updated_at": _utcnow().isoformat(),
+                    "salience": 0.9,
+                    "last_referenced": _utcnow().isoformat(),
+                    "session_id": generator_sid,
+                    "metadata": meta,
+                })
+                mem_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(mem_file, "w", encoding="utf-8") as f:
+                    json.dump(items, f, ensure_ascii=False, indent=2)
+            return row_id
+        except Exception as e:
+            logger.warning(f"FileMem: handoff row write failed: {e}")
+            return None
+
+    def _tool_handoff_extract(self, args: Dict) -> str:
+        """HANDOFF face 1: the life-line for deadlocked super-long sessions.
+
+        Name the source session (session_id arg) -> gather its compact
+        ledger + this profile's filemem rows (+ focus-matched raw lines only
+        when focus is set) -> LLM handoff summary via
+        consolidation.llm_caller.handoff_summarize (fail-soft: no host
+        main_runtime -> the deterministic segment-concat fallback,
+        llm_used=False) -> write the per-source artifact
+        handoffs/<source_sid>.json (REPLACED on re-extract) + exactly one
+        unconfirmed decision row (session_id = this session, the generator;
+        it auto-injects next session only after the normal confirm chain —
+        不串脏). No materials at all -> honest failure, nothing written.
+        Zero host changes; the auto face's two legs + the search face are
+        untouched (叠加不替换)."""
+        src = (args.get("session_id") or "").strip()
+        if not src:
+            return json.dumps({"success": False,
+                              "error": "session_id (the source session to "
+                                       "hand off from) is required"})
+        gen_sid = getattr(self, "session_id", None) or "default"
+        focus = (args.get("focus") or "").strip()
+        materials = self._gather_handoff_materials(src, focus)
+        has_compact = bool(materials["compact_segments"])
+        has_rows = bool(materials["filemem_rows"])
+        has_raw = bool(materials["raw_lines"])
+        if not (has_compact or has_rows or has_raw):
+            return json.dumps({"success": False,
+                               "source_session_id": src,
+                               "reason": "no materials",
+                               "note": ("neither a compact ledger nor this "
+                                        "profile's filemem rows exist for "
+                                        f"{src}; nothing to hand off")})
+        # LLM face (explicit host main_runtime; the live-resolve ladder is
+        # the same as every other LLM face — standalone / no-host degrades
+        # to the deterministic fallback, never a crash).
+        main_runtime = self._live_main_runtime()
+        bundle = self._handoff_material_bundle(materials, src, focus)
+        llm_used = False
+        summary: Optional[str] = None
+        if main_runtime:
+            try:
+                llm = _load_llm_caller()
+                res = llm.handoff_summarize(main_runtime, bundle)
+                self._append_llm_call_telemetry(llm, "handoff")
+                if res.get("llm_used") and res.get("summary"):
+                    summary = res["summary"]
+                    llm_used = True
+            except Exception as e:
+                logger.warning(
+                    f"FileMem: handoff LLM face failed ({e}); "
+                    f"degrading to deterministic fallback")
+        if summary is None:
+            summary = self._handoff_fallback_summary(materials, src)
+            llm_used = False
+        materials_list = []
+        if has_compact:
+            materials_list.append("compact.json")
+        if has_rows:
+            materials_list.append(f"filemem-rows({len(materials['filemem_rows'])})")
+        if has_raw:
+            materials_list.append(f"raw-focus({len(materials['raw_lines'])})")
+        # The per-source artifact (REPLACED on re-extract — one live
+        # handoff per source, same posture as the bringback choice file).
+        artifact_path: Optional[Path] = None
+        hd = self._handoff_dir()
+        if hd is not None:
+            try:
+                hd.mkdir(parents=True, exist_ok=True)
+                artifact_path = hd / f"{src}.json"
+                artifact_path.write_text(json.dumps({
+                    "source_session_id": src,
+                    "generated_by_session": gen_sid,
+                    "generated_ts": _utcnow().isoformat(),
+                    "materials": materials_list,
+                    "filemem_rows": [
+                        (r.get("content") or "")
+                        for r in materials["filemem_rows"][:50]],
+                    "summary": summary,
+                    "llm_used": llm_used,
+                }, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as e:
+                logger.warning(f"FileMem: handoff artifact write failed: {e}")
+                artifact_path = None
+        # Exactly one decision row (re-extract replaces, not appends).
+        row_id = self._write_handoff_row(src, summary, gen_sid)
+        return json.dumps({
+            "success": True,
+            "source_session_id": src,
+            "generated_by_session": gen_sid,
+            "materials": materials_list,
+            "llm_used": llm_used,
+            "artifact": str(artifact_path) if artifact_path else None,
+            "row_id": row_id,
+            "summary": summary[:2000] if len(summary) > 2000 else summary,
+            "note": ("handoff row is UNCONFIRMED: the confirmed-global leg "
+                     "auto-injects it into the next session's auto face "
+                     "only after the normal confirm chain (不串脏). "
+                     + ("" if llm_used else
+                        "llm_unavailable: summary is the deterministic "
+                        "segment concatenation (audit-visible fallback).")),
         })
 
     def _write_draft_file(self, tfile, drafts: List[MemoryItem]) -> None:
@@ -13144,14 +13915,20 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
             return None
         return sd / f"bringback_{session_id}.json"
 
-    def _set_bringback_choice(self, session_id: str, choice: str) -> None:
+    def _set_bringback_choice(self, session_id: str, choice: str,
+                              pin_session_id: Optional[str] = None) -> None:
         """P4: persist the user's bring-back choice for THIS session only.
         3-value choice (owner 2026-10-10, B2-A): 'bring_back' (pin the previous
         session's confirmed rows to the TOP of the auto face), 'clean_start'
         (V2 default: confirmed global skeleton + current-session rows), or
         'fresh' (this session injects NOTHING on the auto face — even the
         confirmed global skeleton is folded out; the SEARCH face is unaffected).
-        Any unrecognized value degrades to 'clean_start' (fail-soft to V2)."""
+        Any unrecognized value degrades to 'clean_start' (fail-soft to V2).
+        HANDOFF face 2 (owner 2026-10-17): optional pin_session_id — the
+        user's NAMED pin target (stored verbatim; validated at RESOLVE time,
+        not here: the choice file is a per-session write, the pin's closed-
+        stamp existence is the resolver's fail-soft check, so a typo'd pin
+        falls through to the auto leg instead of being rejected at write)."""
         valid = ("bring_back", "clean_start", "fresh", "topic_mismatch")
         if choice not in valid:
             choice = "clean_start"
@@ -13160,11 +13937,294 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
             return
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"session_id": session_id, "choice": choice,
+                       "ts": _utcnow().isoformat()}
+            if pin_session_id:
+                payload["pin_session_id"] = str(pin_session_id).strip()
             with open(p, "w", encoding="utf-8") as f:
-                json.dump({"session_id": session_id, "choice": choice,
-                           "ts": _utcnow().isoformat()}, f, ensure_ascii=False)
+                json.dump(payload, f, ensure_ascii=False)
         except Exception as e:
             logger.warning(f"FileMem: bringback choice write failed: {e}")
+
+    def _get_bringback_pin_sid(self, session_id: Optional[str]) -> Optional[str]:
+        """HANDOFF face 2 (owner 2026-10-17): read this session's optional
+        named pin target from the choice file (absent/blank/corrupt -> None,
+        fail-soft to the auto last-closed leg — a bad pin file must never
+        break the resolver)."""
+        p = self._bringback_choice_path(session_id or "")
+        if p is None:
+            return None
+        try:
+            if not p.exists():
+                return None
+            data = json.loads(p.read_text(encoding="utf-8"))
+            pin = (data.get("pin_session_id") or "").strip()
+            return pin or None
+        except Exception:
+            return None
+
+    def _extract_user_named_sid(self, user_query: Optional[str]) -> Optional[str]:
+        """HANDOFF owner ④ (C-gate): detect the user's EXPLICIT recall of a
+        session — a session-id-shaped token in their message that is in THIS
+        profile's known closed-set. Zero LLM, pure regex + set membership
+        (the module-level _extract_user_named_sid does the token scan; here we
+        intersect it with the profile's closed sid set, so an unknown /
+        foreign / typo'd token returns None -> footer keeps today's behavior,
+        不误伤). No storage / no closed ledger -> None (no known set -> no
+        suppression path). Fail-soft: any hiccup degrades to None (footer on,
+        never raises into the prefetch face)."""
+        if not user_query:
+            return None
+        try:
+            # The known closed set for THIS profile (any age — an explicit
+            # recall targets a named OLD session, so the freshness window
+            # does NOT gate the suppression; it gates only the footer-offer
+            # target, which is a different face). Fail-soft to an empty set.
+            closed: set = set()
+            lp = self._last_closed_stamp_path()
+            if lp is not None and lp.exists():
+                cur_sp = _normalize_profile_stamp(getattr(self, "source_profile", None))
+                for line in lp.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    row_sp = _normalize_profile_stamp(row.get("source_profile"))
+                    if row_sp == cur_sp:
+                        s = row.get("session_id")
+                        if s:
+                            closed.add(s)
+                if not closed:
+                    return None
+            return _extract_user_named_sid(user_query, closed)
+        except Exception:
+            return None
+
+    def _record_pending_user_pin(self, session_id: str, named_sid: str) -> None:
+        """HANDOFF owner ④ (C-gate): record the user's named-session recall
+        for THIS session so the agent's follow-up filemem_set_bringback call
+        can carry pin_session_id (= named_sid, which the pin machinery routes
+        through the handoff summary). Session-keyed, in-memory (the pin is a
+        one-turn intent that rides the immediate follow-up tool call; a
+        rebuilt provider re-derives it from the user's still-present message
+        text on its next prefetch, so no disk persistence is needed — same
+        fail-soft posture as _bringback_footer_state's in-memory leg)."""
+        if not session_id or not named_sid:
+            return
+        d = getattr(self, "_pending_user_pins", None)
+        if not isinstance(d, dict):
+            d = {}
+            self._pending_user_pins = d
+        d[session_id] = named_sid
+
+    def _clear_pending_user_pin(self, session_id: str) -> None:
+        """HANDOFF owner ④ (C-gate bridge bookkeeping): drop the user's
+        named-session pin intent once the follow-up filemem_set_bringback
+        call has HONORED it (via args or via the fallback read). One-shot,
+        like the footer itself: a later call in the same session must not
+        silently re-pin the same dead session. No-op when the key is absent
+        (a clean_start / no-intent session never recorded one)."""
+        d = getattr(self, "_pending_user_pins", None)
+        if isinstance(d, dict):
+            d.pop(session_id, None)
+
+    def _get_pending_user_pin(self, session_id: str) -> Optional[str]:
+        """Read the user's named-session pin intent recorded by the C-gate
+        (None when absent — the agent simply makes its ordinary
+        filemem_set_bringback call without a pin, today's behavior)."""
+        d = getattr(self, "_pending_user_pins", None)
+        if not isinstance(d, dict):
+            return None
+        return d.get(session_id)
+
+    def _gather_pin_handoff_from_session_jsonl(self, source_sid: str) -> Dict[str, Any]:
+        """HANDOFF owner re-spec (2026-10-17, pin->tail 白底语义): the material
+        source for the pin handoff summary is EXACTLY ONE — the source
+        session's own conversation log `sessions_dir/<sid>.jsonl` (user turns
+        + the assistant replies, the first-hand record of what the session was
+        doing and where it stopped). It does NOT read the supercompress
+        compact ledger and does NOT read this session's filemem memory rows —
+        the summary must be GENERATED FRESH from the <sid>.jsonl, not derived
+        from the old session's memory state (owner: "完全不依赖旧 session").
+
+        Dedup: the host writes the same user turn twice (the user's message is
+        logged both on arrival and on the assistant reply that followed it),
+        so an N-turn session produces ~2N lines with N unique user turns. We
+        dedup by `content` (the user's words are the signal; the assistant
+        reply rides alongside it in the same row) so the LLM bundle is the
+        N unique turns, not 2N. Returns {turns, dupes_dropped}; a missing /
+        unreadable file yields {turns: [], dupes_dropped: 0} (no materials ->
+        no summary, owner T3 — honest empty). Fail-soft: corrupt lines are
+        skipped, never fatal."""
+        out: Dict[str, Any] = {"turns": [], "dupes_dropped": 0}
+        rp = getattr(self, "sessions_dir", None)
+        if rp is None:
+            return out
+        sf = Path(rp) / f"{source_sid}.jsonl"
+        if not sf.exists():
+            return out
+        seen: set = set()
+        cur_sp = _normalize_profile_stamp(getattr(self, "source_profile", None))
+        for line in sf.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue  # corrupt line is skipped, not fatal
+            if not isinstance(row, dict):
+                continue
+            row_sp = _normalize_profile_stamp(row.get("source_profile"))
+            if row_sp != cur_sp:
+                continue  # foreign-profile row: 不串 profile
+            content = (row.get("content") or "").strip()
+            if not content:
+                continue
+            if content in seen:
+                out["dupes_dropped"] += 1
+                continue  # duplicate turn (host double-logs user msg)
+            seen.add(content)
+            out["turns"].append({
+                "role": row.get("role") or "user",
+                "content": content,
+                "assistant": (row.get("assistant") or "").strip(),
+            })
+        return out
+
+    def _pin_handoff_bundle(self, source_sid: str,
+                            turns: List[Dict[str, str]]) -> str:
+        """The text handed to the LLM face: the source session's dedup'd
+        conversation turns (user words + the assistant reply that followed
+        each). Bounded to the last 40 turns so a 474k-class session does not
+        blow the prompt; the recency of the turns is the task-state signal
+        (the most recent turns are where the session stopped)."""
+        lines = [f"SOURCE SESSION CONVERSATION: {source_sid}"]
+        lines.append(f"({len(turns)} deduplicated turns; most recent last)")
+        lines.append("")
+        for i, t in enumerate(turns[-40:], start=1):
+            lines.append(f"## Turn {i} — user")
+            lines.append(t.get("content") or "")
+            if t.get("assistant"):
+                lines.append(f"   assistant reply: {t['assistant'][:1500]}")
+            lines.append("")
+        lines.append(
+            "Write a HANDOFF summary so a NEW session can continue this work "
+            "without re-reading the transcript. Cover: what task was in "
+            "flight, the current state, the next concrete step, any open "
+            "decisions / red lines, and what the continuing session must NOT "
+            "redo. Stick to what the turns state — never hallucinate. Drop "
+            "off-topic chatter; keep only the session's main task thread.")
+        return "\n".join(lines)
+
+    def _pin_handoff_fallback(self, source_sid: str,
+                              turns: List[Dict[str, str]]) -> str:
+        """Deterministic fallback when no host LLM is available: the dedup'd
+        session turns concatenated (the task-state floor, 不吞脏), with the
+        last turns weighted heaviest (that is where the session stopped).
+        Audit-visible: the marker reports llm_used=False so the continuing
+        session knows it is a mechanical extraction, not a curated one."""
+        parts = [f"[HANDOFF fallback: session {source_sid} — LLM unavailable, "
+                 f"deterministic conversation-turn concatenation]"]
+        for i, t in enumerate(turns[-20:], start=1):
+            parts.append(f"--- Turn {i} (user) ---\n{t.get('content') or ''}")
+            if t.get("assistant"):
+                parts.append(f"(assistant reply: {t['assistant'][:800]})")
+        return "\n\n".join(parts)
+
+    def _handoff_pin_tail_summary(self, session_id: str) -> str:
+        """HANDOFF owner re-spec ② (pin -> white-sheet TAIL injection,
+        2026-10-17): when the user made an EXPLICIT pin_session_id that
+        resolved to a valid closed session for THIS profile, generate the
+        handoff summary FRESH from that session's own conversation log
+        (`sessions/<pin>.jsonl`, dedup'd), and ride it on the auto face.
+
+        Two owner-corrected invariants vs. the prior (flawed) version:
+          (a) SINGLE material source — only `sessions/<pin>.jsonl`. The
+              supercompress compact ledger and this session's filemem memory
+              rows are NOT read (owner: 完全不依赖旧 session 的记忆/ledger，
+              摘要在新 session 从 <sid>.jsonl 当场生成).
+          (b) WHITE-SHEET exclusion — when a valid pin's summary exists, the
+              caller (prefetch) drops the normal recall block entirely; the
+              new session's auto face is ONLY this handoff summary + the
+              pending-draft notice (no other-session confirmed rows, no
+              global confirmed skeleton, no search recall hits). A brand-new
+              clean session carrying just the named session's handoff.
+
+        Fail-soft: any exception / missing storage / no dedup'd turns -> ''
+        (the auto face renders without the summary block, and the recall
+        block is NOT dropped — a pin with no material falls back to today's
+        normal prefetch, never an empty face)."""
+        try:
+            sid = session_id or getattr(self, "session_id", None)
+            if not sid:
+                return ""
+            pin = self._get_bringback_pin_sid(sid)
+            if not (pin and self._last_closed_session_exists_for_profile(pin)):
+                return ""
+            material = self._gather_pin_handoff_from_session_jsonl(pin)
+            turns = material["turns"]
+            if not turns:
+                return ""  # honest: no dedup'd conversation -> nothing to hand off
+            if material["dupes_dropped"]:
+                logger.info(
+                    f"FileMem: pin handoff deduped {material['dupes_dropped']} "
+                    f"duplicate turns in {pin}.jsonl ({len(turns)} unique kept)")
+            main_runtime = self._live_main_runtime()
+            bundle = self._pin_handoff_bundle(pin, turns)
+            llm_used = False
+            summary: Optional[str] = None
+            if main_runtime:
+                try:
+                    llm = _load_llm_caller()
+                    res = llm.handoff_summarize(main_runtime, bundle)
+                    self._append_llm_call_telemetry(llm, "handoff")
+                    if res.get("llm_used") and res.get("summary"):
+                        summary = res["summary"]
+                        llm_used = True
+                except Exception as e:
+                    logger.warning(
+                        f"FileMem: pin tail handoff LLM face failed ({e}); "
+                        f"degrading to deterministic turn-concat")
+            if summary is None:
+                summary = self._pin_handoff_fallback(pin, turns)
+            audit = "LLM" if llm_used else "deterministic-turn-concat"
+            return (f"\n\n【HANDOFF 交接摘要 · session {pin}】（{audit}；"
+                    f"{len(turns)} 条去重对话轮次，从 {pin}.jsonl 当场生成；"
+                    f"生成本 session {sid}；白底面：本 session 仅带此摘要，"
+                    f"不含其他记忆注入）\n{summary}")
+        except Exception as e:
+            logger.warning(f"FileMem: pin tail handoff summary failed ({e}); "
+                          f"auto face renders without the summary block")
+            return ""
+
+    def _bringback_white_sheet_active(self, session_id: str) -> bool:
+        """HANDOFF owner re-spec ② (白底排除): True when this session has an
+        EXPLICIT valid pin whose <sid>.jsonl yields at least one dedup'd
+        conversation turn — i.e. the white-sheet tail summary is going to
+        render. The caller (prefetch) uses this to DROP the normal recall
+        block: a white-sheet new session carries ONLY the handoff summary +
+        the pending-draft notice, no other-session confirmed rows, no global
+        confirmed skeleton, no search recall hits. A pin that has no
+        material (no jsonl / no turns) returns False -> the recall block is
+        NOT dropped (we fall back to today's normal prefetch, never an empty
+        face). Fail-soft: any hiccup -> False (recall keeps working)."""
+        try:
+            sid = session_id or getattr(self, "session_id", None)
+            if not sid:
+                return False
+            pin = self._get_bringback_pin_sid(sid)
+            if not (pin and self._last_closed_session_exists_for_profile(pin)):
+                return False
+            material = self._gather_pin_handoff_from_session_jsonl(pin)
+            return bool(material["turns"])
+        except Exception:
+            return False
 
     def _get_bringback_choice(self, session_id: Optional[str]) -> str:
         """P4 read: default 'clean_start' (== V2 two-leg behavior) when the file
@@ -13236,6 +14296,45 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
             pass
         return 1
 
+    def _last_closed_session_exists_for_profile(self,
+                                                session_id: str) -> bool:
+        """HANDOFF face 2: True when a closed-stamp row for EXACTLY this
+        session id exists in THIS profile's last_closed ledger (the pin's
+        fail-soft validation). Same per-profile + normalized-stamp gate as
+        the last_closed read — a foreign-profile stamp is NOT a valid pin
+        target (不串 profile). NO freshness window: an explicit pin is a
+        full-authority act (the owner named a specific old session) — the
+        30-min window guards the AUTO leg only (owner 裁决 2026-10-17).
+        Fail-soft: no storage_dir / unreadable ledger -> False (the pin
+        falls through to the auto leg, it never crashes the resolver)."""
+        p = self._last_closed_stamp_path()
+        if p is None or not session_id:
+            return False
+        if not p.exists():
+            return False
+        cur_sp = _normalize_profile_stamp(getattr(self, "source_profile", None))
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    if row.get("session_id") != session_id:
+                        continue
+                    row_sp = _normalize_profile_stamp(row.get("source_profile"))
+                    if row_sp != cur_sp:
+                        continue
+                    return True
+            return False
+        except Exception:
+            return False
+
     def _resolve_bringback_session_id(self,
                                        session_id: Optional[str]) -> Optional[str]:
         """P2: the bring-back leg's target — the previous closed session's id,
@@ -13245,7 +14344,17 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         regression). The profile isolation is inherited from P1's
         _last_closed_session_for_profile (row's source_profile must match), so
         a stamped profile never pulls another profile's closed session
-        (owner A: 保持不串 profile)."""
+        (owner A: 保持不串 profile).
+
+        HANDOFF face 2 (owner 2026-10-17): an EXPLICIT pin_session_id (the
+        user named a specific closed session — the deadlocked-session
+        life-line) OVERRIDES the auto last-closed target and BYPASSES the
+        30-min freshness window (the window stays on the AUTO leg only — it
+        guards against auto-reviving stale closes; a deliberate "bring back
+        the session I named" is full authority). An invalid pin (no
+        closed-stamp row for THIS profile: typo / never closed / foreign
+        stamp) is NOT an error — it falls through to the auto leg, keeping
+        some continuity instead of zeroing it."""
         sid = session_id or getattr(self, "session_id", None)
         if not sid:
             return None
@@ -13253,6 +14362,9 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         # and 'fresh' both leave the reorder off (return None -> no pin).
         if self._get_bringback_choice(sid) != "bring_back":
             return None
+        pin = self._get_bringback_pin_sid(sid)
+        if pin and self._last_closed_session_exists_for_profile(pin):
+            return pin
         return self._last_closed_session_for_profile(exclude_session_id=sid)
 
     # ── BRINGBACK P3: one-shot clarify footer (rides the live auto face) ──────
@@ -13416,11 +14528,28 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         的 bring-back footer）。"""
         return getattr(self, "_last_platform", None) == "subagent"
 
-    def _bringback_clarify_footer(self, session_id: str) -> str:
+    def _bringback_clarify_footer(self, session_id: str,
+                                   user_query: Optional[str] = None) -> str:
         """Return the one-shot bring-back footer for THIS session's first
         non-trivial prefetch, or '' when: already asked (one-shot gate), a
         bring-back choice was already recorded for this session (idempotent —
         never re-ask), or no per-profile last_closed stamp to offer.
+
+        HANDOFF owner ④ (2026-10-17, C-gate): when the user's own message
+        (``user_query``, the current user-turn text available at the
+        prefetch face) EXPLICITLY names a KNOWN closed session id, the
+        footer is suppressed — the user already stated their intent (a named
+        recall), so re-asking via the clarify card is redundant and violates
+        "不要把已经明确表达的意向再问一遍". The named sid is recorded as a
+        pending pin intent (``_record_pending_user_pin``) so the agent's
+        follow-up ``filemem_set_bringback`` call can carry ``pin_session_id``
+        (= the user's named session, which the pin machinery then routes
+        through the handoff summary). ONLY a session-id-shaped token that is
+        in THIS profile's known closed-set suppresses — an unknown /
+        foreign / typo'd token falls through to today's footer (fail-soft,
+        不误伤). user_query=None (no message available) -> today's footer,
+        byte-identical. The P1-3 subagent gate and the one-shot gate still
+        run FIRST and are unaffected by the C-gate.
 
         P1-3 子进程闸（owner 2026-10-14）：delegate_task 子进程 session
         （platform == "subagent"）完全不生成 bring-back footer —— 不 clarify
@@ -13471,6 +14600,27 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         if self._has_bringback_choice(sid):
             return ""  # user already answered THIS session (any of 3 choices;
                       # answered state, one-shot held)
+        # HANDOFF owner ④ (C-gate): the user's OWN message names a KNOWN
+        # closed session -> they've already stated their intent, so the
+        # clarify card is suppressed (no re-ask). The named sid is recorded
+        # as a pending pin intent so the agent's follow-up
+        # filemem_set_bringback carries pin_session_id (= that session,
+        # which the pin machinery routes through the handoff summary).
+        # ONLY a session-id-shaped token in THIS profile's known closed-set
+        # suppresses; an unknown / foreign / typo'd token falls through to
+        # today's footer (fail-soft, 不误伤 — owner C3). The one-shot +
+        # subagent gates above still run first and are unaffected.
+        if user_query is not None:
+            named_sid = self._extract_user_named_sid(user_query)
+            if named_sid:
+                self._record_pending_user_pin(sid, named_sid)
+                st[sid] = True  # one-shot held: the card is intentionally NOT asked
+                self._persist_bringback_asked(sid)
+                logger.info(
+                    "FileMem: HANDOFF C-gate — user named closed session "
+                    f"{named_sid} in their message; clarify footer "
+                    f"suppressed for {sid} (pin intent recorded)")
+                return ""
         prev_sid = self._last_closed_session_for_profile(
             exclude_session_id=sid,
             # C (owner 2026-10-11): only offer the bring-back question when the
@@ -13491,6 +14641,25 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         # id) so the model/owner sees WHICH topic is about to be crossed —
         # the "串了谁" signal that the bare session id cannot give.
         prev_topic = self._session_title_hint(prev_sid)
+        # HANDOFF face 3 (owner 裁决 A, 2026-10-17): when the last-closed
+        # session carries a handoff artifact (face 1's
+        # handoffs/<prev_sid>.json), the footer announces it — one line,
+        # riding the existing clarify card: no new option, no
+        # acknowledgement lifecycle (that's face B, a later round).
+        # Choosing bring_back pins prev_sid, so the summary rides the pin
+        # automatically. Fail-soft: no artifact / unreadable -> line
+        # omitted (footer byte-identical to today's).
+        handoff_note = ""
+        hd = self._handoff_dir()
+        if hd is not None:
+            art = hd / f"{prev_sid}.json"
+            if art.exists():
+                handoff_note = (
+                    f"\n【交接摘要】上一个 session（{prev_sid}）留有 filemem 生成的"
+                    "交接摘要（handoffs/ 工件）：选『带回』时该摘要会追加到本次"
+                    "自动注入面【尾部】（独立段落，不置顶、不新增 confirmed 行、"
+                    "检索面不动）。"
+                )
         # A (owner 2026-10-11): the footer is text that DIRECTS the model to
         # resolve the choice — it must emit the clarify TOOL (the native
         # single-select card, keyboard ↑↓ + Enter), NOT paraphrase the three
@@ -13507,7 +14676,8 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
             f"{prev_sid}"
             + (f" · 主题「{prev_topic}」" if prev_topic else "")
             + "）已关闭。本次 session 的自动注入面如何处理？\n"
-            "【指令：必须调用 clarify 工具（原生单选卡，用户可键盘 ↑↓ 选择）问用户"
+            + handoff_note
+            + "【指令：必须调用 clarify 工具（原生单选卡，用户可键盘 ↑↓ 选择）问用户"
             "一次，把下列 4 个选项作为 clarify 的 choices 传入；"
             "不要用纯文字把人话转述这几个选项。】\n"
             "clarify 选项（4 个，按顺序传入 choices）：\n"

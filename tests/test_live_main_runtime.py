@@ -81,13 +81,18 @@ def test_helper_hiccup_fail_soft_no_crash():
 
 
 def test_11_gate_sites_are_wired():
-    """All 11 LLM-face gate sites read through _live_main_runtime (not the
-    raw getattr), so the live-read guarantee covers every face. Static check
-    against the source (no execution of the faces themselves)."""
+    """All LLM-face gate sites read through _live_main_runtime (not the
+    raw getattr), so the live-read guarantee covers every face. Static
+    check against the source (no execution of the faces themselves). The
+    expected count tracks the registered face count (14 as of PLAN-type
+    slice 4 probe face, 2026-10-17: the original 11 + handoff_extract
+    gate + pin->tail summary gate + plan-probe LLM gate) — bump it in
+    lock-step when a new LLM face lands."""
     src = (Path(__file__).resolve().parents[1] / "__init__.py").read_text()
-    # 11 call sites + 1 method definition = 12 occurrences
-    assert src.count("self._live_main_runtime()") == 11, \
-        f"expected 11 gate call sites, found {src.count('self._live_main_runtime()')}"
+    # 14 call sites (incl. handoff face 1 + pin-tail face 3 + plan-probe)
+    # + 1 method definition = 15 occurrences
+    assert src.count("self._live_main_runtime()") == 14, \
+        f"expected 14 gate call sites, found {src.count('self._live_main_runtime()')}"
     assert src.count("def _live_main_runtime(") == 1
     # No bare main_runtime gate may remain on the LLM-face path
     assert 'if not getattr(self, "_main_runtime", None):' not in src, \

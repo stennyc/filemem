@@ -19,7 +19,7 @@ agent 在 session 内经常产出**结构化多步骤计划**（PRD、修复步�
 
 1. 第 5 个记忆类型 `plan`（独立分片 `plan.json`）
 2. 专用工具 `filemem_plan`（list / create / advance 三动词，驱动 plan 全生命周期）
-3. 写门 clarify（plan 落地时问用户"存不存"）
+3. 写门 = probe + clarify 确认链（slice-4，owner 2026-10-17：LLM 探测到 agent 自己写的多步计划 → [记忆报告] 列 pending 条目 → 用户点头 → `filemem_plan(create)` 落地；分类面/regex 面永不直接写 plan 分片，见 §2/§1.4）
 4. 状态机（6 状态）+ 状态相关 level 迁移（活任务 L2 无 TTL，终态降 L0/L1）
 5. 读时两级 clarify（用户问"有哪些未完成 plan"时触发，b 面）
 6. **auto-inject 面恒折出 plan**（任务 ≠ 上下文，plan 永不自动注入）
@@ -75,16 +75,24 @@ _MEMORY_TYPE_REGEX["plan"] = [
 
 ### 1.4 LLM 面（`consolidation/llm_caller.py`）
 
-`TYPE_CLASSIFY_SCHEMA` enum 加 `"plan"`；`TYPE_CLASSIFY_INSTRUCTIONS` 加一行：
+**SLICE-4 反转（owner 裁决 2026-10-17）**：LLM 分类面（type-classifier）**不得**
+是 plan 行进入 plan.json 的门。分类器缺乏"识别 agent 自己生成的 PRD / plan /
+有序多步序列"的能力，把普通内容（用户纠正、设计选择、水位方案）贴了 plan 标签
+污染 plan shard。故 slice-4 把 plan 从分类面的**返回词表**里移除：
 
-```
-- "plan": a structured multi-step execution sequence / PRD / ordered repair
-  plan with a clear done-when criterion; distinct from a single atomic task
-  (task = one to-do; plan = ordered steps with progress + completion state)
-```
+- `TYPE_CLASSIFY_SCHEMA` enum **不含** `"plan"`（只剩
+  `["preference","fact","decision","task"]`）；
+- `TYPE_CLASSIFY_INSTRUCTIONS` 加显式 **never-return-"plan"** 条款（旧"plan =
+  有序多步序列"定义行删除）；plan-shape 内容在此面归 `task`（有序待完成）或
+  `decision`（已定案）；
+- `classify_type` helper 的 verdict 有效集排除 `"plan"`（LLM 回 plan 一律判
+  invalid -> None fail-soft）；
+- `_reclassify_type_llm` 调用侧白名单只剩
+  `("preference","decision","task")`（load-bearing 层——它才决定行落哪个
+  shard；LLM 回 plan -> None，regex fact verdict stands）。
 
-`_reclassify_type_llm` 的 verdict 接受集加 `"plan"`
-（`if verdict in ("preference","decision","task")` 改成含 `"plan"`）。
+plan 行进入 plan.json 的唯一门是 §2 的 **probe + clarify 确认链**（下方），
+不是分类面。
 
 ### 1.5 plan 行 schema（metadata，含强制 anchor）
 
@@ -146,42 +154,55 @@ _MEMORY_TYPE_REGEX["plan"] = [
 
 ---
 
-## 2. 写门 clarify（保留）
+## 2. 写门 clarify（slice-4 改为 probe + clarify 确认链）
 
-**触发**：`_save_memory` 写 plan 分片前。
+**SLICE-4（owner 裁决 2026-10-17）**：§2 原设计（`_detect_type` 命中 plan +
+commit 信号 → 在 `_save_memory` 落盘前 clarify）被 probe + clarify 面取代——
+原因是 §1.4 把 plan 从分类/regex 面移除后，`_detect_type` 不再返 plan，
+`mem_type == "plan"` 的写门分支不复存在。新门如下：
 
-**判定**：
-- `_detect_type` regex 命中 `plan` **且** 内容带 commit 信号
-  （`_PLAN_COMMIT_SIGNALS`，见下）→ 触发 clarify
-- 命中 plan 但无 commit 信号（还在讨论中、不是最终版）→ 不触发，
-  按普通 auto 路径落 L0 draft（不入 plan 分片）
+**触发**：`_save_memory` 的 auto 来源行落到 `task` / `decision` 分片，且
+内容带 regex plan-signal（`_MEMORY_TYPE_REGEX["plan"]`，slice-4 后仅作
+pre-screen 信号）→ post-lock、out-of-lock 跑 `_plan_probe`（与 distill 同
+姿态，host LLM 不坐锁内）。
 
-```python
-_PLAN_COMMIT_SIGNALS = (
-    # 英文
-    "final version", "final plan", "settled plan", "confirmed plan",
-    "here's the plan", "the plan is", "landing the plan",
-    # 中文
-    "最终版", "最终方案", "定稿", "落地方案", "确认方案", "这就是计划",
-    "方案定了", "就按这个", "定了",
-)
-```
+**判定**：`_plan_probe` 是唯一的 plan 候选 LLM 面。预算门（per-session
+cap，超 cap 不发 LLM 调用）+ pre-screen（零 signal 不发调用）+ fail-soft
+（host-down / miss / over-budget -> None，task/decision 行照常落盘，不阻塞
+宿主）。命中 LLM 回 `probe=true` + 结构化的 `{title, steps, done_when}` 时，
+产一个 PENDING PROBE marker（**不写行**），经 clarify 通道
+（`_push_pending_confirm(kind="plan_probe")`）在下一 turn 的 [记忆报告] 列出，
+问用户"是否存为持久 plan 记忆"。
 
 **clarify 内容**：
 
 ```
-检测到已落地计划「<plan.content 前 80 字>」（<N> 步，done-when: <done_when>），
+检测到多步计划「<title>」（<N> 步，done-when: <done_when>），
 是否存为持久 plan 记忆？
   - 存（进 plan 分片，L2 无 TTL，跨 session 不丢）
-  - 不存（降级为 task，普通 L0 draft）
+  - 不存（丢弃，task/decision 行已落盘，不动）
 ```
 
-- 用户答"存" → 写 `plan.json`，`plan_state=in_progress`，`level=L2`，
-  `source=manual`，`source_profile=<当前 profile>`
-- 用户答"不存" → 降级 `task` 分片，走现有 L0 路径
+**消费**：`filemem_review_drafts(action="plan_probe", verdict=...)`：
 
-**位置**：`_save_memory` 的 plan 分支，在判定出 `mem_type == "plan"` 之后、
-落盘之前插入。clarify 走宿主 `clarify` tool（与 KB 写侧同宿主面，零新宿主代码）。
+- 用户答"存"（verdict="save"）→ 走 `filemem_plan(action="create")` 写
+  `plan.json`，`plan_state=in_progress`，`level=L2`，`source=manual`，
+  `source_profile=<当前 profile>`（`_plan_create` 构造 PRD 形状行 + 三戳 +
+  auto-id'd pending steps + 强制 anchor）。这是 plan shard 的**唯一写入门**。
+- 用户答"不存"（verdict="dismiss"）→ 不写 `plan.json`，消耗 panel 条目（停
+  止重新上报）。task/decision 行已在盘上，不动。
+
+**关键不变量**：
+- 无任何自动落盘路径（probe 只产 marker，clarify 是用户确认门）。
+- 分类面（§1.4）永不写 plan shard（owner 红线）——probe + 用户点头是唯一门。
+- 预算记账姿态："charge the attempt, not the success"——host-call 失败也扣
+  session 预算，持续 host-down 不重试 LLM 调用（避免 LLM 成本爆炸红线），
+  镜像 `_reclassify_type_llm` 的"call happened -> charge it"。
+
+**位置**：`_plan_probe` + `_plan_probe_push`（`__init__.py`，save-door
+post-lock LLM pass，与 distill 同段）+ `filemem_review_drafts` 的
+`action="plan_probe"` 消费分支。clarify 走既有 `_push_pending_confirm`
+pending-confirm 队列（[记忆报告] 面板，零新宿主代码）。
 
 ---
 
@@ -265,7 +286,7 @@ reconcile，忘不掉。
 ## 4. 状态机（6 状态）
 
 ```
-                     create（写门 clarify"存"）
+                     create（probe+clarify 确认链，§2 slice-4）
                         │
                         ▼
                   ┌─────────────┐
@@ -602,8 +623,11 @@ plan 行 metadata 内 `progress_log[]`（保留最近 10 条）：
 
 ## 10. 与其他机制的关系（不动项）
 
-- **`_detect_type` / `_reclassify_type_llm`**：加 plan 判定（§1.3/1.4），
-  其余类型判定不变
+- **`_detect_type` / `_reclassify_type_llm`**：slice-4 反转——`_detect_type`
+  **不**再返 `"plan"`（plan regex 行仅存为 probe pre-screen 信号，plan-hit
+  路由到 `task`）；`_reclassify_type_llm` verdict 接受集**不含** `"plan"`
+  （LLM 回 plan -> None，regex fact verdict stands）。其余类型判定不变。
+  详见 §1.4（SLICE-4 反转说明）。
 - **EP-1/EP-2 supersede 谱系**：plan 的 `superseded`（方向变更）**复用**
   现有 `superseded_by` 字段语义，但**不走** EP-1 的 Jaccard 0.5 自动候选
   （plan 的 supersede 是显式 `advance(op="abandon", supersede_with=...)`）
@@ -620,6 +644,10 @@ plan 行 metadata 内 `progress_log[]`（保留最近 10 条）：
   清理前 14 天 warning
 - **bring-back 4 选项面**：完全不掺 plan（§3）
 - **host tree**：零改动（红线）；plan 类型 + 工具全在 plugin 内
+- **probe + clarify 面（§2 slice-4）**：plan shard 的**唯一写入门**是
+  probe 命中 -> [记忆报告] clarify -> 用户点头 -> `filemem_plan(action="create")`。
+  分类面（§1.4）与 regex 面（§1.3 slice-4 后）均**不**直接写 plan shard。
+  原 `_PLAN_COMMIT_SIGNALS` 常量（§2 旧设计）已被 probe 面取代，不再存在。
 
 ---
 
@@ -628,10 +656,12 @@ plan 行 metadata 内 `progress_log[]`（保留最近 10 条）：
 | 文件 | 改动 |
 |---|---|
 | `__init__.py` L115 | `MEMORY_TYPES` 加 `"plan"` |
-| `__init__.py` `_MEMORY_TYPE_REGEX` | 加 `"plan"` 条目（§1.3） |
-| `__init__.py` `_PLAN_COMMIT_SIGNALS` | 新增常量（§2） |
-| `__init__.py` `_save_memory` | plan 分支写门 clarify 钩子（§2） |
-| `__init__.py` `_reclassify_type_llm` | verdict 接受集加 `"plan"` |
+| `__init__.py` `_MEMORY_TYPE_REGEX` | 加 `"plan"` 条目（§1.3，slice-4 后仅作 probe pre-screen 信号） |
+| `__init__.py` `_detect_type` | **slice-4**：不再 verdict `"plan"`（plan regex 行改路由到 `task`） |
+| `__init__.py` `_reclassify_type_llm` | **slice-4**：verdict 接受集**排除** `"plan"`（load-bearing 层） |
+| `__init__.py` 新 | `_plan_probe` + `_plan_probe_push`（§2 slice-4 的 probe + clarify 面） |
+| `__init__.py` `_save_memory` | **slice-4**：auto task/decision 行出口挂 probe（post-lock，与 distill 同段） |
+| `__init__.py` `filemem_review_drafts` | **slice-4**：`action="plan_probe"` 消费分支（save -> `_plan_create`，dismiss -> 不写） |
 | `__init__.py` 新 | `filemem_plan` 工具（list/create/advance + 9 op，§6） |
 | `__init__.py` 新 | plan 行 upsert 语义（同 plan_id 合并）+ anchor 强制校验 |
 | `__init__.py` 新 | level 迁移函数（advance 各 op 内原子完成，§5） |
@@ -639,17 +669,22 @@ plan 行 metadata 内 `progress_log[]`（保留最近 10 条）：
 | `__init__.py` 新 | auto-inject 收行谓词对 plan 类型恒折（§10） |
 | `__init__.py` | `filemem_search`/`filemem_write` tool schema 的 type enum 加 `"plan"`（只读兼容） |
 | `__init__.py` | 跨 profile 戳（last_touched_by / last_completed_by / decision_log，§7） |
-| `consolidation/llm_caller.py` L362 | `TYPE_CLASSIFY_SCHEMA` enum 加 `"plan"` |
-| `consolidation/llm_caller.py` L374 | `TYPE_CLASSIFY_INSTRUCTIONS` 加 plan 描述 |
-| 新测试 | `tests/test_plan_type.py`（TDD 先红后绿） |
+| `consolidation/llm_caller.py` | `TYPE_CLASSIFY_SCHEMA` enum **排除** `"plan"`（slice-4）；`TYPE_CLASSIFY_INSTRUCTIONS` 加 never-return-plan 条款（slice-4）；`classify_type` helper 有效集排除 plan |
+| `consolidation/llm_caller.py` 新 | **slice-4**：`PLAN_PROBE_SCHEMA` + `PLAN_PROBE_INSTRUCTIONS` + `probe_plan` helper（probe LLM 面） |
+| 新测试 | `tests/test_plan_type.py`（TDD 先红后绿）+ `tests/test_plan_type_slice4.py`（slice-4 F1/F2/F3 面） |
 
 ### TDD 测试面（先写红测试）
 
-1. **regex 命中**：plan 强信号 → `_detect_type` 返 `"plan"`；纯 task 信号
-   （"记得跑测试"）仍 `"task"`；纯 fact 仍 `"fact"`（不回归）
-2. **LLM 面**：`classify_type` 可返 `"plan"`
-3. **写门 clarify**：plan + commit 信号 → 触发；plan 无 commit 信号 → 不触发
-   （落 L0 draft）；不存 → 降级 task
+1. **regex 命中（slice-4 反转）**：plan 强信号 → `_detect_type` 路由到
+   `task`（**不**再返 `"plan"`）；纯 task 信号（"记得跑测试"）仍 `"task"`；
+   纯 fact 仍 `"fact"`（不回归）
+2. **LLM 面（slice-4 反转）**：`classify_type` **不**能返 `"plan"`（enum +
+   instructions + helper 有效集 + 调用侧白名单四处全排除）
+3. **probe + clarify 写门（§2 slice-4）**：auto task/decision 行带 plan
+   signal → post-lock 跑 `_plan_probe`；LLM 命中 → PENDING marker ->
+   `_push_pending_confirm(kind="plan_probe")`；用户 verdict="save" ->
+   `filemem_plan(action="create")` 落 plan.json；verdict="dismiss" -> 不写；
+   over-budget / no-runtime / miss -> None（task/decision 行照常落盘，不阻塞）
 4. **list 过滤 + 多 profile**：
    - 缺省跨 profile，返回 in_progress + blocked（不含 done/abandoned/superseded）
    - `state="blocked"` 只返 blocked；`state="done"` 显式查终态
@@ -688,7 +723,7 @@ plan 行 metadata 内 `progress_log[]`（保留最近 10 条）：
 
 ## 12. 验收判据
 
-1. 一份 4 步 plan 经写门 clarify 存入 `plan.json`（L2，每 done 步带 anchor）
+1. 一份 4 步 plan 经 probe+clarify 确认链（§2 slice-4：LLM 探测 → [记忆报告] pending 条目 → 用户 verdict="save" → `filemem_plan(action="create")`）存入 `plan.json`（L2，每 done 步带 anchor）
 2. 新 session，用户问"有哪些未完成 plan" → `filemem_plan(action="list")`
    列出（in_progress/blocked，带三戳 + options），agent 不翻原始 json
 3. 用户选"继续" → 第二级 clarify → agent 先 `reconcile`（核实进度）→

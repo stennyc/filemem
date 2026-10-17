@@ -4,9 +4,13 @@
 Vertical slice 1 (the minimal runnable face, per TDD):
   * MEMORY_TYPES gains "plan"
   * _MEMORY_TYPE_REGEX gains a "plan" entry (en + zh strong signals)
-  * _detect_type returns "plan" for plan strong-signal content, and does NOT
-    regress task / fact / preference / decision verdicts
-  * the LLM classify_type face accepts a "plan" verdict (enum extended)
+  * SLICE-4 (owner ruling 2026-10-17) flip: _detect_type no longer VERDICTS
+    "plan" — a regex plan-signal routes to "task" (the ordered-steps home)
+    and the plan regex row survives only as a pre-screen signal for the
+    probe face. The LLM classify_type face likewise no longer accepts a
+    "plan" verdict (enum + instructions + helper valid-set + caller
+    whitelist all steer clear of "plan"). The ONLY writer of the plan
+    shard is the probe + clarify confirm chain (test_plan_type_slice4.py).
   * the existing tool schemas (filemem_search / filemem_write) expose "plan"
     in their type enums (read-compat)
 
@@ -60,6 +64,12 @@ def _provider():
 
 
 def test_detect_type_plan_english():
+    """Slice 4 flip (owner ruling 2026-10-17): plan-shaped content no longer
+    verdicts `plan`. The regex plan row is now a pre-screen signal for the
+    probe face; a plan-hit routes to `task` (ordered steps to complete).
+    The LLM probe face (not the regex layer) is the only path that can land
+    a confirmed plan row in the plan shard.
+    """
     p = _provider()
     for text in (
         "Implementation plan: Step 1 add the regex table, Step 2 add the LLM face, Step 3 add tests",
@@ -67,7 +77,11 @@ def test_detect_type_plan_english():
         "roadmap: fix sequence for the ledger bug across 4 steps",
         "execution plan with multi-step repair, each step test-gated",
     ):
-        assert p._detect_type(text) == "plan", f"expected plan for {text!r}"
+        verdict = p._detect_type(text)
+        assert verdict != "plan", \
+            f"F2: _detect_type still verdicts 'plan' for {text!r} (got {verdict!r})"
+        assert verdict in ("task", "preference", "decision", "fact"), \
+            f"plan-shape {text!r} should route to a legacy shard, got {verdict!r}"
 
 
 def test_detect_type_plan_chinese():
@@ -78,7 +92,11 @@ def test_detect_type_plan_chinese():
         "落地方案已定稿：分3阶段执行",
         "路线图：多步骤实施",
     ):
-        assert p._detect_type(text) == "plan", f"expected plan for {text!r}"
+        verdict = p._detect_type(text)
+        assert verdict != "plan", \
+            f"F2: _detect_type still verdicts 'plan' for {text!r} (got {verdict!r})"
+        assert verdict in ("task", "preference", "decision", "fact"), \
+            f"plan-shape {text!r} should route to a legacy shard, got {verdict!r}"
 
 
 def test_detect_type_task_not_regressed():
@@ -101,19 +119,29 @@ def test_detect_type_preference_decision_not_regressed():
     assert p._detect_type("我决定选用 redis 作为缓存") == "decision"
 
 
-# ── 1.4 LLM face: classify_type accepts "plan" ───────────────────────────────
+# ── 1.4 LLM face: classify_type (slice 4) no longer accepts "plan" ──────────
 
 def test_llm_type_classify_enum_includes_plan():
+    """Slice 4 flip: the LLM upgrade face no longer advertises 'plan'.
+
+    Owner ruling (2026-10-17): plan rows enter plan.json ONLY via the
+    confirmed filemem_plan face (probe + clarify). The t_090d6f3d
+    type-classify face (enum + instructions + helper valid-set + caller
+    whitelist) must steer clear of 'plan' entirely. The legacy four remain.
+    """
     enum = TYPE_CLASSIFY_SCHEMA["properties"]["type"]["enum"]
-    assert "plan" in enum, f"TYPE_CLASSIFY_SCHEMA enum {enum!r} missing 'plan'"
+    assert "plan" not in enum, f"I1: TYPE_CLASSIFY_SCHEMA enum {enum!r} still lists 'plan'"
     # the legacy four must remain (no regression)
     for t in ("preference", "fact", "decision", "task"):
         assert t in enum
 
 
 def test_llm_type_classify_instructions_mention_plan():
-    assert "plan" in TYPE_CLASSIFY_INSTRUCTIONS, \
-        "classify_type instructions must describe the plan shard for the LLM face"
+    """The instructions must steer the LLM AWAY from 'plan' (a reservation
+    clause): plan-shaped content classifies as task/decision here, never plan."""
+    low = TYPE_CLASSIFY_INSTRUCTIONS.lower()
+    assert "plan" in low, \
+        "instructions must mention plan (to tell the LLM NOT to return it)"
 
 
 # ── read-compat: existing tool schemas expose "plan" ─────────────────────────
