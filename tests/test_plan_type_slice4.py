@@ -534,5 +534,186 @@ def test_sync_turn_probes_spec_landing_assistant_report(monkeypatch, tmp_path):
     assert p._plan_probe_last_seen is None
 
 
+# ── slice-6: capture plan/spec write-paths from host transcript, read the
+# file head, feed the LLM probe face (owner 2026-10-17 "肯定是特征") ────────
+# The 5-step chain: 捕获 -> 分析(会话+落盘路径) -> 读文件头 -> 确认是plan ->
+# 入plan记忆. Host tool_calls structure (verified in agent_runtime_helpers.py):
+# role="assistant" rows carry tool_calls[] = [{"function": {"name", "arguments"}}]
+# where arguments may be a JSON string OR a dict. Host agent/ is ZERO diff —
+# we only read the transcript the host already writes.
+
+def test_plan_path_features_table_exists():
+    """The feature-word table is module-level and non-empty (slice-6 gate:
+    only extract write-paths whose filename/directory carries a plan feature)."""
+    assert isinstance(fm._PLAN_PATH_FEATURES, tuple) and len(fm._PLAN_PATH_FEATURES) >= 3, \
+        "slice-6: _PLAN_PATH_FEATURES table missing or too thin"
+    # the owner's own PRD vocabulary must be covered:
+    for word in ("plan", "prd", "spec", "roadmap"):
+        assert word in [w.lower() for w in fm._PLAN_PATH_FEATURES], \
+            f"slice-6: _PLAN_PATH_FEATURES does not cover {word!r}"
+
+
+def test_extract_plan_write_paths_filters_by_feature(tmp_path):
+    """Given a host transcript with write_file/patch tool_calls, extract the
+    candidate plan/spec paths — only those whose filename OR directory carries
+    a _PLAN_PATH_FEATURES word. Non-feature paths (e.g. src/foo.py) are dropped."""
+    p = _provider()
+    # Build a host-shaped transcript: assistant row with tool_calls, arguments
+    # as a JSON STRING (the host's real shape per agent_runtime_helpers L133).
+    write_args = json.dumps({
+        "path": str(tmp_path / "specs" / "水位PRD-plan.md"),
+        "content": "# PRD ...",
+    })
+    patch_args = json.dumps({
+        "path": str(tmp_path / "src" / "lib.py"),
+        "old_string": "a", "new_string": "b",
+    })
+    history = [
+        {"role": "user", "content": "写一份改造计划"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "write_file", "arguments": write_args}},
+            {"function": {"name": "patch", "arguments": patch_args}},
+        ]},
+    ]
+    paths = p._extract_plan_write_paths(history)
+    # the spec path (carries "spec" in dir + "PRD" in name) must be present
+    assert any("specs" in pp or "plan" in pp for pp in paths), \
+        f"slice-6: spec/plan path not extracted from transcript: {paths!r}"
+    # the non-feature path (src/lib.py — no plan/prd/spec word) must be dropped
+    assert not any("lib.py" in pp for pp in paths), \
+        f"slice-6: non-feature path {paths!r} must be filtered out"
+    # dedup: same dir twice collapses to one
+    assert len(paths) == 1, f"slice-6: expected 1 dedup'd path, got {paths!r}"
+
+
+def test_extract_plan_write_paths_empty_when_no_tool_calls():
+    """A transcript with no tool_calls (or no assistant rows) yields an empty
+    candidate list — no false positives."""
+    p = _provider()
+    assert p._extract_plan_write_paths([
+        {"role": "user", "content": "改水位"},
+        {"role": "assistant", "content": "改好了"},
+    ]) == []
+    # None / malformed history must not raise
+    assert p._extract_plan_write_paths(None) == []
+    assert p._extract_plan_write_paths([{"role": "assistant"}]) == []
+
+
+def test_plan_probe_file_reads_head_and_probes(tmp_path, monkeypatch):
+    """Given a candidate plan file path, _plan_probe_file reads the file head
+    (~400 chars) and feeds it to the probe_plan LLM face; a hit returns a
+    marker carrying the source path + the file's structured steps. No auto-land
+    (the marker still rides the clarify channel via _plan_probe_push)."""
+    plan_file = tmp_path / "specs" / "改造计划.md"
+    plan_file.parent.mkdir(parents=True, exist_ok=True)
+    plan_file.write_text(
+        "# 改造计划\n步骤1：加正则表\n步骤2：加 LLM 面\n步骤3：加测试\n"
+        "完成条件：全绿\n", encoding="utf-8")
+    p = _provider()
+    p._plan_probe_budget = {}
+    p._plan_probe_limit = 3
+
+    fed = []
+
+    class RecordingLoader:
+        @staticmethod
+        def probe_plan(main_runtime, content):
+            fed.append(content)
+            return {"probe": True, "title": "改造计划",
+                    "steps": ["加正则表", "加 LLM 面", "加测试"],
+                    "done_when": "全绿", "model_used": True}
+
+    monkeypatch.setattr(p, "_live_main_runtime", lambda: {"model": "f", "provider": "f"})
+    monkeypatch.setattr(fm, "_load_llm_caller", lambda: RecordingLoader)
+
+    marker = p._plan_probe_file(str(plan_file))
+    assert marker is not None, "slice-6: a probe hit must yield a marker"
+    # the LLM face was fed the file's HEAD (not the assistant's paraphrase)
+    assert fed, "slice-6: the probe LLM face must be issued with the file head"
+    assert "步骤1" in fed[0], \
+        "slice-6: the LLM must receive the file head content (file body, not paraphrase)"
+    # the marker carries the source path so the consumption face can record it
+    assert marker.get("source_path") == str(plan_file), \
+        f"slice-6: marker must carry the source file path (got {marker.get('source_path')!r})"
+    # no auto-land: the marker is a PENDING probe marker, not a written row
+    assert marker["kind"] == "plan_probe"
+
+
+def test_plan_probe_file_missing_path_is_noop(tmp_path):
+    """A candidate path that does not exist on disk -> None (fail-soft, no
+    LLM call issued, no crash into the turn-close path)."""
+    p = _provider()
+    p._plan_probe_budget = {}
+    p._plan_probe_limit = 3
+    calls = []
+
+    class RecordingLoader:
+        @staticmethod
+        def probe_plan(main_runtime, content):
+            calls.append(content)
+            return {"probe": True, "title": "t", "steps": ["a"], "done_when": "x"}
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(p, "_live_main_runtime", lambda: {"model": "f", "provider": "f"})
+    monkeypatch.setattr(fm, "_load_llm_caller", lambda: RecordingLoader)
+    try:
+        res = p._plan_probe_file(str(tmp_path / "does_not_exist_plan.md"))
+    finally:
+        monkeypatch.undo()
+    assert res is None, "slice-6: a missing file must yield None"
+    assert calls == [], "slice-6: no LLM call for a missing file (fail-soft)"
+
+
+def test_sync_turn_feeds_file_body_to_probe(tmp_path, monkeypatch):
+    """End-to-end: sync_turn whose transcript shows a write_file into a spec
+    dir (feature hit) reads the file head and feeds the probe face — the owner's
+    5-step chain 捕获->分析->读文件头->确认->入plan, with the LLM seeing the
+    FILE BODY (not just the assistant's one-line report)."""
+    spec_dir = tmp_path / "specs"
+    spec_dir.mkdir()
+    plan_md = spec_dir / "水位递进带PRD-降档序.md"
+    plan_md.write_text(
+        "# 水位递进带 PRD\n步骤S1：降档分档骨架\n步骤S2：账本旧页 evict\n"
+        "步骤S3：输出面裁剪\n完成条件：全绿 + 宿主零 diff\n", encoding="utf-8")
+    store = _make_store(tmp_path / "store", "s-file")
+    home = _make_home(tmp_path / "home", "h-file")
+    p = _make_provider(tmp_path, store, home, session_id="s-file")
+    p._plan_probe_budget = {}
+    p._plan_probe_limit = 3
+    p._plan_probe_marker_pushed = []
+
+    fed = []
+
+    class RecordingLoader:
+        @staticmethod
+        def probe_plan(main_runtime, content):
+            fed.append(content)
+            return {"probe": True, "title": "水位递进带 PRD",
+                    "steps": ["降档分档", "旧页 evict", "输出面裁剪"],
+                    "done_when": "全绿", "model_used": True}
+
+    monkeypatch.setattr(p, "_live_main_runtime", lambda: {"model": "f", "provider": "f"})
+    monkeypatch.setattr(fm, "_load_llm_caller", lambda: RecordingLoader)
+    monkeypatch.setattr(p, "_plan_probe_push", lambda m: p._plan_probe_marker_pushed.append(m))
+
+    history = [
+        {"role": "user", "content": "出一份降档 PRD"},
+        {"role": "assistant", "content": "PRD 落地了。", "tool_calls": [
+            {"function": {"name": "write_file",
+                          "arguments": json.dumps({"path": str(plan_md), "content": "# 水位递进带 PRD"})}},
+        ]},
+    ]
+    p.sync_turn("出一份降档 PRD", "PRD 落地了。", session_id="s-file", messages=history)
+    # the LLM face must have received the FILE BODY (the real 5-step PRD),
+    # not just the one-line "PRD 落地了" report:
+    assert fed, "slice-6: the probe LLM face must be issued for a spec write"
+    assert any("降档分档" in c for c in fed), \
+        ("slice-6: the LLM must receive the file head/body (the PRD steps), "
+         "not only the assistant's one-line report")
+    # and a marker was pushed through the clarify channel (no auto-land)
+    assert p._plan_probe_marker_pushed, \
+        "slice-6: a probe hit must push a PENDING marker for the clarify channel"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

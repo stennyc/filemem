@@ -187,7 +187,16 @@ _MEMORY_TYPE_REGEX = {
     ],
 }
 
-# t_plan_slice5 F4: spec-landing structure words for the plan-probe pre-screen.
+# t_plan_slice6: plan/spec file-path FEATURE words (owner ruling 2026-10-17,
+# "肯定是特征" — only extract candidate write-paths whose FILENAME or
+# DIRECTORY carries a plan/spec feature, NOT a full directory scan). The
+# LLM face then reads the file head + the turn's transcript context to
+# decide "is this a genuine multi-step plan/PRD". Substring match, lower-
+# cased (same posture as _PLAN_LAND_SIGNALS above).
+_PLAN_PATH_FEATURES = (
+    "plan", "prd", "spec", "roadmap", "milestone", "execution",
+    "action-plan", "design-doc", "refactor",
+)
 #
 # Owner catch (2026-10-17): a supercompress PRD report ("PRD 落地了。文件：
 # /usr/.../specs/水位递进带PRD.md … 8 条 TDD RED 锚") never reached the LLM
@@ -5436,12 +5445,38 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # ONLY writer of the plan shard, and only via a confirmed nod).
         if assistant_content and not self._turn_foreign:
             try:
-                _marker = self._plan_probe(assistant_content)
-                if _marker is not None:
-                    self._plan_probe_push(_marker)
-                    logger.info(
-                        f"FileMem: plan-probe marker pushed from sync_turn "
-                        f"assistant report (title={_marker.get('title')!r})")
+                # t_plan_slice6: 5-step chain — capture plan/spec write-paths
+                # from the host transcript, read each file head, and feed the
+                # FILE BODY to the LLM probe face (not just the assistant's
+                # one-line report). The host transcript is the only source of
+                # truth for what files were written this turn.
+                _file_marker_pushed = False
+                if messages:
+                    for _sp in self._extract_plan_write_paths(messages):
+                        _file_marker = self._plan_probe_file(_sp)
+                        if _file_marker is not None:
+                            # File head was fed to the LLM and produced a
+                            # marker — use it (it carries source_path + the
+                            # file's structured steps, richer than the report).
+                            self._plan_probe_push(_file_marker)
+                            logger.info(
+                                f"FileMem: plan-probe marker pushed from "
+                                f"sync_turn FILE head ({_sp!r}) "
+                                f"(title={_file_marker.get('title')!r})")
+                            _file_marker_pushed = True
+                            break
+                if not _file_marker_pushed:
+                    # No spec-file probe produced a marker this turn → fall
+                    # back to the slice-5 text probe so a bare "PRD 落地了"
+                    # report is still caught. _plan_probe's two-layer
+                    # pre-screen (structure word OR plan-signal word) is the
+                    # cost gate; a miss is a silent no-op.
+                    _marker = self._plan_probe(assistant_content)
+                    if _marker is not None:
+                        self._plan_probe_push(_marker)
+                        logger.info(
+                            f"FileMem: plan-probe marker pushed from sync_turn "
+                            f"assistant report (title={_marker.get('title')!r})")
             except Exception as _e:
                 logger.debug(f"FileMem: sync_turn plan-probe skipped: {_e}")
 
@@ -7161,6 +7196,101 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             "source_content": (content or "").strip()[:400],
             "ts": _utcnow().isoformat(),
         }
+        return marker
+
+    # ── t_plan_slice6: capture plan/spec write-paths from the host transcript ─
+    # owner 5-step chain (2026-10-17): 捕获 -> 分析(会话+落盘路径) -> 读文件头
+    # -> 确认是plan -> 入plan记忆. Host tool_calls shape (verified in
+    # agent_runtime_helpers.py L127/L156/L133): role="assistant" rows carry
+    # tool_calls[] = [{"function": {"name", "arguments"}}] where arguments is
+    # a JSON string OR a dict. We only READ the host transcript (zero diff to
+    # host agent/) — the host already writes these rows.
+
+    def _extract_plan_write_paths(self, history: Optional[List[Dict[str, Any]]]) -> List[str]:
+        """t_plan_slice6: extract candidate plan/spec write-paths from this
+        turn's host transcript.
+
+        Scans role="assistant" rows' tool_calls for write_file / patch /
+        write actions, pulls the ``path`` arg, and keeps ONLY paths whose
+        FILENAME or DIRECTORY carries a _PLAN_PATH_FEATURES word (owner
+        ruling "肯定是特征"). Dedup by directory (owner: 记录文件夹路径即可).
+        Host agent/ is ZERO diff — we read only the transcript the host
+        already persists. Fail-soft: malformed / None history -> [].
+        """
+        if not isinstance(history, list):
+            return []
+        # write-tool names that carry a file path (the host's disk-write faces)
+        write_tools = {"write_file", "patch", "write", "write_files",
+                       "create_file", "append_file"}
+        # dedup by parent directory, keep first-seen path per dir. Python 3.7+
+        # dict is insertion-ordered, so a plain dict preserves first-seen order
+        # (no need for OrderedDict).
+        seen_dirs: "Dict[str, str]" = {}
+        for msg in history:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            for tc in (msg.get("tool_calls") or []):
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                name = str(fn.get("name", "")).lower()
+                if name not in write_tools:
+                    continue
+                args = fn.get("arguments")
+                # host shape: arguments is a JSON string OR a dict
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = None
+                if not isinstance(args, dict):
+                    continue
+                path = args.get("path") or args.get("file") or args.get("target")
+                if not path:
+                    continue
+                path = str(path)
+                # feature gate (owner "以文件所在路径判断，记录文件夹路径即可"):
+                # match the basename AND its immediate parent directory ONLY —
+                # NOT the whole absolute path (a parent dir named e.g.
+                # "plans_review" further up the tree must not leak in).
+                low_base = os.path.basename(path).lower()
+                low_parent = os.path.basename(os.path.dirname(path)).lower()
+                if not (any(feat in low_base for feat in _PLAN_PATH_FEATURES)
+                        or any(feat in low_parent for feat in _PLAN_PATH_FEATURES)):
+                    continue
+                # dedup by parent directory (owner: 记文件夹路径即可)
+                d = os.path.dirname(path) or path
+                seen_dirs.setdefault(d, path)
+        return list(seen_dirs.values())
+
+    def _plan_probe_file(self, path: str) -> Optional[Dict[str, Any]]:
+        """t_plan_slice6: read the head of a candidate plan/spec file (~400
+        chars) and feed IT (the file body, not the assistant's paraphrase) to
+        the SAME budget-gated probe_plan LLM face. A hit returns a PENDING
+        marker carrying the source path — the marker rides the clarify channel
+        via _plan_probe_push (no auto-land, owner ruling slice-4).
+
+        Fail-soft: missing file / no main_runtime / over-budget / any host
+        failure -> None (never blocks the turn-close path). The file head is
+        the cost-gate input; the LLM still has the final say (is-this-a-
+        genuine-multi-step-plan verdict), same as _plan_probe.
+        """
+        # The file must actually exist on disk — a candidate path from the
+        # transcript is only a signal, the file body is what the LLM judges.
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                head = f.read(400)
+        except Exception as e:
+            logger.debug(f"FileMem: plan-probe file read failed ({path}): {e}")
+            return None
+        # Feed the file head + a short path tag through the SAME budget-gated
+        # probe LLM face. The path tag helps the LLM confirm the artifact.
+        probe_input = f"[file: {path}]\n{head}"
+        marker = self._plan_probe(probe_input)
+        if marker is not None:
+            marker["source_path"] = path
         return marker
 
     def _plan_probe_push(self, marker: Dict[str, Any]) -> None:
