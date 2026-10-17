@@ -284,6 +284,66 @@ def relevance_score(main_runtime: Optional[Dict[str, Any]], query: str, text: st
         return {"relevance": 0.5, "model_used": False, "reason": f"model_unavailable_fallback={exc}"}
 
 
+_HANDOFF_FAIL = {"summary": None, "llm_used": False}
+
+HANDOFF_INSTRUCTIONS = """
+You are writing a HANDOFF summary for a dead or deadlocked agent session so a
+NEW session can continue the work without re-reading the whole transcript.
+
+Context: The material bundle below combines the session's supercompress compact
+ledger segments (task state / next steps / red lines) and its confirmed
+filemem rows (decisions / preferences). When focus-filtered raw lines are
+present they mark the user's stated interest area.
+
+Output JSON:
+{
+  "summary": "handoff text (target ~800 chars, max 4000 chars hard limit): current task state, in-flight work, next concrete steps, open decisions / red lines, and anything the continuing session must NOT redo",
+  "confirmed": boolean
+}
+
+Rules:
+- Cover: task state / in-flight work / next steps / open items / red lines.
+- Never hallucinate — only summarize what the material bundle states.
+- 'confirmed' true only when the bundle is coherent enough to hand off on.
+"""
+
+HANDOFF_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string",
+                    "description": "交接摘要（4000 char 封顶）"},
+        "confirmed": {"type": "boolean"}
+    },
+    "required": ["summary", "confirmed"]
+}
+
+
+def handoff_summarize(main_runtime: Optional[Dict[str, Any]],
+                      material_text: str) -> Dict[str, Any]:
+    """LLM handoff summary of one material bundle (host main-model face,
+    explicit main_runtime — same posture as distill: zero hardcoded model /
+    provider config, temperature 0.0). Fail-soft, same shape as distill:
+    ANY failure coerces to llm_used=False — the CALLER falls back to the
+    deterministic segment concatenation (audit-visible degradation, 不吞脏,
+    data never lost)."""
+    try:
+        parsed = _structured_call(main_runtime, HANDOFF_INSTRUCTIONS,
+                                  HANDOFF_SCHEMA,
+                                  material_text, temperature=0.0,
+                                  max_tokens=2048) or {}
+        summary = (parsed.get("summary") or "").strip()
+        confirmed = bool(parsed.get("confirmed"))
+        if confirmed and not summary:
+            confirmed = False
+        if not summary:
+            return dict(_HANDOFF_FAIL)
+        return {"summary": summary, "llm_used": True,
+                "confirmed": confirmed}
+    except Exception as exc:
+        _record_face_fallback(main_runtime, exc)
+        return dict(_HANDOFF_FAIL, **{"reason": f"llm_unavailable={exc}"})
+
+
 _DISTILL_FAIL = {"summary": None, "value": None, "confirmed": False}
 
 DISTILL_INSTRUCTIONS = """
@@ -363,7 +423,7 @@ TYPE_CLASSIFY_SCHEMA = {
     "properties": {
         "type": {
             "type": "string",
-            "enum": ["preference", "fact", "decision", "task", "plan"],
+            "enum": ["preference", "fact", "decision", "task"],
             "description": "the memory shard this content most precisely belongs to",
         },
     },
@@ -375,10 +435,12 @@ Classify the single memory content below into EXACTLY one shard type:
 - "preference": a user preference / taste / standing choice
 - "decision": a settled choice or decision about what to use / adopt / commit to
 - "task": an action to do, a to-do, something that MUST / needs to be completed
-- "plan": a structured multi-step execution sequence / PRD / ordered repair
-  plan with a clear done-when criterion; distinct from a single atomic task
-  (task = one to-do; plan = ordered steps with progress + completion state)
 - "fact": a neutral durable statement (default when none of the above fit)
+NEVER return "plan". The "plan" shard is reserved for confirmed multi-step
+PRD rows created only via the explicit plan-confirm face (filemem_plan);
+plan-shaped content such as an execution sequence or repair roadmap must be
+classified here as "task" (ordered steps to complete) or "decision" (a
+settled plan), never "plan".
 Prefer the MOST SPECIFIC non-fact type the content genuinely supports; use
 "fact" only when it is purely a neutral fact. Return a JSON object."""
 
@@ -398,7 +460,10 @@ def classify_type(main_runtime: Optional[Dict[str, Any]], content: str) -> Dict[
                                   TYPE_CLASSIFY_SCHEMA, content,
                                   temperature=0.0, max_tokens=64) or {}
         verdict = parsed.get("type")
-        if verdict not in ("preference", "fact", "decision", "task", "plan"):
+        # 'plan' is not a valid verdict for this face (it is reserved for the
+        # confirmed PRD rows written by filemem_plan): treat it as invalid ->
+        # fail-soft (the caller keeps the regex verdict).
+        if verdict not in ("preference", "fact", "decision", "task"):
             _record_face_fallback(main_runtime, Exception("invalid_type"))  # card 3: llm_call row fallback
             return {"type": None, "model_used": False,
                     "reason": f"invalid_type_fallback={verdict!r}"}
@@ -406,6 +471,89 @@ def classify_type(main_runtime: Optional[Dict[str, Any]], content: str) -> Dict[
     except Exception as exc:
         _record_face_fallback(main_runtime, exc)  # card 3: llm_call row fallback=True
         return {"type": None, "model_used": False,
+                "reason": f"model_unavailable_fallback={exc}"}
+
+
+# ── t_plan_slice4: plan-PROBE face (owner ruling 2026-10-17) ─────────────────
+# The LLM face that DETECTS plan-shaped content the agent itself authored
+# (a multi-step PRD / execution sequence / repair roadmap with a done-when
+# criterion) and emits a PENDING PROBE marker. It NEVER writes a row: the
+# caller (the save-door / turn-close hook) pushes the marker through the
+# clarify channel (filemem._push_pending_confirm kind="plan_probe"); only a
+# confirmed user nod lands a PRD-shaped row via filemem_plan(action="create").
+# Same host-call posture as classify_type / distill: explicit main_runtime
+# snapshot, zero hardcoded model names, zero custom config keys, fail-soft
+# (ANY failure -> probe=False, the caller fires NO clarify, 不吞脏, 不炸宿主).
+PLAN_PROBE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "probe": {
+            "type": "boolean",
+            "description": "true only when the content is a multi-step plan/PRD worth remembering",
+        },
+        "title": {
+            "type": "string",
+            "description": "short plan title (<= 80 chars)",
+        },
+        "steps": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "the ordered step texts (3-10 items)",
+        },
+        "done_when": {
+            "type": "string",
+            "description": "the completion criterion",
+        },
+    },
+    "required": ["probe"],
+}
+
+PLAN_PROBE_INSTRUCTIONS = """You are a plan detector for an AI agent's memory store.
+Decide whether the content below is a MULTI-STEP plan the AGENT ITSELF
+authored or committed to — a PRD / execution sequence / repair roadmap /
+landing plan with ordered steps (>= 3) and a recognizable done-when
+criterion. These are the memories worth keeping as a structured plan.
+
+Return "probe": true ONLY for such content. A single to-do, a one-line
+instruction, a settled one-off choice, or a neutral fact is NOT a plan —
+return "probe": false for all of those.
+
+When probe is true, also return: "title" (short), "steps" (the ordered step
+texts, 3-10 items), "done_when" (the completion criterion).
+Return a JSON object."""
+
+
+def probe_plan(main_runtime: Optional[Dict[str, Any]], content: str) -> Dict[str, Any]:
+    """LLM plan-probe (host main-model face, explicit main_runtime,
+    temperature 0.0 / max_tokens 256).
+
+    Returns {'probe': bool, 'title'?: str, 'steps'?: [str],
+    'done_when'?: str, 'model_used': bool, 'reason'?: str}. ANY failure
+    (no snapshot / host surface missing / host down / timeout / unparseable
+    reply / malformed payload) -> probe=False + model_used=False — the
+    caller fires NO clarify (fail-soft, 宁可漏判, 不吞脏, 不炸宿主).
+    """
+    try:
+        parsed = _structured_call(main_runtime, PLAN_PROBE_INSTRUCTIONS,
+                                  PLAN_PROBE_SCHEMA, content,
+                                  temperature=0.0, max_tokens=256) or {}
+        if not parsed.get("probe"):
+            return {"probe": False, "model_used": True}
+        title = str(parsed.get("title") or "").strip()[:120]
+        steps = [str(s).strip() for s in (parsed.get("steps") or []) if str(s).strip()]
+        done_when = str(parsed.get("done_when") or "").strip()
+        # A hit WITHOUT structured steps / title is NOT a usable marker —
+        # downgrade to a miss (the caller would have nothing to offer the
+        # user; the confirm chain requires concrete steps).
+        if not title or len(steps) < 2:
+            return {"probe": False, "model_used": True,
+                    "reason": "unstructured_hit_downgraded"}
+        return {"probe": True, "title": title, "steps": steps,
+                "done_when": done_when or "all steps done",
+                "model_used": True}
+    except Exception as exc:
+        _record_face_fallback(main_runtime, exc)  # card 3: llm_call row fallback=True
+        return {"probe": False, "model_used": False,
                 "reason": f"model_unavailable_fallback={exc}"}
 
 
