@@ -187,6 +187,39 @@ _MEMORY_TYPE_REGEX = {
     ],
 }
 
+# t_plan_slice5 F4: spec-landing structure words for the plan-probe pre-screen.
+#
+# Owner catch (2026-10-17): a supercompress PRD report ("PRD 落地了。文件：
+# /usr/.../specs/水位递进带PRD.md … 8 条 TDD RED 锚") never reached the LLM
+# probe: the PRD text landed in a file on disk, not in the memory store, so
+# _save_memory's auto task/decision hook never fired. The live path is
+# sync_turn's assistant text; the pre-screen there gates on the signal below.
+#
+# Two-layer OR (each layer is sufficient alone — NOT a two-leg AND, which
+# would break the existing slice-4 behavior where a plan-signal word alone is
+# enough; the LLM has the final say, pre-screen is only a cost gate):
+#   layer A (strong): _PLAN_LAND_SIGNALS — spec-landing structure words.
+#     A single hit = the agent is reporting a PRD/spec landing, the strongest
+#     possible plan signal. Enough to pass pre-screen on its own.
+#   layer B (weak):   _MEMORY_TYPE_REGEX["plan"] — plan-signal words
+#     ("PRD", "步骤N", "落地方案", "实施计划" …). A single hit = plan-shaped
+#     content. Sufficient alone (slice-4 behavior, unchanged).
+# BOTH layers miss -> prescreen_skip -> no LLM call (cost red line, "宁漏勿炸"
+# applies to the BOTH-miss case only).
+#
+# Single source of truth: _plan_probe reads THIS tuple (module-level, zero I/O,
+# same posture as _MEMORY_TYPE_REGEX and META_MARKERS above).
+_PLAN_LAND_SIGNALS = (
+    # spec-landing openers (the owner's own PRD vocabulary, strongest signal):
+    "PRD 落地", "PRD落地", "落地了", "新建 specs/", "specs/",
+    # independent-failure-surface vocabulary:
+    "独立失败面", "两条面", "逃生门",
+    # TDD / RED-anchor vocabulary (the PRD's test-plan anchors):
+    "TDD RED 锚", "TDD RED", "RED 锚", "TDD",
+    # generic plan-report openers (English, mirror of the Chinese set):
+    "spec landed", "PRD landed", "spec file",
+)
+
 # M1/M3 single source of truth: structural markers of a *room/group transcript*
 # (or system scaffolding) that must never be stored as a durable fact/preference.
 # A's ingress predicate (current-turn aperture) and M1's batch-extract gate both
@@ -5385,6 +5418,33 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         except Exception as _e:
             logger.debug(f"FileMem: turn-close B4 fallback skipped: {_e}")
 
+        # t_plan_slice5 F4 (owner 2026-10-17, '补活路'): the live path for a
+        # spec/PRD landing is THIS turn's assistant text reporting the
+        # landing ("PRD 落地了。文件：/…/specs/水位递进带PRD.md … 8 条 TDD RED
+        # 锚"). The agent writes the spec file directly (write_file/patch),
+        # never through the memory store, so _save_memory's auto task/decision
+        # probe hook — the only probe trigger slice-4 wired — was structurally
+        # unable to see it: 0 probe_plan calls, 0 plan_probe audit rows
+        # (verified in consolidation_log.jsonl). Fix: feed the assistant text
+        # into the SAME budget-gated _plan_probe face here, at turn end,
+        # outside any write lock (same posture as the distill LLM pass in
+        # _save_memory). _plan_probe's two-layer pre-screen (structure word
+        # OR plan-signal word) is the cost gate; a miss is a silent no-op,
+        # a hit pushes a PENDING marker through the clarify channel so the
+        # NEXT turn's [记忆报告] lists it and the user decides save/dismiss.
+        # No auto-land (owner ruling, inherited from slice-4: the probe is the
+        # ONLY writer of the plan shard, and only via a confirmed nod).
+        if assistant_content and not self._turn_foreign:
+            try:
+                _marker = self._plan_probe(assistant_content)
+                if _marker is not None:
+                    self._plan_probe_push(_marker)
+                    logger.info(
+                        f"FileMem: plan-probe marker pushed from sync_turn "
+                        f"assistant report (title={_marker.get('title')!r})")
+            except Exception as _e:
+                logger.debug(f"FileMem: sync_turn plan-probe skipped: {_e}")
+
 
     def _detect_turn_failures(self, sid: str, user_content: str,
                               full_history: Optional[List[Dict[str, Any]]]) -> None:
@@ -7043,14 +7103,35 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             logger.info(f"FileMem: plan-probe budget hit ({sid} >= {limit}), "
                         f"skipping probe")
             return None
-        # Deterministic pre-screen: ONLY probe content that already carried a
-        # regex plan-signal (the caller only routes task/decision rows, and
-        # even those only if _detect_type saw the plan pre-screen row). A
-        # zero-signal content is NOT worth an LLM call (cost red line).
+        # t_plan_slice5 F4: TWO-LAYER pre-screen (cost gate, NOT the verdict —
+        # the LLM probe face still has the final say, pre-screen only decides
+        # whether an LLM call is worth issuing):
+        #   layer A (strong): _PLAN_LAND_SIGNALS — spec-landing structure
+        #     words ("PRD 落地", "specs/", "TDD RED 锚" …). A single hit =
+        #     the agent is reporting a PRD/spec landing, the strongest plan
+        #     signal. Sufficient alone.
+        #   layer B (weak):  _MEMORY_TYPE_REGEX["plan"] — plan-signal words
+        #     ("步骤N", "落地方案", "实施计划" …). Sufficient alone
+        #     (slice-4 behavior, unchanged).
+        # BOTH layers miss -> prescreen_skip -> no LLM call (the "宁漏勿炸"
+        # cost red line applies to the both-miss case only). Record the
+        # decision on self._plan_probe_last_decision so the sync_turn live
+        # path can audit WHY a report was/wasn't probed ("prescreen_pass" /
+        # "prescreen_skip").
         content_lower = (content or "").lower()
-        has_signal = any(re.search(pat, content_lower)
-                         for pat in _MEMORY_TYPE_REGEX.get("plan", ()))
-        if not has_signal:
+        struct_hit = any(s.lower() in content_lower for s in _PLAN_LAND_SIGNALS)
+        plan_hit = any(re.search(pat, content_lower)
+                       for pat in _MEMORY_TYPE_REGEX.get("plan", ()))
+        _plan_probe_last_decision = (
+            "prescreen_pass" if (struct_hit or plan_hit) else "prescreen_skip"
+        )
+        try:
+            self._plan_probe_last_decision = _plan_probe_last_decision
+            self._plan_probe_last_seen = (
+                content if (struct_hit or plan_hit) else None)
+        except Exception:
+            pass  # partial instance (__new__ in tests without the attrs)
+        if not (struct_hit or plan_hit):
             return None
         try:
             llm = _load_llm_caller()

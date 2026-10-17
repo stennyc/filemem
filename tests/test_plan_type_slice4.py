@@ -38,9 +38,13 @@ Portability: no absolute paths; provider shells are `__new__` where possible;
 llm_caller constants are module-level (zero I/O); the probe LLM face is
 exercised through the loader-seam monkeypatch used by the slice-2 tests.
 """
+import copy
+import re
 import sys
+import threading
 import pathlib
 import json
+import types
 from pathlib import Path
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -48,6 +52,31 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import pytest
 import __init__ as fm
 from __init__ import FileMemProvider, MEMORY_TYPES
+from consolidation import DECAY_DEFAULTS
+
+
+def _noop_router():
+    r = types.SimpleNamespace()
+    r.detect_and_route = lambda content: {"level": None}
+    return r
+
+
+def _make_store(tmp, sid):
+    store = tmp / "filemem" / sid
+    for sub in ("memories", "sessions", "episodic", "consolidated",
+                "knowledge", "knowledge/archive", "knowledge/export",
+                "local_semantic"):
+        (store / sub).mkdir(parents=True, exist_ok=True)
+    for t in MEMORY_TYPES:
+        (store / "memories" / f"{t}.json").write_text(
+            json.dumps([], ensure_ascii=False, indent=2), encoding="utf-8")
+    return store
+
+
+def _make_home(tmp, letter="h"):
+    home = tmp / letter / "home"
+    (home / "memories").mkdir(parents=True, exist_ok=True)
+    return home
 from consolidation.llm_caller import (
     TYPE_CLASSIFY_SCHEMA,
     TYPE_CLASSIFY_INSTRUCTIONS,
@@ -273,6 +302,236 @@ def test_probe_plan_charges_attempt_on_host_failure(monkeypatch):
     res2 = p._plan_probe("Implementation plan: Step 1, Step 2, Step 3")
     assert res2 is None
     assert calls == [], "over-budget (post-failure) probe must NOT re-issue the LLM call"
+
+
+# ── F4: live-path face — agent reports a spec/PRD landing (owner 2026-10-17) ─
+# Known-gap fix: _save_memory's probe trigger never sees the specs/ file write
+# (agent writes PRD to disk directly, not through the memory store). The live
+# path is this turn's ASSISTANT text reporting the landing. A joint pre-screen
+# (plan-signal word AND a spec/PRD-landing structure word) routes the text into
+# the SAME budget-gated _plan_probe face — no new LLM face, no auto-land.
+
+def test_plan_land_signals_table_exists():
+    """The structure-word table is module-level and non-empty (F4 pre-screen
+    layer A: a spec-landing report carries these words; the table is matched
+    as case-insensitive SUBSTRINGS, not regexes)."""
+    assert isinstance(fm._PLAN_LAND_SIGNALS, tuple) and len(fm._PLAN_LAND_SIGNALS) >= 3, \
+        "F4: _PLAN_LAND_SIGNALS table missing or too thin"
+    # the owner's own PRD vocabulary must be covered (the 2026-10-17 supercompress
+    # PRD used all of these; substring match, lower-cased):
+    for word in ("PRD 落地", "独立失败面", "逃生门", "TDD", "RED 锚", "specs/"):
+        assert any(word.lower() in s.lower() for s in fm._PLAN_LAND_SIGNALS), \
+            f"F4: _PLAN_LAND_SIGNALS does not cover {word!r}"
+
+
+def test_plan_probe_prescreen_passes_spec_landing_report():
+    """A PRD-landing assistant report passes the two-layer pre-screen
+    (structure word hit OR plan-signal word hit), so _plan_probe actually
+    issues the LLM call for it."""
+    p = _provider()
+    report = ("PRD 落地了。\n文件：/usr/local/lib/hermes-agent/plugins/context_engine/"
+              "supercompress/specs/水位递进带PRD-降档序90到55加90逃生门两面.md（新建 specs/ 目录、"
+              "18KB）。两条面彻底分开：A 面 sc 窗口膨胀，B 面 474k 宿主 refuse 卡死。"
+              "8 条 TDD RED 锚（T-A1/A2/A3 降档序 + T-B1/B2/B3 两面叠省）。"
+              "改动的 6 个点全在 sc 侧。")
+    p._plan_probe_budget = {}
+    p._plan_probe_limit = 3
+    p._plan_probe_last_decision = None
+    p._plan_probe_last_seen = None
+
+    calls = []
+
+    class RecordingLoader:
+        @staticmethod
+        def probe_plan(main_runtime, content):
+            calls.append(content)
+            return {"probe": False, "model_used": True}
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(p, "_live_main_runtime", lambda: {"model": "f", "provider": "f"})
+    monkeypatch.setattr(fm, "_load_llm_caller", lambda: RecordingLoader)
+    try:
+        p._plan_probe(report)
+    finally:
+        monkeypatch.undo()
+    assert calls, \
+        ("F4: a spec/PRD-landing report with plan-signal words must PASS the "
+         "pre-screen and reach the LLM probe face (joint signal, not just "
+         "the auto task/decision rows _save_memory sees)")
+
+
+def test_plan_probe_prescreen_blocks_plain_prose():
+    """Negative control: ordinary assistant prose without the joint signal
+    (no plan-signal word, no structure word) is NOT probed — zero LLM call."""
+    p = _provider()
+    p._plan_probe_budget = {}
+    p._plan_probe_limit = 3
+    p._plan_probe_last_decision = None
+    p._plan_probe_last_seen = None
+
+    calls = []
+
+    class RecordingLoader:
+        @staticmethod
+        def probe_plan(main_runtime, content):
+            calls.append(content)
+            return {"probe": True, "title": "t", "steps": ["a"], "done_when": "x"}
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(p, "_live_main_runtime", lambda: {"model": "f", "provider": "f"})
+    monkeypatch.setattr(fm, "_load_llm_caller", lambda: RecordingLoader)
+    try:
+        res = p._plan_probe("缓存命中率在压测后从 78% 升到 91%")
+    finally:
+        monkeypatch.undo()
+    assert res is None and calls == [], \
+        "F4: plain prose without the joint plan-signal+structure signal must NOT reach the LLM probe"
+
+
+def _make_provider(tmp, store, home, source_profile="coder", host_factory=None,
+                   session_id="s-e2e", auto_extract=False,
+                   decay=None):
+    """A synthetic provider wired for the sync_turn live path (no initialize();
+    the attrs below are what sync_turn touches). Mirrors the production
+    __new__ wiring the drain-path tests use, plus the plan-probe seam."""
+    p = FileMemProvider.__new__(FileMemProvider)
+    p._lock = threading.Lock()
+    p.session_id = session_id
+    p.source_profile = source_profile
+    p.hermetis_home = home
+    p.storage_dir = store
+    p.memories_dir = store / "memories"
+    p.sessions_dir = store / "sessions"
+    p.episodic_dir = store / "episodic"
+    p.pending_queue_path = store / "consolidated" / "pending_upgrades.jsonl"
+    p.knowledge_dir = store / "knowledge"
+    p.knowledge_entries_path = store / "knowledge" / "entries.json"
+    p.knowledge_raw_pending_path = store / "knowledge" / "raw_pending.json"
+    p.knowledge_archive_dir = store / "knowledge" / "archive"
+    p._decay = copy.deepcopy(decay) if decay is not None else copy.deepcopy(DECAY_DEFAULTS)
+    p._llm_ctx = None
+    p._main_runtime = None
+    p.trigger_router = _noop_router()
+    p._session_drafts = {}
+    p._last_recall = None
+    p._turn_marker_index = {}
+    p._turn_failure = {}
+    p._pending_failure_meta = {}
+    p._failure_recent = {}
+    p._rate_limited_queue = []
+    p._rate_limited_queue_cap = 100
+    p._turn_overflow_total = 0
+    p._last_save_time = 0.0
+    p._save_interval = 30
+    p._session_save_count = 0
+    p._pending_confirm = {}
+    p._pending_confirm_cap = 50
+    p._turn_self_test = False
+    p._turn_canary = False
+    p._turn_active_sid = session_id
+    p._session_hwm = {}
+    p._turn_report_line = lambda sid: ""
+    p._drain_seen = {}
+    p._drain_host_store_fn = host_factory
+    p.auto_extract = auto_extract
+    return p
+
+
+def test_plan_probe_prescreen_blocks_when_both_layers_miss(monkeypatch):
+    """Negative control (cost red line, '宁漏勿炸'): assistant prose that
+    misses BOTH pre-screen layers — no _PLAN_LAND_SIGNALS structure word AND
+    no _MEMORY_TYPE_REGEX["plan"] plan-signal word — is NOT probed, zero LLM
+    call. This is the both-miss case only; a hit on EITHER layer passes."""
+    p = _provider()
+    p._plan_probe_budget = {}
+    p._plan_probe_limit = 3
+    calls = []
+
+    class RecordingLoader:
+        @staticmethod
+        def probe_plan(main_runtime, content):
+            calls.append(content)
+            return {"probe": True, "title": "t", "steps": ["a"], "done_when": "x"}
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(p, "_live_main_runtime", lambda: {"model": "f", "provider": "f"})
+    monkeypatch.setattr(fm, "_load_llm_caller", lambda: RecordingLoader)
+    try:
+        res = p._plan_probe("查了，缓存命中率在压测后从 78% 升到 91%，不用改")
+    finally:
+        monkeypatch.undo()
+    assert res is None and calls == [], \
+        ("F4: prose with no structure word and no plan-signal word must NOT "
+         "reach the LLM probe (both layers miss = skip)")
+
+
+def test_plan_probe_prescreen_structure_word_sufficient_alone(monkeypatch):
+    """Layer A alone is sufficient: a structure word hit (e.g. '两条面') with
+    NO plan-signal word still passes the pre-screen and reaches the LLM probe
+    face — the LLM decides whether it is a genuine multi-step plan (the
+    pre-screen is a cost gate, not the verdict)."""
+    p = _provider()
+    p._plan_probe_budget = {}
+    p._plan_probe_limit = 3
+    calls = []
+
+    class RecordingLoader:
+        @staticmethod
+        def probe_plan(main_runtime, content):
+            calls.append(content)
+            return {"probe": False, "model_used": True}
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(p, "_live_main_runtime", lambda: {"model": "f", "provider": "f"})
+    monkeypatch.setattr(fm, "_load_llm_caller", lambda: RecordingLoader)
+    try:
+        p._plan_probe("两条面分开处理，A 面 sc 窗口，B 面宿主。")
+    finally:
+        monkeypatch.undo()
+    assert calls, \
+        "F4: a structure-word hit alone (layer A) must pass the pre-screen"
+
+
+def test_sync_turn_probes_spec_landing_assistant_report(monkeypatch, tmp_path):
+    """End-to-end live path: sync_turn whose assistant text reports a specs/
+    PRD landing (joint signal present) issues the probe face once for the
+    report, and a no-signal assistant turn issues zero probes. This is the
+    face the 2026-10-17 supercompress PRD turn was supposed to hit and missed
+    (owner catch: 'filemem 还是没有触发 LLM 询问用户是否保存')."""
+    store = _make_store(tmp_path, "s-e2e")
+    home = _make_home(tmp_path, "h-e2e")
+    p = _make_provider(tmp_path, store, home, session_id="s-e2e")
+    p._plan_probe_budget = {}
+    p._plan_probe_limit = 3
+    p._plan_probe_last_decision = None
+    p._plan_probe_last_seen = None
+    p._plan_probe_marker_pushed = []
+
+    class RecordingLoader:
+        @staticmethod
+        def probe_plan(main_runtime, content):
+            return {"probe": False, "model_used": True}
+
+    monkeypatch.setattr(p, "_live_main_runtime", lambda: {"model": "f", "provider": "f"})
+    monkeypatch.setattr(fm, "_load_llm_caller", lambda: RecordingLoader)
+    monkeypatch.setattr(p, "_plan_probe_push", lambda m: p._plan_probe_marker_pushed.append(m))
+
+    report = ("PRD 落地了。文件：/root/specs/水位递进带PRD-降档序.md（新建 specs/ 目录）。"
+              "两条面彻底分开：A 面 sc 窗口膨胀，B 面 474k 宿主 refuse。"
+              "8 条 TDD RED 锚 + 6 个改动点全在 sc 侧。")
+    p.sync_turn("改 supercompress 水位", report)
+    assert p._plan_probe_last_seen == report, \
+        "F4: sync_turn must feed the spec-landing assistant report into the plan probe"
+    assert p._plan_probe_last_decision == "prescreen_pass", \
+        f"F4: joint-signal report must pass the pre-screen (got {p._plan_probe_last_decision!r})"
+
+    # negative control: a turn whose assistant text has NO joint signal -> skipped
+    p._plan_probe_last_decision = None
+    p._plan_probe_last_seen = None
+    p.sync_turn("查了个配置", "查了，缓存命中率 91%，不用改")
+    assert p._plan_probe_last_decision == "prescreen_skip", \
+        f"F4: no-signal assistant turn must NOT reach the probe face (got {p._plan_probe_last_decision!r})"
+    assert p._plan_probe_last_seen is None
 
 
 if __name__ == "__main__":

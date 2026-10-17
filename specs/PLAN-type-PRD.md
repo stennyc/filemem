@@ -161,15 +161,36 @@ commit 信号 → 在 `_save_memory` 落盘前 clarify）被 probe + clarify 面
 原因是 §1.4 把 plan 从分类/regex 面移除后，`_detect_type` 不再返 plan，
 `mem_type == "plan"` 的写门分支不复存在。新门如下：
 
-**触发**：`_save_memory` 的 auto 来源行落到 `task` / `decision` 分片，且
-内容带 regex plan-signal（`_MEMORY_TYPE_REGEX["plan"]`，slice-4 后仅作
-pre-screen 信号）→ post-lock、out-of-lock 跑 `_plan_probe`（与 distill 同
-姿态，host LLM 不坐锁内）。
+**触发**（两个独立挂点，各自独立锚，不混）：
+
+**挂点 A（slice-4，auto 行出口）**：`_save_memory` 的 auto 来源行落到
+`task` / `decision` 分片 → post-lock、out-of-lock 跑 `_plan_probe`（与
+distill 同姿态，host LLM 不坐锁内）。
+**挂点 B（slice-5 F4，owner 2026-10-17 "补活路"）**：agent 写 spec/PRD
+文件是**直接落盘**（write_file/patch），从不经过记忆存储，所以挂点 A
+结构性地看不见它（supercompress PRD 轮验证：`probe_plan` 调用 0 次、
+`plan_probe` 审计行 0 条）。活路是**本轮 assistant 文本**报落盘那一刻
+（"PRD 落地了。文件：/…/specs/水位递进带PRD.md … 8 条 TDD RED 锚"）——
+`sync_turn` 轮末（turn-close B4 fallback 之后）对 `assistant_content`
+跑同一个 budget-gated `_plan_probe`，outside any write lock（与 distill
+LLM pass 同姿态）。命中推 PENDING marker 走 clarify 通道，下一 turn 的
+[记忆报告] 列出，用户定存/不存。零自动落盘（owner 裁决，slice-4 继承）。
 
 **判定**：`_plan_probe` 是唯一的 plan 候选 LLM 面。预算门（per-session
-cap，超 cap 不发 LLM 调用）+ pre-screen（零 signal 不发调用）+ fail-soft
+cap，超 cap 不发 LLM 调用）+ 双层 pre-screen（slice-5 F4，**任一层命中
+即过闸**——两层是 OR 不是 AND：AND 门会挂掉 slice-4 既有行为，plan-signal
+词单独就够触发；pre-screen 只是成本闸，最终判定归 LLM）+ fail-soft
 （host-down / miss / over-budget -> None，task/decision 行照常落盘，不阻塞
-宿主）。命中 LLM 回 `probe=true` + 结构化的 `{title, steps, done_when}` 时，
+宿主）：
+- **layer A（强）**：`_PLAN_LAND_SIGNALS`（模块级词表，spec 落盘结构词：
+  "PRD 落地"、"specs/"、"独立失败面"、"逃生门"、"TDD RED 锚" …）。单条
+  命中 = agent 在报 spec/PRD 落盘，是最强 plan 信号，单独足够过闸。
+- **layer B（弱）**：`_MEMORY_TYPE_REGEX["plan"]`（plan-signal 词："步骤N"、
+  "落地方案"、"实施计划" …）。单独命中也过闸（slice-4 行为不变）。
+- **两层都 miss** -> `prescreen_skip` -> 不发 LLM 调用（成本红线，"宁漏
+  勿炸"只适用于双 miss 情形）。判定记在 `self._plan_probe_last_decision`
+  （"prescreen_pass"/"prescreen_skip"），`_plan_probe_last_seen` 记被探测
+  的原文，供活路审计。命中 LLM 回 `probe=true` + 结构化的 `{title, steps, done_when}` 时，
 产一个 PENDING PROBE marker（**不写行**），经 clarify 通道
 （`_push_pending_confirm(kind="plan_probe")`）在下一 turn 的 [记忆报告] 列出，
 问用户"是否存为持久 plan 记忆"。
@@ -659,8 +680,10 @@ plan 行 metadata 内 `progress_log[]`（保留最近 10 条）：
 | `__init__.py` `_MEMORY_TYPE_REGEX` | 加 `"plan"` 条目（§1.3，slice-4 后仅作 probe pre-screen 信号） |
 | `__init__.py` `_detect_type` | **slice-4**：不再 verdict `"plan"`（plan regex 行改路由到 `task`） |
 | `__init__.py` `_reclassify_type_llm` | **slice-4**：verdict 接受集**排除** `"plan"`（load-bearing 层） |
-| `__init__.py` 新 | `_plan_probe` + `_plan_probe_push`（§2 slice-4 的 probe + clarify 面） |
-| `__init__.py` `_save_memory` | **slice-4**：auto task/decision 行出口挂 probe（post-lock，与 distill 同段） |
+| `__init__.py` 新 | `_PLAN_LAND_SIGNALS`（§2 slice-5 F4：spec 落盘结构词表，pre-screen layer A） |
+| `__init__.py` 新 | `_plan_probe` + `_plan_probe_push`（§2 slice-4 的 probe + clarify 面；slice-5 F4 改双层 pre-screen） |
+| `__init__.py` `_save_memory` | **slice-4**：auto task/decision 行出口挂 probe（挂点 A，post-lock，与 distill 同段） |
+| `__init__.py` `sync_turn` | **slice-5 F4**：轮末 assistant 文本挂 probe（挂点 B，turn-close B4 fallback 之后，活路） |
 | `__init__.py` `filemem_review_drafts` | **slice-4**：`action="plan_probe"` 消费分支（save -> `_plan_create`，dismiss -> 不写） |
 | `__init__.py` 新 | `filemem_plan` 工具（list/create/advance + 9 op，§6） |
 | `__init__.py` 新 | plan 行 upsert 语义（同 plan_id 合并）+ anchor 强制校验 |
