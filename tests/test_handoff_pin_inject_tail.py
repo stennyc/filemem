@@ -23,6 +23,17 @@ T 系列（pin → tail 摘要注入）：
   T4: auto 腿（无 pin）→ 摘要不生成、不 append（owner 裁决①，字节级回归）。
   T5: pin 跨 profile / 无效 → 回退 auto 腿，不为该 pin 生成摘要。
 
+T7: `HANDOFF_INSTRUCTIONS` 语义修正（owner 2026-10-17：交接摘要重点应
+    落在 session 末端——正在处理 + 未完成任务，不是平均摘全篇）：
+      a. 必须含"末端 / 最后几轮 / 未完成 / 正在处理"的强调性指令（不
+         是平铺清单——LLM 要被告知"重点在尾部"）。
+      b. 材料源描述必须含"session 对话流水 / turns"（pin→tail 面实际
+         喂的是 session jsonl，不是 compact ledger；原 Context 行描述
+         错配）。
+T8: `_pin_handoff_bundle` 尾部加权不变式：取 `turns[-40:]`（最近 40 轮）
+    而非全篇，且 `user_query` 取最后一个 user turn（"用户最后说啥"是
+    判断"当前任务"最强信号）——回归哨兵，锁死尾部偏重行为。
+
 C 系列（clarify 面收窄）：
   C1: user 消息含【已知 closed】sid → footer 抑制（返回 ''）+ 记 pin 意图。
   C2: user 消息无 sid 形态 token（"接着干"）→ footer 照旧弹（回归哨兵）。
@@ -293,6 +304,68 @@ def test_t6_pin_dedupes_double_logged_turns(tmp_path, monkeypatch):
     assert len(mat["turns"]) == 2, mat
     assert mat["dupes_dropped"] == 2, mat
     assert [t["content"] for t in mat["turns"]] == ["turn-A", "turn-B"]
+
+
+def test_t7_handoff_instructions_emphasize_tail_not_flat(tmp_path):
+    """owner 2026-10-17: the handoff summary must EMPHASIZE the session tail
+    (in-flight / unfinished work) — not a flat even-weighted digest of the
+    whole transcript. Assert the LLM instructions carry the tail-priority
+    directive AND describe the actual material source (session conversation
+    turns, not the compact ledger the stale Context line referenced)."""
+    import sys
+    sys.path.insert(0, ".")
+    from consolidation.llm_caller import HANDOFF_INSTRUCTIONS
+    low = HANDOFF_INSTRUCTIONS.lower()
+    # tail emphasis present: EXPLICIT weighting of the session END
+    # (in-flight / unfinished) — not just the word "in-flight" sitting in a
+    # flat "cover X" list (that is the pre-fix prompt, which let this pass
+    # spuriously):
+    assert any(k in low for k in ("emphasis", "focus on the", "emphasize the",
+                                  "weight", "prioriti", "most important",
+                                  "key to", "primary focus")), \
+        f"HANDOFF_INSTRUCTIONS must carry an EXPLICIT tail-emphasis directive; got:\n{HANDOFF_INSTRUCTIONS}"
+    # and the word "in-flight" must appear in that emphasis context, not only
+    # as one item among equals:
+    assert "in-flight" in low, "in-flight (unfinished work) must remain named"
+    # material source describes session conversation (pin->tail face):
+    assert any(k in low for k in ("conversation", "turns", "transcript",
+                                  "session log", "jsonl")), \
+        f"HANDOFF_INSTRUCTIONS Context must describe the session conversation " \
+        f"turns, not the compact ledger; got:\n{HANDOFF_INSTRUCTIONS}"
+
+
+def test_t8_pin_handoff_bundle_tail_weighted(tmp_path):
+    """Layering: gather returns the FULL dedup'd turn list; the BUNDLE layer
+    applies the last-40 truncation AND the tail-priority directive (owner
+    2026-10-17: summary must emphasize the session END — in-flight +
+    unfinished work, not an even-weighted digest). The bundle is a prompt
+    string: it carries only the last 40 turns, and its closing instruction
+    must carry the tail-emphasis semantics."""
+    _stale_close(tmp_path, "s_tail")
+    turns = [{"role": "user", "content": f"turn-{i}", "assistant": f"r{i}"}
+             for i in range(1, 60)]  # 59 turns
+    _write_session_jsonl(tmp_path, "s_tail", turns=turns)
+    p = _make_provider(tmp_path, sid="s_cur", profile="default")
+
+    # gather layer returns the full dedup'd list (no tail truncation):
+    mat = p._gather_pin_handoff_from_session_jsonl("s_tail")
+    assert len(mat["turns"]) == 59, f"gather layer must return full list; got {len(mat['turns'])}"
+    assert mat["turns"][0]["content"] == "turn-1" and mat["turns"][-1]["content"] == "turn-59"
+
+    # bundle layer: last-40 only + tail-priority directive in the prompt:
+    bundle = p._pin_handoff_bundle("s_tail", mat["turns"])
+    assert isinstance(bundle, str), "bundle must be the LLM prompt string"
+    # tail turns present, early turns dropped:
+    assert "turn-59" in bundle and "turn-20" in bundle
+    assert "turn-1" not in bundle and "turn-10" not in bundle, (
+        "bundle must cap to last-40 turns; early turns must be dropped")
+    # the owner's emphasis: the prompt must carry an EXPLICIT tail-priority
+    # directive (PRIMARY FOCUS on the most recent turns / in-flight work),
+    # not just the word "stopped" among equals:
+    low = bundle.lower()
+    assert any(k in low for k in ("primary focus", "most recent", "focus on",
+                                  "emphasize", "in flight", "not yet complete")), \
+        f"bundle prompt must carry an explicit tail-priority directive; got tail: {bundle[-500:]}"
 
 
 def test_t4_auto_leg_generates_no_summary(tmp_path):

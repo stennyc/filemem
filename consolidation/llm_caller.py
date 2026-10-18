@@ -290,21 +290,25 @@ HANDOFF_INSTRUCTIONS = """
 You are writing a HANDOFF summary for a dead or deadlocked agent session so a
 NEW session can continue the work without re-reading the whole transcript.
 
-Context: The material bundle below combines the session's supercompress compact
-ledger segments (task state / next steps / red lines) and its confirmed
-filemem rows (decisions / preferences). When focus-filtered raw lines are
-present they mark the user's stated interest area.
+Context: The material bundle below is the source session's recorded state
+(its conversation turns / compact-ledger segments / confirmed memory rows,
+most recent LAST). The final entries are where the session actually stopped;
+earlier entries are context, not the focus. When a focus-filtered raw line is
+present it marks the user's stated interest area.
 
 Output JSON:
 {
-  "summary": "handoff text (target ~800 chars, max 4000 chars hard limit): current task state, in-flight work, next concrete steps, open decisions / red lines, and anything the continuing session must NOT redo",
+  "summary": "handoff text (target ~800 chars, max 4000 chars hard limit). PRIMARY FOCUS is the session's tail: what was IN-FLIGHT or NOT yet complete, where it stopped, and the very next concrete step. Completed work gets a one-line 'done so far' line only — do not re-summarize settled history. Also carry open decisions / red lines and what the continuing session must NOT redo.",
   "confirmed": boolean
 }
 
 Rules:
-- Cover: task state / in-flight work / next steps / open items / red lines.
-- Never hallucinate — only summarize what the material bundle states.
-- 'confirmed' true only when the bundle is coherent enough to hand off on.
+- Emphasize the session END: in-flight / unfinished work + next step are the
+  most important content. Treat earlier (completed) entries as context, not
+  the main thread — one line for 'done so far', spend the budget on what is
+  still open.
+- Never hallucinate — only summarize what the material states.
+- 'confirmed' true only when the material is coherent enough to hand off on.
 """
 
 HANDOFF_SCHEMA = {
