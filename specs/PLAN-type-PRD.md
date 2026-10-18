@@ -204,6 +204,15 @@ LLM pass 同姿态）。命中推 PENDING marker 走 clarify 通道，下一 tur
 
 `sync_turn` 挂点逻辑：文件探针优先（有 spec/plan 特征写路径就喂文件正文），
 没产出 marker 才回退 slice-5 文本探针（裸"PRD 落地了"转述仍能被接住）。
+**两个子触发互不 gate（缺陷修，reviewer NOTE-1 2026-10-18）**：5 步链
+（文件探针）只依赖宿主 transcript 的 `tool_calls`，因此 `assistant_content`
+为空/None 的"静默落盘"轮（agent 纯 write_file、正文没说话）也必须跑——
+`sync_turn` 外层闸是 `if not self._turn_foreign`（不判 `assistant_content`）；
+而 slice-5 文本探针（fallback）判的是正文，故只在 `assistant_content` 非空时
+才回退（`if assistant_content and not _file_marker_pushed`）。修前两个子触发
+都挂在 `if assistant_content and ...` 下，静默落盘轮被整段跳过——恰是
+owner 最在意的"默默落盘"场景活路断点。新增锚
+`test_sync_turn_file_probe_fires_when_assistant_body_empty`。
 
 **判定**：`_plan_probe` 是唯一的 plan 候选 LLM 面。预算门（per-session
 cap，超 cap 不发 LLM 调用）+ 双层 pre-screen（slice-5 F4，**任一层命中

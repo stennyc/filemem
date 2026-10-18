@@ -715,5 +715,59 @@ def test_sync_turn_feeds_file_body_to_probe(tmp_path, monkeypatch):
         "slice-6: a probe hit must push a PENDING marker for the clarify channel"
 
 
+def test_sync_turn_file_probe_fires_when_assistant_body_empty(tmp_path, monkeypatch):
+    """Defect fix (reviewer NOTE-1, 2026-10-18): the 5-step chain must run even
+    when the agent silently write_file's a spec/PRD and says NOTHING in the
+    assistant body. The host transcript's tool_calls is the only source of truth
+    for what was written — an empty assistant_content must NOT skip the file
+    probe. Before the fix, sync_turn gated the whole block on
+    `if assistant_content and ...`, so a tool_calls-only turn (assistant said
+    nothing) skipped _extract_plan_write_paths entirely."""
+    spec_dir = tmp_path / "specs"
+    spec_dir.mkdir()
+    plan_md = spec_dir / "水位递进带PRD-静默落盘.md"
+    plan_md.write_text(
+        "# 水位递进带 PRD\n步骤S1：降档分档骨架\n步骤S2：账本旧页 evict\n"
+        "完成条件：全绿 + 宿主零 diff\n", encoding="utf-8")
+    store = _make_store(tmp_path / "store", "s-silent")
+    home = _make_home(tmp_path / "home", "h-silent")
+    p = _make_provider(tmp_path, store, home, session_id="s-silent")
+    p._plan_probe_budget = {}
+    p._plan_probe_limit = 3
+    p._plan_probe_marker_pushed = []
+
+    fed = []
+
+    class RecordingLoader:
+        @staticmethod
+        def probe_plan(main_runtime, content):
+            fed.append(content)
+            return {"probe": True, "title": "水位递进带 PRD",
+                    "steps": ["降档分档", "旧页 evict"],
+                    "done_when": "全绿", "model_used": True}
+
+    monkeypatch.setattr(p, "_live_main_runtime", lambda: {"model": "f", "provider": "f"})
+    monkeypatch.setattr(fm, "_load_llm_caller", lambda: RecordingLoader)
+    monkeypatch.setattr(p, "_plan_probe_push", lambda m: p._plan_probe_marker_pushed.append(m))
+
+    # assistant turn: tool_calls populated, body is EMPTY (the silent-落盘 case).
+    history = [
+        {"role": "user", "content": "出一份降档 PRD"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "write_file",
+                          "arguments": json.dumps({"path": str(plan_md), "content": "# 水位递进带 PRD"})}},
+        ]},
+    ]
+    # assistant_content = "" (falsy) → pre-fix this turn skipped the file probe.
+    p.sync_turn("出一份降档 PRD", "", session_id="s-silent", messages=history)
+    assert fed, \
+        ("defect NOTE-1: a silent write_file turn (empty assistant body) "
+         "must still fire the 5-step file probe")
+    assert any("降档分档" in c for c in fed), \
+        "defect NOTE-1: the probe LLM must receive the file body on a silent-落盘 turn"
+    assert p._plan_probe_marker_pushed, \
+        "defect NOTE-1: a silent-落盘 turn must still push a PENDING marker"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

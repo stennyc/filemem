@@ -5441,15 +5441,26 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # OR plan-signal word) is the cost gate; a miss is a silent no-op,
         # a hit pushes a PENDING marker through the clarify channel so the
         # NEXT turn's [记忆报告] lists it and the user decides save/dismiss.
-        # No auto-land (owner ruling, inherited from slice-4: the probe is the
-        # ONLY writer of the plan shard, and only via a confirmed nod).
-        if assistant_content and not self._turn_foreign:
+        # (owner ruling, inherited from slice-4: the probe is the ONLY writer
+        # of the plan shard, and only via a confirmed nod).
+        #
+        # Two independent sub-triggers, NOT gated on each other (defect fix
+        # reviewer NOTE-1, 2026-10-18):
+        #   - 5-step chain (file probe) depends ONLY on the host transcript's
+        #     tool_calls — an agent that silently write_file's a spec/PRD and
+        #     says nothing in the assistant body MUST still be caught, so this
+        #     sub-trigger runs whenever not _turn_foreign, regardless of
+        #     assistant_content.
+        #   - slice-5 text probe (fallback) judges the assistant's report text,
+        #     so it runs only when assistant_content is non-empty.
+        if not self._turn_foreign:
             try:
                 # t_plan_slice6: 5-step chain — capture plan/spec write-paths
                 # from the host transcript, read each file head, and feed the
                 # FILE BODY to the LLM probe face (not just the assistant's
                 # one-line report). The host transcript is the only source of
-                # truth for what files were written this turn.
+                # truth for what files were written this turn. Runs even when
+                # the assistant said nothing (tool_calls-only turn).
                 _file_marker_pushed = False
                 if messages:
                     for _sp in self._extract_plan_write_paths(messages):
@@ -5465,12 +5476,13 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                                 f"(title={_file_marker.get('title')!r})")
                             _file_marker_pushed = True
                             break
-                if not _file_marker_pushed:
-                    # No spec-file probe produced a marker this turn → fall
-                    # back to the slice-5 text probe so a bare "PRD 落地了"
-                    # report is still caught. _plan_probe's two-layer
-                    # pre-screen (structure word OR plan-signal word) is the
-                    # cost gate; a miss is a silent no-op.
+                if assistant_content and not _file_marker_pushed:
+                    # No spec-file probe produced a marker this turn AND the
+                    # assistant actually reported something → fall back to the
+                    # slice-5 text probe so a bare "PRD 落地了" report is still
+                    # caught. _plan_probe's two-layer pre-screen (structure
+                    # word OR plan-signal word) is the cost gate; a miss is a
+                    # silent no-op.
                     _marker = self._plan_probe(assistant_content)
                     if _marker is not None:
                         self._plan_probe_push(_marker)
@@ -14326,11 +14338,15 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
             lines.append("")
         lines.append(
             "Write a HANDOFF summary so a NEW session can continue this work "
-            "without re-reading the transcript. Cover: what task was in "
-            "flight, the current state, the next concrete step, any open "
-            "decisions / red lines, and what the continuing session must NOT "
-            "redo. Stick to what the turns state — never hallucinate. Drop "
-            "off-topic chatter; keep only the session's main task thread.")
+            "without re-reading the transcript. PRIMARY FOCUS is the most "
+            "RECENT turns: what was still in flight or NOT yet complete where "
+            "the session stopped, and the very next concrete step. Earlier, "
+            "already-finished turns get a single 'done so far' line only — do "
+            "not re-summarize settled history; spend the summary budget on what "
+            "is still open. Also carry open decisions / red lines and what the "
+            "continuing session must NOT redo. Stick to what the turns state — "
+            "never hallucinate. Drop off-topic chatter; keep only the "
+            "session's main task thread.")
         return "\n".join(lines)
 
     def _pin_handoff_fallback(self, source_sid: str,
