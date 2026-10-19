@@ -91,6 +91,16 @@ _cache_lock = threading.Lock()
 # None — the standalone pre-register state keeps today's exact behavior:
 # _llm_ctx None -> the 7 segments skip, not error).
 _HOST_LLM_CTX = None
+# Multiplex fix: the module singletons above are process-global, so a
+# multiplexed gateway (N profiles, one process) lets the LAST register()
+# win and bleed its ctx into every other profile's instances. The per-home
+# dicts below are the primary store: register() writes the ctx under the
+# CURRENT profile's home, and the hooks / instance init / live-read look
+# up by the provider's OWN home, so profile A's ctx never reaches profile
+# B. The module globals remain as a fallback ONLY when no per-home entry
+# exists yet (standalone / legacy single-profile / pre-register), keeping
+# today's exact behavior when a home never registered.
+_HOST_LLM_CTX_BY_HOME: Dict[str, Any] = {}
 
 # LLM 显式化◎ (t_32980f71): host main_runtime SNAPSHOT, module-level
 # inheritance — same level as _HOST_LLM_CTX above.
@@ -111,6 +121,14 @@ _HOST_LLM_CTX = None
 # BEFORE register() (same no-clobber-when-None rule as _llm_ctx).
 # Epic card 2's 5 LLM call sites consume provider._main_runtime.
 _HOST_MAIN_RUNTIME = None
+# Multiplex fix: per-profile home-keyed main_runtime snapshot (same
+# rationale as _HOST_LLM_CTX_BY_HOME). register() writes the captured
+# snapshot under the CURRENT profile's home; the LLM faces look up by the
+# provider's own home so a multiplexed gateway's per-profile main-model
+# config (which can differ across profiles) never bleeds cross-profile.
+# The module global above is retained as a fallback for the
+# standalone/legacy single-profile case (no per-home entry yet).
+_HOST_MAIN_RUNTIME_BY_HOME: Dict[str, Any] = {}
 
 # Memory types
 MEMORY_TYPES = ["preference", "fact", "decision", "task", "plan"]
@@ -13278,6 +13296,12 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                 if got:
                     self._main_runtime = got
                     _HOST_MAIN_RUNTIME = got  # persist: binder success benefits all
+                    # Multiplex fix: also persist under THIS profile's home
+                    # (per-home dict is the primary source; module global
+                    # remains the cross-profile fallback).
+                    _hk = _home_key(self)
+                    if _hk is not None:
+                        _HOST_MAIN_RUNTIME_BY_HOME[_hk] = got
                     return got
             except Exception:
                 pass
@@ -13285,9 +13309,16 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         # runtime (set_runtime_main leaks it into the module-level contextvar
         # via _publish_runtime_main_mirrors on the executor thread, visible to
         # any thread that reads _RUNTIME_MAIN_CONTEXT after the publish).
-        if _HOST_MAIN_RUNTIME:
-            self._main_runtime = _HOST_MAIN_RUNTIME
-            return _HOST_MAIN_RUNTIME
+        # Multiplex fix: per-home snapshot takes precedence; the module
+        # global is only the cross-profile fallback.
+        _hk = _home_key(self)
+        fallback = (
+            _HOST_MAIN_RUNTIME_BY_HOME.get(_hk)
+            if _hk is not None else None
+        ) or _HOST_MAIN_RUNTIME
+        if fallback:
+            self._main_runtime = fallback
+            return fallback
         return None
 
     def _rebind_main_runtime(self) -> None:
@@ -13348,11 +13379,20 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                 resolved = None
         if resolved is not None:
             source = "tick_live"
-        elif _HOST_MAIN_RUNTIME is not None:
-            resolved = _HOST_MAIN_RUNTIME
-            source = "module_fallback"
         else:
-            source = "none"
+            # Multiplex fix: per-home snapshot takes precedence (this profile's
+            # own main_runtime, captured at register / post_llm_call); the
+            # module global is the cross-profile fallback.
+            _hk = _home_key(self)
+            fallback = (
+                _HOST_MAIN_RUNTIME_BY_HOME.get(_hk)
+                if _hk is not None else None
+            ) or _HOST_MAIN_RUNTIME
+            if fallback is not None:
+                resolved = fallback
+                source = "module_fallback"
+            else:
+                source = "none"
         if resolved is not None:
             self._main_runtime = resolved
         # One audit row per outcome (overwrite / fallback / keep-None),
@@ -14933,27 +14973,56 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
 
 # ── Auto-Retrieve Hook ───────────────────────────────────────────────────────────
 
+def _resolve_current_hermes_home() -> Path:
+    """Resolve the current profile's hermes_home (multiplex-aware, O6 forward-fix).
+
+    Uses hermes_constants.get_hermes_home() (context-local, set per-profile via
+    HERMES_HOME override at session start) when available; falls back to the
+    legacy desktop home Path.home()/.hermes on standalone interpreters
+    (zero-dep, no crash). Forward-only: only new instances get the corrected
+    home; no historical memories/*.json row is re-stamped.
+
+    Shared by register() (home-scoped cache key for multiplexed gateways) and
+    _get_cached_provider (instance initialization) — one source of truth.
+    """
+    home = Path.home() / ".hermes"
+    try:
+        from hermes_constants import get_hermes_home
+        resolved = get_hermes_home()
+        if resolved:
+            home = Path(resolved)
+    except Exception:
+        pass
+    return home
+
+
+def _home_key(provider_or_home) -> Optional[str]:
+    """Multiplex fix: the per-home ctx-dict key for a provider instance
+    (its own resolved hermes_home as a string) — or None when the instance
+    has no home yet (pre-initialize / a bare standalone instance). A None
+    key means "no per-home entry" -> the caller falls back to the module
+    global (today's exact standalone behavior).
+
+    Dict keys are typed ``str``; the helper returns ``Optional[str]`` so
+    callers can guard with ``if key is not None`` (never setitem/lookup
+    with a None key — that would be a KeyError on a typed dict)."""
+    home = getattr(provider_or_home, "hermetis_home", None)
+    if home is None:
+        return None
+    try:
+        return str(Path(home))
+    except Exception:  # pragma: no cover - fail-soft
+        return str(home)
+
+
 def _get_cached_provider(session_id: str) -> FileMemProvider:
     """Get or create a cached provider instance for the session."""
     with _cache_lock:
         if session_id not in _provider_cache:
             provider = FileMemProvider()
-            # O6 forward-fix: resolve the CURRENT profile's home from the engine's
-            # context-local get_hermes_home() (set per-profile via HERMES_HOME
-            # override at session start), NOT the hardcoded desktop/default
-            # Path.home()/.hermes (which froze source_profile to the launch
-            # profile under multiplex). Forward-only: only new instances get the
-            # corrected home; no historical memories/*.json row is re-stamped.
-            # Graceful fallback: standalone/older interpreters without
-            # hermes_constants keep the legacy desktop home (zero-dep, no crash).
-            hermes_home = Path.home() / ".hermes"
-            try:
-                from hermes_constants import get_hermes_home
-                resolved = get_hermes_home()
-                if resolved:
-                    hermes_home = Path(resolved)
-            except Exception:
-                pass
+            # O6 forward-fix: resolve the CURRENT profile's home (multiplex-aware,
+            # see _resolve_current_hermes_home docstring). Forward-only.
+            hermes_home = _resolve_current_hermes_home()
             provider.initialize(session_id, hermes_home=hermes_home)
             # S1b F3: propagate the module-level host LLM ctx (set at
             # register() time) to the NEW instance — before S1b, every
@@ -14962,11 +15031,18 @@ def _get_cached_provider(session_id: str) -> FileMemProvider:
             # When _HOST_LLM_CTX is None (standalone, pre-register) this is
             # a no-op: the instance keeps today's exact _llm_ctx-None
             # behavior (7 segments skip, not error).
-            provider._llm_ctx = _HOST_LLM_CTX
-            # LLM 显式化◎: propagate the host main_runtime snapshot the same
-            # way (None in standalone -> instances keep their default None;
-            # the LLM faces keep today's exact skip semantics).
-            provider._main_runtime = _HOST_MAIN_RUNTIME
+            # Multiplex fix: per-home ctx takes precedence (this instance's
+            # own profile's ctx); the module global is only the fallback
+            # for a home that never registered (standalone / legacy).
+            _hkey = _home_key(provider)
+            provider._llm_ctx = (
+                _HOST_LLM_CTX_BY_HOME.get(_hkey)
+                if _hkey is not None else None
+            ) or _HOST_LLM_CTX
+            provider._main_runtime = (
+                _HOST_MAIN_RUNTIME_BY_HOME.get(_hkey)
+                if _hkey is not None else None
+            ) or _HOST_MAIN_RUNTIME
             _provider_cache[session_id] = provider
         return _provider_cache[session_id]
 
@@ -14981,11 +15057,28 @@ def _refresh_provider_llm_ctx(provider: "FileMemProvider") -> None:
 
     LLM 显式化◎: the same no-clobber-when-None refresh is applied to the
     host main_runtime snapshot (_HOST_MAIN_RUNTIME -> provider._main_runtime)
-    so the runtime face closes the same P2 boundary-face window."""
-    host_ctx = _HOST_LLM_CTX
+    so the runtime face closes the same P2 boundary-face window.
+
+    Multiplex fix: the per-home dicts are the primary source (this provider's
+    own profile's ctx / runtime); the module globals are the fallback ONLY
+    when the provider has no home or that home never registered (standalone
+    / legacy single-profile). The no-clobber-when-None rule is preserved:
+    a missing / None value never overwrites a bound ctx."""
+    _hkey = _home_key(provider)
+    host_ctx = (
+        _HOST_LLM_CTX_BY_HOME.get(_hkey)
+        if _hkey is not None else None
+    )
+    if host_ctx is None:
+        host_ctx = _HOST_LLM_CTX  # module fallback (standalone / legacy)
     if host_ctx is not None:
         provider._llm_ctx = host_ctx
-    host_runtime = _HOST_MAIN_RUNTIME
+    host_runtime = (
+        _HOST_MAIN_RUNTIME_BY_HOME.get(_hkey)
+        if _hkey is not None else None
+    )
+    if host_runtime is None:
+        host_runtime = _HOST_MAIN_RUNTIME  # module fallback
     if host_runtime is not None:
         provider._main_runtime = host_runtime
 
@@ -15048,12 +15141,19 @@ def filemem_auto_catch(session_id: str, user_message: str, assistant_response: s
         # Live-read NOW (post-turn moment) + write back to the module
         # variable: every tick thread that calls _live_main_runtime()
         # hits the module fallback (level c) 100%.
-        global _HOST_MAIN_RUNTIME
+        global _HOST_MAIN_RUNTIME, _HOST_MAIN_RUNTIME_BY_HOME
         if _normalize_main_runtime is not None:
             try:
                 live_rt = _normalize_main_runtime(None)
                 if live_rt:
                     _HOST_MAIN_RUNTIME = live_rt
+                    # Multiplex fix: also persist under THIS profile's home
+                    # (the per-home dict is the primary source the hooks'
+                    # _refresh_provider_llm_ctx reads; the module global
+                    # remains the cross-profile fallback).
+                    _hk = _home_key(provider)
+                    if _hk is not None:
+                        _HOST_MAIN_RUNTIME_BY_HOME[_hk] = live_rt
                     provider._main_runtime = live_rt
                     logger.info(
                         "FileMem: captured host main_runtime from post_llm_call "
@@ -15089,7 +15189,10 @@ def filemem_kanban_unsettle(task_id: str = None, **kw: Any) -> None:
         tid = _SETTLED_KANBAN_ID_RE.fullmatch(str(task_id or "").strip())
         if not tid:
             return
-        provider = _get_cached_provider("default")
+        # Multiplex fix: key by current profile home (same scoped key as
+        # register()), so a kanban event on profile B touches B's own cached
+        # instance, not profile A's (cross-profile unsettle writes are cut).
+        provider = _get_cached_provider(f"{_resolve_current_hermes_home()}:default")
         provider._unsettle_by_kanban_id(tid.group(0), source_event="kanban_task_event")
     except Exception as e:
         logger.debug(f"FileMem: kanban unsettle no-op/failed: {e}")
@@ -15161,9 +15264,16 @@ def _ensure_memory_toolset() -> None:
 
 def register(ctx) -> None:
     """Register filemem as a memory provider with hooks."""
-    global _HOST_LLM_CTX
-    # Use cached provider for consistency (solution 2)
-    provider = _get_cached_provider("default")
+    global _HOST_LLM_CTX, _HOST_MAIN_RUNTIME, _HOST_LLM_CTX_BY_HOME, _HOST_MAIN_RUNTIME_BY_HOME
+    # Multiplex fix: scope the cache key by the current profile's home so each
+    # profile gets its own provider instance (host claim_instance invariant:
+    # one instance per profile home, no cross-profile sharing). Without this,
+    # every profile's register() in a multiplexed gateway resolves the same
+    # "default" key -> same instance -> the second profile's claim_instance
+    # is rejected and the host drops the provider for that profile.
+    _home = _resolve_current_hermes_home()
+    _hkey = str(_home)
+    provider = _get_cached_provider(f"{_home}:default")
 
     # B3: expose host-owned LLM access to the provider so search mode "model"
     # can route through ctx.llm on the host main-model path (no task key) —
@@ -15181,6 +15291,10 @@ def register(ctx) -> None:
     # _refresh_provider_llm_ctx() on every fire (covers instances cached
     # BEFORE register()).
     _HOST_LLM_CTX = ctx
+    # Multiplex fix: ALSO record the ctx under THIS profile's home so a
+    # later register() for a DIFFERENT profile (multiplexed gateway) does
+    # not bleed its ctx into this profile's instances via the module global.
+    _HOST_LLM_CTX_BY_HOME[_hkey] = ctx
 
     # LLM 显式化◎ (t_32980f71): capture the host main_runtime snapshot at
     # register time (inside a host turn: the main runtime is already set in
@@ -15190,7 +15304,6 @@ def register(ctx) -> None:
     # empty dict -> keep _HOST_MAIN_RUNTIME None (the LLM faces keep
     # today's exact _llm_ctx-None skip semantics; nothing errors), and an
     # absent host helper (older build) is a no-op.
-    global _HOST_MAIN_RUNTIME
     # no-clobber: register() runs every LLM turn (~100ms BEFORE
     # build_turn_context publishes the runtime into the contextvar), so an
     # unconditional `_HOST_MAIN_RUNTIME = None` would erase what the
@@ -15203,6 +15316,11 @@ def register(ctx) -> None:
     resolved = provider._live_main_runtime()
     if resolved is not None:
         _HOST_MAIN_RUNTIME = resolved
+        # Multiplex fix: per-profile main_runtime snapshot (the gateway's
+        # per-profile main-model config can differ across profiles — the
+        # module global stays a cross-profile fallback, the per-home dict
+        # is this profile's own snapshot).
+        _HOST_MAIN_RUNTIME_BY_HOME[_hkey] = resolved
         provider._main_runtime = resolved
         logger.info(
             "FileMem: captured host main_runtime snapshot "
@@ -15218,7 +15336,9 @@ def register(ctx) -> None:
     # process) — it would otherwise keep _main_runtime None. New instances
     # pick the snapshot up in _get_cached_provider; pre-cached ones are
     # covered by the hooks' _refresh_provider_llm_ctx refresh face.
-    provider._main_runtime = _HOST_MAIN_RUNTIME
+    # Multiplex fix: per-profile snapshot takes precedence; the module
+    # global is only the cross-profile fallback.
+    provider._main_runtime = _HOST_MAIN_RUNTIME_BY_HOME.get(_hkey) or _HOST_MAIN_RUNTIME
 
     # P0-1: log source_profile at register time for observability
     sp = getattr(provider, "source_profile", None)

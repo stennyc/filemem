@@ -388,7 +388,10 @@ def test_f2_spawn_moved_before_gate_in_source():
 def _reset_provider_cache():
     with fm._cache_lock:
         fm._provider_cache.clear()
+        fm._HOST_LLM_CTX_BY_HOME.clear()
+        fm._HOST_MAIN_RUNTIME_BY_HOME.clear()
     fm._HOST_LLM_CTX = None
+    fm._HOST_MAIN_RUNTIME = None
 
 
 def test_f3_register_new_session_instance_gets_ctx(tmp_path, monkeypatch):
