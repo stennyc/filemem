@@ -131,6 +131,22 @@
   "notice": {
     "cross_profile_skip_hint": false
   },
+  "topic_guard": {
+    "enable": true,
+    "fail_open": false,
+    "block": [
+      "Kanban t_",
+      "kanban-block-relay",
+      "卡掉进了 blocked",
+      "看板",
+      "block-relay",
+      "kanban.db",
+      "派单",
+      "worker 侧",
+      "gave_up",
+      "卡板"
+    ]
+  },
   "memory_type": {
     "enable": true,
     "llm_per_session": 5

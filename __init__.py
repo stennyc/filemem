@@ -3141,14 +3141,33 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         mem_file = self.memories_dir / f"{mem_type}.json"
         fp = self._drain_fingerprint(content)    # D3: normalized content fingerprint
         sp = getattr(self, "source_profile", None)
+        # P6-A (owner 2026-10-20): the D4 dedup key (row_stamp == my_stamp,
+        # content-fp) is widened symmetrically to NEUTRAL rows:
+        #   * a NEUTRAL pool row (row_sp None/'') = the shared-skeleton class
+        #     -> matches ANY consumer stamp (the read face's _auto_recall_
+        #     eligible "neutral = shared" semantics — the drain re-landing the
+        #     same content as a new row every turn is exactly the kanban L0
+        #     re-ask loop the owner hit 10+ times).
+        #   * an UNRESOLVED consumer (sp None/'') -> content-fp-only matching
+        #     (a single-profile store can't attribute rows, so it must be
+        #     able to dedup against stamped rows — the P1-3 tight rule).
+        #   * a CROSSED stamp (row_sp set and != sp, both resolved) still
+        #     does NOT match -> profile isolation (D4) is preserved.
+        sp_resolved = sp not in (None, "")
+
+        def _drain_dedup_match(row_sp: Optional[str]) -> bool:
+            if row_sp in (None, ""):
+                return True              # neutral pool row = shared, matches anyone
+            if not sp_resolved:
+                return True              # unresolved consumer = content-fp-only
+            return row_sp == sp          # both resolved: same-profile only
+
         with self._lock:
             with self._shard_lock(mem_file):
                 items = self._read_memories_file(mem_file)
-                # D4: dedup key = (source_profile, content-fp). A row under
-                # ANOTHER profile does NOT block this write (the shared central
-                # pool must not let profile A clobber profile B).
+                # D4 + P6-A: dedup key = (profile-match above, content-fp).
                 for it in items:
-                    if (self._drain_row_profile(it) == sp
+                    if (_drain_dedup_match(self._drain_row_profile(it))
                             and self._drain_fingerprint(it.get("content", "")) == fp):
                         return "dup"
                 # NEW row — mirror the _save_memory auto-row stamping EXACTLY
@@ -4845,17 +4864,34 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # "" = the gate is fail-open -> nothing is dropped, pre-P5 behavior).
         _p5_cur_topic = self._session_title_hint(sid) if sid else ""
         _p5_gate_cfg = getattr(self, "_decay", None)
+        # P6-B (owner 2026-10-20): topic_guard.fail_open (default true) lets
+        # the unresolvable-topic case DROP block-marker rows instead of
+        # listing everything.  The block list (default empty) is content
+        # substrings — kanban / room residue markers.  Scope: kind=='l0'
+        # ONLY (the 待拍板 L1/L2 class + plan_probe entries keep their own
+        # faces and are NEVER silenced here).
+        _tg = (_p5_gate_cfg or {}).get("topic_guard") if isinstance(_p5_gate_cfg, dict) else {}
+        _tg = _tg if isinstance(_tg, dict) else {}
+        _tg_enable = bool(_tg.get("enable", True))
+        _tg_fail_closed = _tg_enable and (not _tg.get("fail_open", True))
+        _tg_block = [str(b) for b in (_tg.get("block") or []) if str(b).strip()]
 
         def _p5_keep(it):
             # L1/L2 (the 待拍板 class, kind != 'l0') are never silenced here.
             if it.get("kind", "l0") != "l0":
                 return True
-            # No resolvable current topic -> fail-open: keep everything.
-            if not _p5_cur_topic:
-                return True
-            # The L0 row's own topic = its content (truncated); the P1-2 gate
-            # is the single source (BM25 overlap, default threshold 0.1).
             _row_topic = ((it.get("content") or "").strip().replace("\n", " ")[:80])
+            # No resolvable current topic:
+            #   P6-B fail-closed + a block-marker hit -> drop the row.
+            #   otherwise (fail-open / no block / no hit) -> keep everything
+            #   (pre-P5 zero false-silence behavior).
+            if not _p5_cur_topic:
+                if _tg_fail_closed and _tg_block and \
+                        any(m in (it.get("content") or "") for m in _tg_block):
+                    return False
+                return True
+            # Resolvable topic: the P1-2 gate is the single source (BM25
+            # overlap, default threshold 0.1).
             return _topic_overlap_gate(_row_topic, _p5_cur_topic, _p5_gate_cfg)
 
         pending = [it for it in pending if _p5_keep(it)]
