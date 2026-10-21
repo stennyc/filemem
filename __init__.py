@@ -2984,9 +2984,13 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             lock_path.touch(exist_ok=True)
             fh = open(lock_path, "a+b")
             try:
-                fh.seek(0)
-                if fh.tell() == 0:
-                    # Windows locking() fails beyond EOF — reserve byte 0
+                # Windows locking() fails beyond EOF — reserve byte 0.
+                # Check the SIZE, not the position: after seek(0) tell() is
+                # always 0, so `fh.tell() == 0` appended 1B on EVERY acquire
+                # (unbounded .lock growth, found in the 2026-10-21 Windows
+                # audit). fstat is lock-agnostic (never EACCES) and a 0-byte
+                # file cannot hold a byte-0 lock, so the write is safe.
+                if os.fstat(fh.fileno()).st_size == 0:
                     fh.write(b"0")
                     fh.seek(0)
                 msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
@@ -3275,8 +3279,9 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             lock_path.touch(exist_ok=True)
             fh = open(str(lock_path), "a+b")
             try:
-                fh.seek(0)
-                if fh.tell() == 0:
+                # fstat SIZE check (tell() after seek(0) is always 0 -> the
+                # old check appended 1B per acquire; see _shard_lock).
+                if os.fstat(fh.fileno()).st_size == 0:
                     fh.write(b"0")
                     fh.seek(0)
                 msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
