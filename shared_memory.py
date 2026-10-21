@@ -272,14 +272,21 @@ def _merge_into_local(
                 continue
             cur_meta = cur.get("metadata") or {}
             new_meta = (d.get("metadata") or {})
+            # S5 双审 major 修复: 门控第三层与中央同列同源 ——
+            # cur 侧 = 本地行被中央门控覆盖前活行的 agent_id (存 metadata.shared_agent_id,
+            # 上次合入/首推时回写), 而非 source_profile (profile 名与推送 agent 不同源,
+            # 跨 agent 同 ts 时本地与中央可用不同列判出相反结论).
+            # new 侧 = 本机的 agent_id (本机推送方, 与中央 EXCLUDED.agent_id 对应).
             if _gate_accepts(
                 int(cur_meta.get("shared_version") or 0),
-                cur.get("updated_at"), cur_meta.get("source_profile"),
+                cur.get("updated_at"), cur_meta.get("shared_agent_id"),
                 int(new_meta.get("shared_version") or 1),
                 d.get("updated_at"), agent_id,
             ):
                 merged = _rowdict_to_local(d)
                 merged["metadata"]["source_profile"] = cur_meta.get("source_profile") or agent_id
+                # 回写中央活行 agent_id 到本地 metadata (下次门控第三层与中央同列)
+                merged["metadata"]["shared_agent_id"] = d.get("agent_id") or agent_id
                 local_by_id[rid] = merged
                 for i, it in enumerate(items):
                     if it.get("id") == rid:
@@ -349,12 +356,14 @@ def _sync_locked(provider, cfg: Dict[str, Any], new_confirmed_ids: List[str]) ->
 
         # 2) pull 增量: updated_at > since (首次 since=None -> 全量, 带 LIMIT 防 50 agent 首推风暴)
         # S5: 只拉 confirmed=TRUE 行 (中央 CHECK 约束 + "只共享 confirmed" 原则).
+        # S5 双审 major 修复: NULL updated_at 行 (中央列 nullable, 直连手工推可产生)
+        # 被 STRICT > 水位线永遮蔽 -> 首推/增量均补 "IS NULL OR" 收口, 不漏拉。
         if since is None:
             cur.execute(
                 "SELECT id, mem_type, content, level, confirmed, source_profile, agent_id, "
                 "version, updated_at, created_at, metadata FROM memories "
-                "WHERE updated_at IS NOT NULL AND confirmed = TRUE "
-                "ORDER BY updated_at LIMIT 5000"
+                "WHERE confirmed = TRUE "
+                "ORDER BY updated_at NULLS FIRST LIMIT 5000"
             )
         else:
             # psycopg2 把 since (last_pull, TIMESTAMPTZ) 读回的是 datetime;
@@ -368,8 +377,8 @@ def _sync_locked(provider, cfg: Dict[str, Any], new_confirmed_ids: List[str]) ->
             cur.execute(
                 "SELECT id, mem_type, content, level, confirmed, source_profile, agent_id, "
                 "version, updated_at, created_at, metadata FROM memories "
-                "WHERE updated_at > %s AND confirmed = TRUE "
-                "ORDER BY updated_at LIMIT 5000",
+                "WHERE (updated_at > %s OR updated_at IS NULL) AND confirmed = TRUE "
+                "ORDER BY updated_at NULLS FIRST LIMIT 5000",
                 (since,),
             )
         incoming_raw = cur.fetchall()
@@ -383,6 +392,12 @@ def _sync_locked(provider, cfg: Dict[str, Any], new_confirmed_ids: List[str]) ->
         # 3) 门控合入本地 shard (本地旧行门控, 与中央 PL/pgSQL 同语义)
         clobbered = _merge_into_local(provider.memories_dir, incoming, agent_id)
 
+        # S5 双审 critical: 中央 token 硬约束 — upsert 签名新增 p_token_hash 尾参,
+        # 中央函数体内 require_agent 强制校验 (此前仅"客户端自愿调 _central_auth",
+        # 持 PG 密码可直调 upsert 绕过). token_hash = sha256(config token),
+        # 与 _central_auth 同款哈希; 空 token -> 中央 unknown 拒 (与 S4 语义一致).
+        import hashlib
+        token_hash = hashlib.sha256((cfg.get("token") or "").encode("utf-8")).hexdigest()
         # 4) push 本机新 confirmed 行 (走中央 PL/pgSQL upsert_memory_row, 门控在 SQL 层)
         # S5: 客户端过滤 confirmed — 只推 metadata.confirmed==True 行 (未确认行
         # 留在本地 pending, 不进中央; 与 "只共享 confirmed 行" 原则对齐).
@@ -401,12 +416,13 @@ def _sync_locked(provider, cfg: Dict[str, Any], new_confirmed_ids: List[str]) ->
                 from datetime import datetime as _dt2
                 return _dt2(v).isoformat() if isinstance(v, _dt2) else v
             cur.execute(
-                "SELECT upsert_memory_row(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "SELECT upsert_memory_row(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (d["id"], d["mem_type"], d["content"], d["level"], d["confirmed"],
                  d["source_profile"] or provider.source_profile, agent_id,
                  d["version"], _js(d["updated_at"]), _js(d["created_at"]),
                  json.dumps(d["metadata"], ensure_ascii=False,
-                            default=lambda o: o.isoformat() if hasattr(o, "isoformat") else str(o))),
+                            default=lambda o: o.isoformat() if hasattr(o, "isoformat") else str(o)),
+                 token_hash),
             )
             pushed += 1
 
