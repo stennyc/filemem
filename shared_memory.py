@@ -105,6 +105,32 @@ class _PgConn:
             pass
 
 
+class _TokenRejected(Exception):
+    """中央 agent_registry 拒 (unknown/revoked token)。
+
+    S4 owner 拍板 (a): token 校验在中央 SQL 函数层 (require_agent),
+    客户端 fail-soft 捕获后仍不阻塞本地写, 但语义上区分"拒"与"连不上"。"""
+    pass
+
+
+def _central_auth(conn, agent_id: str, token: str) -> None:
+    """中央层 token 硬约束 (owner S4 拍 (a)): push/pull 前调
+    require_agent(agent_id, sha256(token))。token_hash 不入行数据
+    (memories/kb_docs 不存 token), 只做调用时校验; 中央 RAISE ->
+    _TokenRejected (客户端语义"拒", 非"连不上"), 本地写仍 fail-soft。"""
+    import hashlib
+    token_hash = hashlib.sha256((token or "").encode("utf-8")).hexdigest()
+    cur = conn.cur()
+    try:
+        cur.execute("SELECT require_agent(%s, %s)", (agent_id, token_hash))
+    except Exception as e:
+        # require_agent 的 RAISE EXCEPTION (unknown/revoked) 是 SQL 层硬约束,
+        # psycopg2 报为 error 22000 raise_exception。这里把"中央拒"与
+        # "连接/网络异常"区分: 只转中央业务拒 (SQL 执行到 require_agent),
+        # 连接断 (connect 阶段) 已在外层 _PgConn 抛, 不在此捕获。
+        raise _TokenRejected(str(e)) from e
+
+
 # ── 行 <-> 中央列 映射 (version 走 metadata.shared_version) ─────────────────
 
 def _row_to_rowdict(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -159,18 +185,28 @@ def _rowdict_to_local(d: Dict[str, Any]) -> Dict[str, Any]:
 # ── 本地门控合入 (与中央 PL/pgSQL upsert_memory_row 同语义) ─────────────────
 
 def _gate_accepts(
-    cur_version: Optional[int], cur_updated: Optional[str], cur_agent: Optional[str],
-    new_version: int, new_updated: Optional[str], new_agent: str,
+    cur_version: Optional[int], cur_updated, cur_agent: Optional[str],
+    new_version: int, new_updated, new_agent: str,
 ) -> bool:
     """中央门控在本地侧的镜像: 新行是否胜出 (本地 shard 已有 cur 行时)。
     version > -> 同 version 比 updated_at -> 再比 agent_id 字典序小者赢。
-    cur_updated 为 ISO 字符串, 直接字符串比较 (同格式同宽度, 字典序=时间序)。"""
+    updated_at 可能是 ISO str (本地) 或 datetime (中央 PG 拉回) — 统一成
+    ISO str 再比 (同格式同宽度, 字典序=时间序; datetime.isoformat 带时区)。"""
+    from datetime import datetime as _dt
+    def _k(v):
+        if v is None:
+            return ""
+        if isinstance(v, _dt):
+            return v.isoformat()
+        return str(v)
+    cur_updated = _k(cur_updated)
+    new_updated = _k(new_updated)
     if new_version > (cur_version or 0):
         return True
     if new_version == (cur_version or 0):
-        if (new_updated or "") > (cur_updated or ""):
+        if new_updated > cur_updated:
             return True
-        if (new_updated or "") == (cur_updated or ""):
+        if new_updated == cur_updated:
             return new_agent < (cur_agent or "")
     return False
 
@@ -253,6 +289,13 @@ def sync_on_write(
     with _local_lock:  # 跨 provider 实例共享一把锁: 同机多 profile 并发写不撕裂
         try:
             return _sync_locked(provider, cfg, new_confirmed_ids)
+        except _TokenRejected as e:
+            # S4: 中央 token 校验拒 (unknown/revoked) —— 语义上"拒", 不是
+            # fail-soft 跳过: 记 WARNING 让 owner 看到 token 失效, 但仍不阻塞
+            # 本地写路径 (owner 原则: 本地数据源始终安全)。
+            logger.warning(f"shared_memory: central token rejected for agent "
+                           f"{cfg.get('agent_id')}: {e}")
+            return {"status": "rejected", "reason": "token-rejected"}
         except Exception as e:
             # fail-soft: PG 不可达 / 部分失败 -> 本地写已完成, 同步静默跳过
             logger.warning(f"shared_memory sync_on_write no-op (fail-soft): {e}")
@@ -263,6 +306,10 @@ def _sync_locked(provider, cfg: Dict[str, Any], new_confirmed_ids: List[str]) ->
     conn = _PgConn(cfg["pg"])
     try:
         agent_id = cfg["agent_id"]
+        # S4 owner 拍 (a): 中央层 token 硬约束 — 拉/推前先过 require_agent,
+        # 不通过中央 RAISE -> 客户端转 _TokenRejected (语义"拒", 非 fail-soft
+        # 连不上)。token 空且中央没 agent_registry 行时也 RAISE (unknown)。
+        _central_auth(conn, agent_id, cfg.get("token", ""))
         kind = "memory"
         cur = conn.cur()
 
@@ -282,6 +329,14 @@ def _sync_locked(provider, cfg: Dict[str, Any], new_confirmed_ids: List[str]) ->
                 "WHERE updated_at IS NOT NULL ORDER BY updated_at LIMIT 5000"
             )
         else:
+            # psycopg2 把 since (last_pull, TIMESTAMPTZ) 读回的是 datetime;
+            # 本地行的 updated_at 是 ISO str — 必须统一成 datetime 再比
+            # (跨机时钟纪律: 本地/中央都是带时区 ISO, 可直接比)。
+            from datetime import datetime as _dtc, timezone as _tzc
+            if isinstance(since, str):
+                since = _dtc.fromisoformat(since.replace("Z", "+00:00"))
+            if since.tzinfo is None:
+                since = since.replace(tzinfo=_tzc.utc)
             cur.execute(
                 "SELECT id, mem_type, content, level, confirmed, source_profile, agent_id, "
                 "version, updated_at, created_at, metadata FROM memories "
