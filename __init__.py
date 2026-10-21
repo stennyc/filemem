@@ -2613,6 +2613,18 @@ class FileMemProvider(MemoryProvider):
         # Load config
         self._load_config(kwargs)
 
+        # S2 (2026-10-21 owner PRD): shared-memory cross-machine sync surface.
+        # Reads plugins.entries.filemem.shared_memory from config.yaml (all
+        # dashboard). 缺段 / enabled=false -> self._shared_mem is None and
+        # every _sm_notify call is a byte-level no-op (本地行为零变化).
+        # version 走行 metadata.shared_version (零侵入 MemoryItem 字段).
+        try:
+            import shared_memory as _sm
+        except Exception:
+            _sm = None
+        self._sm_mod = _sm
+        self._shared_mem_cfg = _sm._load_shared_memory_config() if _sm else None
+
         # Load externalized decay params (TTL/salience/lambda) — full param surface kept on provider
         self._decay = load_decay_config(self.hermetis_home)
 
@@ -3128,6 +3140,21 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # short-circuited).
         return _delete_path
 
+    def _sm_notify(self, new_confirmed_ids: List[str]) -> None:
+        """S2 (owner PRD 2026-10-21): B' 写前拉后推 — call AFTER a confirmed
+        row has landed in a local shard (post json.dump). No-op when
+        shared_memory config absent / disabled / module missing, so the
+        local write path is byte-identical by default. Fail-soft inside
+        shared_memory.sync_on_write: any PG hiccup logs a warning and
+        returns, never blocking the host turn.
+        """
+        if getattr(self, "_shared_mem_cfg", None) is None or getattr(self, "_sm_mod", None) is None:
+            return
+        try:
+            self._sm_mod.sync_on_write(self, new_confirmed_ids or [])
+        except Exception as e:
+            logger.warning(f"FileMem: shared-memory sync no-op (fail-soft): {e}")
+
     def _drain_write_native(self, entry: str, target: str, sid: str) -> str:
         """Land one drained entry in the pool (L0, source=auto, D5 category
         stamp, source_profile stamp). Profile-scoped dedup (D4): a row already
@@ -3523,6 +3550,9 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 items.append(row)
                 with open(mem_file, "w", encoding="utf-8") as f:
                     json.dump(items, f, ensure_ascii=False, indent=2)
+
+                # S2: B' 写前拉后推 — factory rule row is confirmed (L2) -> notify
+                self._sm_notify([self.FACTORY_TASK_PRIORITY_ID])
             logger.info("FileMem: factory-seeded L2 task-priority meta-rule")
         except Exception as e:
             logger.warning(f"FileMem: factory seed failed (fail-soft): {e}")
@@ -6553,6 +6583,12 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     _ts = getattr(self, "_turn_active_sid", None) or self.session_id
                     self._push_pending_confirm(_ts, item.id, level, content, kind="l0")
 
+                # S2: B' 写前拉后推 — only a row that lands CONFIRMED (source
+                # manual / confirmed / confirmed_draft) pushes; auto-unconfirmed
+                # L0 stays local-only until its confirm chain flips it.
+                if source in ("manual", "confirmed", "confirmed_draft", "factory"):
+                    self._sm_notify([item.id])
+
                 # LLM pass target: only a NEW auto-extract item (source="auto",
                 # unconfirmed at creation) is distilled. manual / confirmed_draft
                 # writes are already confirmed and inject-ready — no distill.
@@ -7425,6 +7461,11 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         entry.setdefault("metadata", {}).update(metadata)
                         with open(mem_file, "w", encoding="utf-8") as f:
                             json.dump(items, f, ensure_ascii=False, indent=2)
+                        # S2: a metadata update that flips/sets confirmed=True
+                        # is a "row confirm into shard" -> B' pull-then-push.
+                        # Pure metadata refreshes (no confirmed flip) stay local.
+                        if metadata.get("confirmed") is True:
+                            self._sm_notify([item_id])
                         return
         except Exception as e:
             logger.warning(f"FileMem: metadata update failed for {item_id}: {e}")
@@ -7506,6 +7547,15 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 if new_this_type:
                     with open(mem_file, "w", encoding="utf-8") as f:
                         json.dump(items, f, ensure_ascii=False, indent=2)
+                    # S2: B' 写前拉后推 — batch door: only rows that carry
+                    # confirmed=True metadata push to central (unconfirmed L0
+                    # batch extracts stay local-only, same as the single door).
+                    _sm_batch_ids = [
+                        _item["id"] for _item in items[-new_this_type:]
+                        if (_item.get("metadata") or {}).get("confirmed") is True
+                    ]
+                    if _sm_batch_ids:
+                        self._sm_notify(_sm_batch_ids)
                     # LLM pass: collect batch targets for post-lock distillation
                     _sid = getattr(self, "_turn_active_sid", None) or self.session_id or "default"
                     for _item in items[-new_this_type:]:
