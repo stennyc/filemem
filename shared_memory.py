@@ -30,6 +30,14 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# 统一时间戳时区基准 (S5: 门控比较走 epoch, naive 时间戳按 UTC 解释,
+# 与中央 TIMESTAMPTZ 的 UTC 存储同基准 — 跨机时钟纪律要求 NTP)。
+try:
+    from datetime import timezone as _tz_mod
+    _UTC = _tz_mod.utc
+except Exception:  # pragma: no cover
+    _UTC = None
+
 # 连接用参数 (fail-soft, 每次调用都读 —— 不缓存, 避免 config 改动后旧连接)
 _MAX_CONNECT_ATTEMPTS = 1  # 不做重试风暴: 连不上就 no-op, 下次写再试
 
@@ -190,23 +198,41 @@ def _gate_accepts(
 ) -> bool:
     """中央门控在本地侧的镜像: 新行是否胜出 (本地 shard 已有 cur 行时)。
     version > -> 同 version 比 updated_at -> 再比 agent_id 字典序小者赢。
-    updated_at 可能是 ISO str (本地) 或 datetime (中央 PG 拉回) — 统一成
-    ISO str 再比 (同格式同宽度, 字典序=时间序; datetime.isoformat 带时区)。"""
-    from datetime import datetime as _dt
-    def _k(v):
+
+    S5 双审 critical 修复: 时间戳比较统一走 epoch (datetime.fromisoformat),
+    不再用字符串字典序 (ISO str 的时区/微秒位数差异会让"同一瞬时"判为不等,
+    与中央 TIMESTAMPTZ 瞬时比较 diverge = split-brain, R6 同型)。
+    无效/缺时间戳 -> None 视为 -infinity (与中央 COALESCE(x,'-infinity') 同语义)。"""
+    def _epoch(v):
+        """-> float epoch (UTC) 或 None (缺/无效)。datetime 对象也归一。"""
         if v is None:
-            return ""
-        if isinstance(v, _dt):
-            return v.isoformat()
-        return str(v)
-    cur_updated = _k(cur_updated)
-    new_updated = _k(new_updated)
+            return None
+        from datetime import datetime as _dt
+        try:
+            if isinstance(v, _dt):
+                if v.tzinfo is None:
+                    v = v.replace(tzinfo=_UTC)
+                return v.timestamp()
+            s = str(v)
+            if not s:
+                return None
+            d = _dt.fromisoformat(s.replace("Z", "+00:00"))
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=_UTC)
+            return d.timestamp()
+        except Exception:
+            return None
+    cur_epoch = _epoch(cur_updated)
+    new_epoch = _epoch(new_updated)
+    NEG_INF = float("-inf")
+    c = cur_epoch if cur_epoch is not None else NEG_INF
+    n = new_epoch if new_epoch is not None else NEG_INF
     if new_version > (cur_version or 0):
         return True
     if new_version == (cur_version or 0):
-        if new_updated > cur_updated:
+        if n > c:
             return True
-        if new_updated == cur_updated:
+        if n == c:
             return new_agent < (cur_agent or "")
     return False
 
@@ -322,11 +348,13 @@ def _sync_locked(provider, cfg: Dict[str, Any], new_confirmed_ids: List[str]) ->
         since = row[0] if row else None
 
         # 2) pull 增量: updated_at > since (首次 since=None -> 全量, 带 LIMIT 防 50 agent 首推风暴)
+        # S5: 只拉 confirmed=TRUE 行 (中央 CHECK 约束 + "只共享 confirmed" 原则).
         if since is None:
             cur.execute(
                 "SELECT id, mem_type, content, level, confirmed, source_profile, agent_id, "
                 "version, updated_at, created_at, metadata FROM memories "
-                "WHERE updated_at IS NOT NULL ORDER BY updated_at LIMIT 5000"
+                "WHERE updated_at IS NOT NULL AND confirmed = TRUE "
+                "ORDER BY updated_at LIMIT 5000"
             )
         else:
             # psycopg2 把 since (last_pull, TIMESTAMPTZ) 读回的是 datetime;
@@ -340,7 +368,8 @@ def _sync_locked(provider, cfg: Dict[str, Any], new_confirmed_ids: List[str]) ->
             cur.execute(
                 "SELECT id, mem_type, content, level, confirmed, source_profile, agent_id, "
                 "version, updated_at, created_at, metadata FROM memories "
-                "WHERE updated_at > %s ORDER BY updated_at LIMIT 5000",
+                "WHERE updated_at > %s AND confirmed = TRUE "
+                "ORDER BY updated_at LIMIT 5000",
                 (since,),
             )
         incoming_raw = cur.fetchall()
@@ -355,12 +384,16 @@ def _sync_locked(provider, cfg: Dict[str, Any], new_confirmed_ids: List[str]) ->
         clobbered = _merge_into_local(provider.memories_dir, incoming, agent_id)
 
         # 4) push 本机新 confirmed 行 (走中央 PL/pgSQL upsert_memory_row, 门控在 SQL 层)
+        # S5: 客户端过滤 confirmed — 只推 metadata.confirmed==True 行 (未确认行
+        # 留在本地 pending, 不进中央; 与 "只共享 confirmed 行" 原则对齐).
         pushed = 0
         for rid in new_confirmed_ids:
             rowmap = _read_local_row(provider.memories_dir, rid)
             if rowmap is None:
                 continue
             d = _row_to_rowdict(rowmap)
+            if not d.get("confirmed"):
+                continue  # 未确认行: 不推中央 (本地保留, 待 confirm 后下次推)
             # 本地行的 updated_at/created_at 是 ISO 字符串 (filemem 约定);
             # metadata jsonb 推中央前做一次 json 序列化兜底 (datetime 已在
             # _rowdict_to_local 清过, 这里是 push 侧的本地行, 再保险一次)。
