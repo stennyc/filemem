@@ -193,6 +193,106 @@ def sync_on_write(
             return {"status": "skipped", "reason": f"fail-soft: {e}"}
 
 
+def create_task(cfg: Dict[str, Any], agent_id: str, task_name: str) -> Optional[Dict[str, Any]]:
+    """门 3: 中央发号 (全局唯一 task_ref, 50 设备跨机不撞). 只读鉴权 + 发号."""
+    conn = _PgConn(cfg["pg"])
+    try:
+        _central_auth(conn, agent_id, cfg.get("token", ""))
+        import hashlib
+        token_hash = hashlib.sha256((cfg.get("token") or "").encode("utf-8")).hexdigest()
+        cur = conn.cur()
+        cur.execute("SELECT create_task(%s, %s, %s)", (agent_id, task_name, token_hash))
+        row = cur.fetchone()
+        conn.commit()
+        return {"task_ref": row[0]} if row else None
+    except _TokenRejected as e:
+        logger.warning(f"shared_memory create_task token rejected: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"shared_memory create_task no-op (fail-soft): {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def handoff(cfg: Dict[str, Any], task_ref: str, to_agent: str,
+            summary: str, plan_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """门 3: 交棒 (写 pending 棒, 可带 plan_id 指针 — 不传 PRD 正文).
+    交方 = 本机 (cfg.agent_id). 单活: 该 task_ref 已有 pending 棒则中央拒."""
+    conn = _PgConn(cfg["pg"])
+    try:
+        agent_id = cfg["agent_id"]
+        _central_auth(conn, agent_id, cfg.get("token", ""))
+        import hashlib
+        token_hash = hashlib.sha256((cfg.get("token") or "").encode("utf-8")).hexdigest()
+        cur = conn.cur()
+        cur.execute(
+            "SELECT hand_off(%s, %s, %s, %s, %s, %s)",
+            (task_ref, agent_id, to_agent, summary, token_hash, plan_id))
+        row = cur.fetchone()
+        conn.commit()
+        return {"status": "ok", "task_ref": task_ref, "version": row[0] if row else None}
+    except _TokenRejected as e:
+        logger.warning(f"shared_memory handoff token rejected: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"shared_memory handoff no-op (fail-soft): {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def take_handoff(cfg: Dict[str, Any], task_ref: str) -> Optional[Dict[str, Any]]:
+    """门 3: 取棒 (原子翻 pending -> taken). 只取"交给我"的棒.
+    返回 row dict (含 plan_id 指针 — 接手方按它调 filemem_plan 还原上下文).
+    取不到 (不是交给我 / 已被取 / 无此 task_ref) -> None."""
+    conn = _PgConn(cfg["pg"])
+    try:
+        agent_id = cfg["agent_id"]
+        _central_auth(conn, agent_id, cfg.get("token", ""))
+        import hashlib
+        token_hash = hashlib.sha256((cfg.get("token") or "").encode("utf-8")).hexdigest()
+        cur = conn.cur()
+        # take_handoff RETURNS handoffs (composite): psycopg2 fetchone 返回 1 元素
+        # (composite text), 不是 11 列平铺. 直接解析 composite text 脆弱 (带引号的
+        # 时间戳含逗号), 故原子 UPDATE 走函数, 读回走普通 11 列 SELECT.
+        # 函数 RAISE (非交给我 / 已被取 / 无此 task_ref) -> 下方 catch 返回 None.
+        try:
+            cur.execute("SELECT take_handoff(%s, %s, %s)",
+                        (task_ref, agent_id, token_hash))
+            cur.fetchone()  # 触发原子翻 pending->taken
+            conn.commit()
+        except Exception:
+            conn.close()
+            return None
+        # 读回: 普通 SELECT 11 列 (物理 ordinal), 按 (task_ref, to_agent=本agent, taken).
+        try:
+            cur.execute(
+                "SELECT handoff_id, task_ref, version, from_agent, to_agent, summary, "
+                "state, taken_by, created_at, taken_at, plan_id FROM handoffs "
+                "WHERE task_ref = %s AND to_agent = %s AND state = 'taken' "
+                "ORDER BY version DESC LIMIT 1",
+                (task_ref, agent_id))
+            row = cur.fetchone()
+        except Exception:
+            conn.close()
+            raise
+        if row is None:
+            return None
+        cols = ["handoff_id", "task_ref", "version", "from_agent", "to_agent",
+                "summary", "state", "taken_by", "created_at", "taken_at",
+                "plan_id"]
+        return dict(zip(cols, row))
+    except _TokenRejected as e:
+        logger.warning(f"shared_memory take_handoff token rejected: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"shared_memory take_handoff no-op (fail-soft): {e}")
+        return None
+    finally:
+        conn.close()
+
+
 def _push_locked(provider, cfg: Dict[str, Any], new_row_ids: List[str]) -> Dict[str, Any]:
     conn = _PgConn(cfg["pg"])
     try:
