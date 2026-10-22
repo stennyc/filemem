@@ -1,6 +1,6 @@
 """filemem 侧内联共享同步 — 只推不拉版 (owner 定稿 2026-10-22 三扇门重构).
 
-中央库 = 一台 Postgres 的 memory_all 表 (全量沉淀池, append 语义).
+中央库 = 一台 Postgres 的 memories 表 (全量沉淀池, append 语义).
 设计原则 (owner 定稿, 不再讨论):
 
 - 只推不拉: 本机 filemem 数据源 (唯一权威, 自动注入面) 只往外推, 中央行
@@ -24,7 +24,7 @@ fail-soft: 任何 PG 不可达 / 配置缺失 / psycopg2 缺失 / 异常 -> 静�
   无跨设备门控 (单向无冲突), 无本地镜像门控
 - S5 的 epoch 门控对齐 / shared_agent_id 回写 (为"本地镜像中央门控"服务, 已废)
 保留:
-- 推腿: 本机行 -> 中央 memory_all (幂等, 带 device 归属 + token 鉴权)
+- 推腿: 本机行 -> 中央 memories (幂等, 带 device 归属 + token 鉴权)
 - 检索面: 查中央 (只读 SQL), 结果不落本地
 """
 from __future__ import annotations
@@ -123,7 +123,7 @@ class _TokenRejected(Exception):
 def _central_auth(conn, agent_id: str, token: str) -> None:
     """中央层 token 硬约束 (owner S4 拍 (a)): push 前调
     require_agent(agent_id, sha256(token))。token_hash 不入行数据
-    (memory_all 不存 token), 只做调用时校验; 中央 RAISE ->
+    (memories 不存 token), 只做调用时校验; 中央 RAISE ->
     _TokenRejected (客户端语义"拒", 非"连不上"), 本地写仍 fail-soft。"""
     import hashlib
     token_hash = hashlib.sha256((token or "").encode("utf-8")).hexdigest()
@@ -137,7 +137,7 @@ def _central_auth(conn, agent_id: str, token: str) -> None:
 # ── 行 -> 中央列 映射 (version 走 metadata.shared_version, 仅防重放) ──────
 
 def _row_to_rowdict(row: Dict[str, Any]) -> Dict[str, Any]:
-    """shard 行 -> 中央 memory_all 列 dict (全量存, confirmed 是行上状态列).
+    """shard 行 -> 中央 memories 列 dict (全量存, confirmed 是行上状态列).
 
     只推不拉: 门 1 全量沉淀, 门 2 confirmed 共识 = 同一张表的不同查询过滤,
     所以这里不再过滤 confirmed — 所有行都推, confirmed 值原样带上去。"""
@@ -207,7 +207,7 @@ def _push_locked(provider, cfg: Dict[str, Any], new_row_ids: List[str]) -> Dict[
         # 中央函数体内 require_agent 强制校验 (非原设备 / 持 PG 密码可绕过).
         import hashlib
         token_hash = hashlib.sha256((cfg.get("token") or "").encode("utf-8")).hexdigest()
-        # 只推: 本机新落盘行 -> 中央 memory_all (全量, 幂等 upsert)。
+        # 只推: 本机新落盘行 -> 中央 memories (全量, 幂等 upsert)。
         # 无 pull 腿 / 无水位推进 — agent_watermarks.last_pull 不再使用。
         pushed = 0
         for rid in new_row_ids:
@@ -290,7 +290,7 @@ def search_central(
     cfg: Dict[str, Any], query: str, confirmed_only: bool = True,
     limit: int = 50,
 ) -> List[Dict[str, Any]]:
-    """查中央 memory_all (别人的参考记忆)。只读, 返回行 dict 列表, 不写本地。
+    """查中央 memories (别人的参考记忆)。只读, 返回行 dict 列表, 不写本地。
 
     confirmed_only=True -> 门 2 共识面 (confirmed=true);
     confirmed_only=False -> 门 1 全量沉淀池。
@@ -303,7 +303,7 @@ def search_central(
         _central_auth(conn, agent_id, cfg.get("token", ""))
         cur = conn.cur()
         cols = ("SELECT id, mem_type, content, level, confirmed, source_profile, "
-                "agent_id, version, updated_at, metadata FROM memory_all")
+                "agent_id, version, updated_at, metadata FROM memories")
         sql = cols + " WHERE (content ILIKE %s OR metadata::text ILIKE %s)"
         params: List[Any] = [f"%{query}%", f"%{query}%"]
         if confirmed_only:
