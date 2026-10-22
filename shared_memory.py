@@ -1,42 +1,41 @@
-"""S2: filemem 侧内联共享同步 (owner 定稿 2026-10-21, PRD /root/.hermes/docs/shared-memory-prd.md)
+"""filemem 侧内联共享同步 — 只推不拉版 (owner 定稿 2026-10-22 三扇门重构).
 
-跨机共享 confirmed 记忆: 本机 <base>/filemem/memories 5 shard 与一台中央
-Postgres (memories 表) 双向同步。设计原则 (owner 拍板, 不再讨论):
+中央库 = 一台 Postgres 的 memory_all 表 (全量沉淀池, append 语义).
+设计原则 (owner 定稿, 不再讨论):
 
-- 组件形态: 内联几十行, 无 daemon / 无独立插件 / 无中间层。本文件就是
-  filemem 仓自带的 shared_memory.py, kb 仓会内联一份同构实现 (X 方案,
-  门控逻辑两仓各一份, S5 双审专查行为一致性)。
-- 检索 = B' 写前拉后推: 只在"写 confirmed 行"时刻 pull 增量 + 合入本地
-  shard + push 本机 confirmed 行; 纯搜永不碰中央。
-- 门控 = 真·B: 行 metadata.shared_version (本地单调) 大者赢 -> 同 version
-  比 updated_at -> 再比 agent_id 字典序小者赢; 被覆盖旧版进 memory_history。
-  与中央 upsert_memory_row PL/pgSQL 函数同语义 (S1 已 30/30 实测)。
+- 只推不拉: 本机 filemem 数据源 (唯一权威, 自动注入面) 只往外推, 中央行
+  绝不回写本地. 本地数据源只被本机写, 永不被中央覆盖.
+- 中央 = "别人的参考记忆": 只读可查 (检索面), 不自动注入, 不回写本地.
+  confirmed 是行上一个状态列, 别的设备查"共识" = 带 confirmed=true 过滤.
+- 门控简化: 单向后每行只有原 device 能写, 不存在"同 id 多设备写冲突".
+  中央 upsert = 原设备幂等覆盖 + 非原设备拒写 (token 鉴权 + device 归属).
+- 组件形态: 内联本文件, 无 daemon / 无独立插件 / 无中间层.
 - 配置 = 各 profile config.yaml plugins.entries.filemem.shared_memory
-  (全 dashboard, 缺段 / enabled=false -> 整个模块 no-op, 字节级不变)。
-- 版本存 metadata.shared_version: 不改 MemoryItem 既有字段 / 行结构,
-  零侵入 filemem 行模型。
+  (缺段 / enabled=false -> 整个模块 no-op, 本地行为字节级不变).
+- 版本存 metadata.shared_version: 仅防"原设备自己"重放/乱序 (单调), 不做
+  跨设备 tie-break (那套已随双向语义删除).
 
 fail-soft: 任何 PG 不可达 / 配置缺失 / psycopg2 缺失 / 异常 -> 静默跳过,
-绝不阻塞 filemem 本地写路径 (owner 原则: 本地数据源始终安全)。
+绝不阻塞 filemem 本地写路径 (本地数据源始终安全).
+
+砍掉 (相对 S2-S5 双向版):
+- pull 增量腿 (last_pull 水位 / 全量首拉 / 增量拉) — 不拉了
+- _rowdict_to_local / _merge_into_local / _gate_accepts — 中央行不进本地 shard,
+  无跨设备门控 (单向无冲突), 无本地镜像门控
+- S5 的 epoch 门控对齐 / shared_agent_id 回写 (为"本地镜像中央门控"服务, 已废)
+保留:
+- 推腿: 本机行 -> 中央 memory_all (幂等, 带 device 归属 + token 鉴权)
+- 检索面: 查中央 (只读 SQL), 结果不落本地
 """
 from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
-
-# 统一时间戳时区基准 (S5: 门控比较走 epoch, naive 时间戳按 UTC 解释,
-# 与中央 TIMESTAMPTZ 的 UTC 存储同基准 — 跨机时钟纪律要求 NTP)。
-try:
-    from datetime import timezone as _tz_mod
-    _UTC = _tz_mod.utc
-except Exception:  # pragma: no cover
-    _UTC = None
 
 # 连接用参数 (fail-soft, 每次调用都读 —— 不缓存, 避免 config 改动后旧连接)
 _MAX_CONNECT_ATTEMPTS = 1  # 不做重试风暴: 连不上就 no-op, 下次写再试
@@ -122,9 +121,9 @@ class _TokenRejected(Exception):
 
 
 def _central_auth(conn, agent_id: str, token: str) -> None:
-    """中央层 token 硬约束 (owner S4 拍 (a)): push/pull 前调
+    """中央层 token 硬约束 (owner S4 拍 (a)): push 前调
     require_agent(agent_id, sha256(token))。token_hash 不入行数据
-    (memories/kb_docs 不存 token), 只做调用时校验; 中央 RAISE ->
+    (memory_all 不存 token), 只做调用时校验; 中央 RAISE ->
     _TokenRejected (客户端语义"拒", 非"连不上"), 本地写仍 fail-soft。"""
     import hashlib
     token_hash = hashlib.sha256((token or "").encode("utf-8")).hexdigest()
@@ -132,17 +131,16 @@ def _central_auth(conn, agent_id: str, token: str) -> None:
     try:
         cur.execute("SELECT require_agent(%s, %s)", (agent_id, token_hash))
     except Exception as e:
-        # require_agent 的 RAISE EXCEPTION (unknown/revoked) 是 SQL 层硬约束,
-        # psycopg2 报为 error 22000 raise_exception。这里把"中央拒"与
-        # "连接/网络异常"区分: 只转中央业务拒 (SQL 执行到 require_agent),
-        # 连接断 (connect 阶段) 已在外层 _PgConn 抛, 不在此捕获。
         raise _TokenRejected(str(e)) from e
 
 
-# ── 行 <-> 中央列 映射 (version 走 metadata.shared_version) ─────────────────
+# ── 行 -> 中央列 映射 (version 走 metadata.shared_version, 仅防重放) ──────
 
 def _row_to_rowdict(row: Dict[str, Any]) -> Dict[str, Any]:
-    """shard 行 -> 中央列 dict (只取 confirmed 语义相关列)。"""
+    """shard 行 -> 中央 memory_all 列 dict (全量存, confirmed 是行上状态列).
+
+    只推不拉: 门 1 全量沉淀, 门 2 confirmed 共识 = 同一张表的不同查询过滤,
+    所以这里不再过滤 confirmed — 所有行都推, confirmed 值原样带上去。"""
     meta = row.get("metadata") or {}
     return {
         "id": row.get("id"),
@@ -158,170 +156,30 @@ def _row_to_rowdict(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _rowdict_to_local(d: Dict[str, Any]) -> Dict[str, Any]:
-    """中央列 dict -> 本地 shard 行 (保持 filemem 行结构, version 塞回
-    metadata.shared_version; 不引入任何 MemoryItem 之外的新顶层键)。
-    PG 的 TIMESTAMPTZ 被 psycopg2 转成 datetime —— 必须转回 ISO 字符串,
-    否则本地 json.dump 炸 (filemem 行里的时间戳全是 ISO str, 不是 datetime)。"""
-    from datetime import datetime as _dt
-    meta = d.get("metadata") or {}
-    if not isinstance(meta, dict):
-        meta = {}
-    meta = dict(meta)
-    meta["shared_version"] = int(d.get("version") or 1)
-    # metadata jsonb 里的时间戳也可能被 PG 还成 datetime —— 全量清一遍
-    def _norm(v):
-        if isinstance(v, _dt):
-            return v.isoformat()
-        return v
-    meta = {k: _norm(v) for k, v in meta.items()}
-    def _ts(v):
-        if isinstance(v, _dt):
-            return v.isoformat()
-        return v
-    return {
-        "id": d.get("id"),
-        "type": d.get("mem_type"),
-        "content": d.get("content", ""),
-        "level": d.get("level"),
-        "created_at": _ts(d.get("created_at")),
-        "updated_at": _ts(d.get("updated_at")),
-        "metadata": meta,
-    }
-
-
-# ── 本地门控合入 (与中央 PL/pgSQL upsert_memory_row 同语义) ─────────────────
-
-def _gate_accepts(
-    cur_version: Optional[int], cur_updated, cur_agent: Optional[str],
-    new_version: int, new_updated, new_agent: str,
-) -> bool:
-    """中央门控在本地侧的镜像: 新行是否胜出 (本地 shard 已有 cur 行时)。
-    version > -> 同 version 比 updated_at -> 再比 agent_id 字典序小者赢。
-
-    S5 双审 critical 修复: 时间戳比较统一走 epoch (datetime.fromisoformat),
-    不再用字符串字典序 (ISO str 的时区/微秒位数差异会让"同一瞬时"判为不等,
-    与中央 TIMESTAMPTZ 瞬时比较 diverge = split-brain, R6 同型)。
-    无效/缺时间戳 -> None 视为 -infinity (与中央 COALESCE(x,'-infinity') 同语义)。"""
-    def _epoch(v):
-        """-> float epoch (UTC) 或 None (缺/无效)。datetime 对象也归一。"""
-        if v is None:
-            return None
-        from datetime import datetime as _dt
-        try:
-            if isinstance(v, _dt):
-                if v.tzinfo is None:
-                    v = v.replace(tzinfo=_UTC)
-                return v.timestamp()
-            s = str(v)
-            if not s:
-                return None
-            d = _dt.fromisoformat(s.replace("Z", "+00:00"))
-            if d.tzinfo is None:
-                d = d.replace(tzinfo=_UTC)
-            return d.timestamp()
-        except Exception:
-            return None
-    cur_epoch = _epoch(cur_updated)
-    new_epoch = _epoch(new_updated)
-    NEG_INF = float("-inf")
-    c = cur_epoch if cur_epoch is not None else NEG_INF
-    n = new_epoch if new_epoch is not None else NEG_INF
-    if new_version > (cur_version or 0):
-        return True
-    if new_version == (cur_version or 0):
-        if n > c:
-            return True
-        if n == c:
-            return new_agent < (cur_agent or "")
-    return False
-
-
-def _merge_into_local(
-    memories_dir: Path, incoming: List[Dict[str, Any]], agent_id: str,
-) -> int:
-    """把中央拉回的增量行按门控合入本地 5 shard。返回本地真被覆盖的行数。
-
-    合入规则 (与 S1 G1-G4 同语义):
-      - 本地无此 id -> 直接写本地
-      - 本地有 -> 门控接受才覆盖 (中央行的 agent_id 记在 metadata.source_profile
-        的同行, 门控比较用中央行的 agent_id)
-      - 覆盖时本地旧行不另开审计 (中央 memory_history 已记); 本地只是数据面
-    """
-    if not incoming:
-        return 0
-    by_type: Dict[str, List[Dict[str, Any]]] = {}
-    for d in incoming:
-        by_type.setdefault(str(d.get("mem_type") or "fact"), []).append(d)
-    clobbered = 0
-    for mem_type, rows in by_type.items():
-        mem_file = memories_dir / f"{mem_type}.json"
-        if not mem_file.exists():
-            continue
-        with open(mem_file, "r", encoding="utf-8") as f:
-            items = json.load(f)
-        local_by_id = {it.get("id"): it for it in items}
-        changed = False
-        for d in rows:
-            rid = d.get("id")
-            cur = local_by_id.get(rid)
-            if cur is None:
-                items.append(_rowdict_to_local(d))
-                local_by_id[rid] = _rowdict_to_local(d)
-                changed = True
-                continue
-            cur_meta = cur.get("metadata") or {}
-            new_meta = (d.get("metadata") or {})
-            # S5 双审 major 修复: 门控第三层与中央同列同源 ——
-            # cur 侧 = 本地行被中央门控覆盖前活行的 agent_id (存 metadata.shared_agent_id,
-            # 上次合入/首推时回写), 而非 source_profile (profile 名与推送 agent 不同源,
-            # 跨 agent 同 ts 时本地与中央可用不同列判出相反结论).
-            # new 侧 = 本机的 agent_id (本机推送方, 与中央 EXCLUDED.agent_id 对应).
-            if _gate_accepts(
-                int(cur_meta.get("shared_version") or 0),
-                cur.get("updated_at"), cur_meta.get("shared_agent_id"),
-                int(new_meta.get("shared_version") or 1),
-                d.get("updated_at"), agent_id,
-            ):
-                merged = _rowdict_to_local(d)
-                merged["metadata"]["source_profile"] = cur_meta.get("source_profile") or agent_id
-                # 回写中央活行 agent_id 到本地 metadata (下次门控第三层与中央同列)
-                merged["metadata"]["shared_agent_id"] = d.get("agent_id") or agent_id
-                local_by_id[rid] = merged
-                for i, it in enumerate(items):
-                    if it.get("id") == rid:
-                        items[i] = merged
-                        break
-                clobbered += 1
-                changed = True
-        if changed:
-            tmp = mem_file.with_suffix(".json.tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(items, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, mem_file)
-    return clobbered
-
-
-# ── 主入口: 写 confirmed 行后调用 (写前拉后推的"推"侧 + 读侧) ──────────────
+# ── 主入口: 写行后调用 (只推, 不拉) ──────────────────────────────────────
 
 _local_lock = threading.Lock()
 
 
 def sync_on_write(
     provider,
-    new_confirmed_ids: List[str],
+    new_row_ids: List[str],
 ) -> Dict[str, Any]:
-    """provider = FileMemProvider 实例 (用其 hermetis_home/memories_dir/source_profile)。
-    new_confirmed_ids = 本次写路径刚落盘的行 id (可为空: 纯拉兜底也走这里)。
+    """provider = FileMemProvider 实例 (用其 memories_dir/source_profile)。
+    new_row_ids = 本次写路径刚落盘的行 id (全量, confirmed+unconfirmed 都推
+    门 1 沉淀池; 空 -> no-op 返回 skipped)。
 
-    返回 {"status": "skipped"|"ok", "pulled": n, "pushed": n, "clobbered_local": n}
+    只推不拉: 本函数只有推腿, 无 pull / merge / 水位。中央行绝不进本地。
+    返回 {"status": "ok"|"skipped"|"rejected", "pushed": n}
     """
     cfg = _load_shared_memory_config()
     if cfg is None:
         return {"status": "skipped", "reason": "config-absent-or-disabled"}
-    with _local_lock:  # 跨 provider 实例共享一把锁: 同机多 profile 并发写不撕裂
+    if not new_row_ids:
+        return {"status": "skipped", "reason": "no-ids", "pushed": 0}
+    with _local_lock:  # 跨 provider 实例共享一把锁: 同机多 profile 并发推不撕裂
         try:
-            return _sync_locked(provider, cfg, new_confirmed_ids)
+            return _push_locked(provider, cfg, new_row_ids)
         except _TokenRejected as e:
             # S4: 中央 token 校验拒 (unknown/revoked) —— 语义上"拒", 不是
             # fail-soft 跳过: 记 WARNING 让 owner 看到 token 失效, 但仍不阻塞
@@ -330,88 +188,35 @@ def sync_on_write(
                            f"{cfg.get('agent_id')}: {e}")
             return {"status": "rejected", "reason": "token-rejected"}
         except Exception as e:
-            # fail-soft: PG 不可达 / 部分失败 -> 本地写已完成, 同步静默跳过
+            # fail-soft: PG 不可达 / 部分失败 -> 本地写已完成, 推静默跳过
             logger.warning(f"shared_memory sync_on_write no-op (fail-soft): {e}")
             return {"status": "skipped", "reason": f"fail-soft: {e}"}
 
 
-def _sync_locked(provider, cfg: Dict[str, Any], new_confirmed_ids: List[str]) -> Dict[str, Any]:
+def _push_locked(provider, cfg: Dict[str, Any], new_row_ids: List[str]) -> Dict[str, Any]:
     conn = _PgConn(cfg["pg"])
     try:
         agent_id = cfg["agent_id"]
-        # S4 owner 拍 (a): 中央层 token 硬约束 — 拉/推前先过 require_agent,
+        # S4 owner 拍 (a): 中央层 token 硬约束 — 推前过 require_agent,
         # 不通过中央 RAISE -> 客户端转 _TokenRejected (语义"拒", 非 fail-soft
         # 连不上)。token 空且中央没 agent_registry 行时也 RAISE (unknown)。
         _central_auth(conn, agent_id, cfg.get("token", ""))
-        kind = "memory"
         cur = conn.cur()
 
-        # 1) 水位线: 本机该 kind 的 last_pull (缺 -> 全量拉, 首次部署)
-        cur.execute(
-            "SELECT last_pull FROM agent_watermarks WHERE agent_id=%s AND kind=%s",
-            (agent_id, kind),
-        )
-        row = cur.fetchone()
-        since = row[0] if row else None
-
-        # 2) pull 增量: updated_at > since (首次 since=None -> 全量, 带 LIMIT 防 50 agent 首推风暴)
-        # S5: 只拉 confirmed=TRUE 行 (中央 CHECK 约束 + "只共享 confirmed" 原则).
-        # S5 双审 major 修复: NULL updated_at 行 (中央列 nullable, 直连手工推可产生)
-        # 被 STRICT > 水位线永遮蔽 -> 首推/增量均补 "IS NULL OR" 收口, 不漏拉。
-        if since is None:
-            cur.execute(
-                "SELECT id, mem_type, content, level, confirmed, source_profile, agent_id, "
-                "version, updated_at, created_at, metadata FROM memories "
-                "WHERE confirmed = TRUE "
-                "ORDER BY updated_at NULLS FIRST LIMIT 5000"
-            )
-        else:
-            # psycopg2 把 since (last_pull, TIMESTAMPTZ) 读回的是 datetime;
-            # 本地行的 updated_at 是 ISO str — 必须统一成 datetime 再比
-            # (跨机时钟纪律: 本地/中央都是带时区 ISO, 可直接比)。
-            from datetime import datetime as _dtc, timezone as _tzc
-            if isinstance(since, str):
-                since = _dtc.fromisoformat(since.replace("Z", "+00:00"))
-            if since.tzinfo is None:
-                since = since.replace(tzinfo=_tzc.utc)
-            cur.execute(
-                "SELECT id, mem_type, content, level, confirmed, source_profile, agent_id, "
-                "version, updated_at, created_at, metadata FROM memories "
-                "WHERE (updated_at > %s OR updated_at IS NULL) AND confirmed = TRUE "
-                "ORDER BY updated_at NULLS FIRST LIMIT 5000",
-                (since,),
-            )
-        incoming_raw = cur.fetchall()
-        incoming = [
-            dict(zip(
-                ["id", "mem_type", "content", "level", "confirmed", "source_profile",
-                 "agent_id", "version", "updated_at", "created_at", "metadata"], r
-            )) for r in incoming_raw
-        ]
-
-        # 3) 门控合入本地 shard (本地旧行门控, 与中央 PL/pgSQL 同语义)
-        clobbered = _merge_into_local(provider.memories_dir, incoming, agent_id)
-
-        # S5 双审 critical: 中央 token 硬约束 — upsert 签名新增 p_token_hash 尾参,
-        # 中央函数体内 require_agent 强制校验 (此前仅"客户端自愿调 _central_auth",
-        # 持 PG 密码可直调 upsert 绕过). token_hash = sha256(config token),
-        # 与 _central_auth 同款哈希; 空 token -> 中央 unknown 拒 (与 S4 语义一致).
+        # S5 双审 critical: 中央 token 硬约束 — upsert 尾参 p_token_hash,
+        # 中央函数体内 require_agent 强制校验 (非原设备 / 持 PG 密码可绕过).
         import hashlib
         token_hash = hashlib.sha256((cfg.get("token") or "").encode("utf-8")).hexdigest()
-        # 4) push 本机新 confirmed 行 (走中央 PL/pgSQL upsert_memory_row, 门控在 SQL 层)
-        # S5: 客户端过滤 confirmed — 只推 metadata.confirmed==True 行 (未确认行
-        # 留在本地 pending, 不进中央; 与 "只共享 confirmed 行" 原则对齐).
+        # 只推: 本机新落盘行 -> 中央 memory_all (全量, 幂等 upsert)。
+        # 无 pull 腿 / 无水位推进 — agent_watermarks.last_pull 不再使用。
         pushed = 0
-        for rid in new_confirmed_ids:
+        for rid in new_row_ids:
             rowmap = _read_local_row(provider.memories_dir, rid)
             if rowmap is None:
                 continue
             d = _row_to_rowdict(rowmap)
-            if not d.get("confirmed"):
-                continue  # 未确认行: 不推中央 (本地保留, 待 confirm 后下次推)
             # 本地行的 updated_at/created_at 是 ISO 字符串 (filemem 约定);
-            # metadata jsonb 推中央前做一次 json 序列化兜底 (datetime 已在
-            # _rowdict_to_local 清过, 这里是 push 侧的本地行, 再保险一次)。
+            # metadata jsonb 推中央前做一次 json 序列化兜底 (datetime 保险)。
             def _js(v):
                 from datetime import datetime as _dt2
                 return _dt2(v).isoformat() if isinstance(v, _dt2) else v
@@ -425,22 +230,8 @@ def _sync_locked(provider, cfg: Dict[str, Any], new_confirmed_ids: List[str]) ->
                  token_hash),
             )
             pushed += 1
-
-        # 5) 推水位线 (本机该 agent+kind 的 last_pull/last_push)
-        if incoming:
-            last_ts = max((d["updated_at"] for d in incoming if d.get("updated_at")), default=None)
-            if last_ts:
-                cur.execute(
-                    "INSERT INTO agent_watermarks (agent_id, kind, last_pull, last_push, last_version_seen) "
-                    "VALUES (%s, %s, %s, now(), (SELECT max(version) FROM memories)) "
-                    "ON CONFLICT (agent_id, kind) DO UPDATE SET "
-                    "last_pull = EXCLUDED.last_pull, last_push = now(), "
-                    "last_version_seen = GREATEST(agent_watermarks.last_version_seen, EXCLUDED.last_version_seen)",
-                    (agent_id, kind, last_ts),
-                )
         conn.commit()
-        return {"status": "ok", "pulled": len(incoming), "pushed": pushed,
-                "clobbered_local": clobbered}
+        return {"status": "ok", "pushed": pushed}
     finally:
         conn.close()
 
@@ -460,9 +251,17 @@ def _read_local_row(memories_dir: Path, rid: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _bump_version_for(row: Dict[str, Any]) -> int:
+    """写路径落盘新行时调用: 返回该行的共享 version (单调 +1, 仅防重放)。
+    新行 = 1 (backfill 后所有行起步 1), 变更 = 旧 + 1。不做跨设备 tie-break。"""
+    old = int((row.get("metadata") or {}).get("shared_version") or 0)
+    return old + 1
+
+
 def backfill_versions(memories_dir: Path) -> int:
-    """存量 955+ 行回填 metadata.shared_version=1 (PRD D9)。
-    仅对缺该键的行补, 已有不动; 原地原子写 (tmp+os.replace)。返回补的行数。"""
+    """存量行回填 metadata.shared_version=1。仅对缺该键的行补, 已有不动;
+    原地原子写 (tmp+os.replace)。返回补的行数。"""
+    import os
     touched = 0
     for mem_type in ("fact", "preference", "decision", "task", "plan"):
         mem_file = memories_dir / f"{mem_type}.json"
@@ -485,8 +284,44 @@ def backfill_versions(memories_dir: Path) -> int:
     return touched
 
 
-def _bump_version_for(row: Dict[str, Any]) -> int:
-    """写路径落盘新 confirmed 行时调用: 返回该行的共享 version (单调 +1)。
-    新行 = 1 (backfill 后所有行起步 1), 变更 = 旧 + 1。"""
-    old = int((row.get("metadata") or {}).get("shared_version") or 0)
-    return old + 1
+# ── 检索面: 查中央 (只读, 结果不落本地) ─────────────────────────────────
+
+def search_central(
+    cfg: Dict[str, Any], query: str, confirmed_only: bool = True,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """查中央 memory_all (别人的参考记忆)。只读, 返回行 dict 列表, 不写本地。
+
+    confirmed_only=True -> 门 2 共识面 (confirmed=true);
+    confirmed_only=False -> 门 1 全量沉淀池。
+    这是"中央=别人的可参考记忆"的读入口, 结果由调用方(agent 模型)决定用不用,
+    绝不自动注入本地 auto-inject 面, 也绝不回写本地数据源。
+    """
+    conn = _PgConn(cfg["pg"])
+    try:
+        agent_id = cfg["agent_id"]
+        _central_auth(conn, agent_id, cfg.get("token", ""))
+        cur = conn.cur()
+        cols = ("SELECT id, mem_type, content, level, confirmed, source_profile, "
+                "agent_id, version, updated_at, metadata FROM memory_all")
+        sql = cols + " WHERE (content ILIKE %s OR metadata::text ILIKE %s)"
+        params: List[Any] = [f"%{query}%", f"%{query}%"]
+        if confirmed_only:
+            sql += " AND confirmed = TRUE"
+        sql += " ORDER BY updated_at DESC NULLS LAST LIMIT %s"
+        params.append(limit)
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        return [
+            dict(zip(
+                ["id", "mem_type", "content", "level", "confirmed",
+                 "source_profile", "agent_id", "version", "updated_at", "metadata"], r
+            )) for r in rows
+        ]
+    except _TokenRejected:
+        return []
+    except Exception as e:
+        logger.warning(f"shared_memory search_central no-op (fail-soft): {e}")
+        return []
+    finally:
+        conn.close()

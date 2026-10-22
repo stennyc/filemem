@@ -13,3 +13,4 @@ provides_tools:
 - filemem_delete
 - filemem_review_drafts
 - filemem_check_promotion
+- shared_memory_search

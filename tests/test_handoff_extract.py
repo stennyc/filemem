@@ -54,7 +54,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from __init__ import FileMemProvider  # noqa: E402
 
-from tests._llm_host_fake import _MAIN_RUNTIME, install as install_host_fake  # noqa: E402
+from _llm_host_fake import _MAIN_RUNTIME, install as install_host_fake  # noqa: E402
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────

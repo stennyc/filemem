@@ -2613,11 +2613,12 @@ class FileMemProvider(MemoryProvider):
         # Load config
         self._load_config(kwargs)
 
-        # S2 (2026-10-21 owner PRD): shared-memory cross-machine sync surface.
-        # Reads plugins.entries.filemem.shared_memory from config.yaml (all
-        # dashboard). 缺段 / enabled=false -> self._shared_mem is None and
-        # every _sm_notify call is a byte-level no-op (本地行为零变化).
-        # version 走行 metadata.shared_version (零侵入 MemoryItem 字段).
+        # S2-v3 (owner 定稿 2026-10-22, 三扇门): shared-memory 只推不拉.
+        # Reads plugins.entries.filemem.shared_memory from config.yaml. 缺段 /
+        # enabled=false -> self._shared_mem is None and every _sm_notify call is
+        # a byte-level no-op (本地行为零变化). version 走行 metadata.shared_version
+        # (仅防原设备重放, 不做跨设备门控). 中央 = 别人的参考记忆: 本机全量推,
+        # 中央行不回写本地 / 不自动注入.
         try:
             import shared_memory as _sm
         except Exception:
@@ -3140,20 +3141,87 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # short-circuited).
         return _delete_path
 
-    def _sm_notify(self, new_confirmed_ids: List[str]) -> None:
-        """S2 (owner PRD 2026-10-21): B' 写前拉后推 — call AFTER a confirmed
-        row has landed in a local shard (post json.dump). No-op when
-        shared_memory config absent / disabled / module missing, so the
-        local write path is byte-identical by default. Fail-soft inside
-        shared_memory.sync_on_write: any PG hiccup logs a warning and
-        returns, never blocking the host turn.
+    def _sm_notify(self, new_row_ids: List[str]) -> None:
+        """S2-v3 (owner 定稿 2026-10-22, 三扇门): 只推不拉 — call AFTER a row has
+        landed in a local shard (post json.dump). 传的是"本次落盘的行 id"
+        (门 1 全量沉淀: confirmed + unconfirmed 都推), 由 shared_memory 内部按
+        metadata.confirmed 原样带列上中央, 不做本地 confirmed 过滤。
+        No-op when shared_memory config absent / disabled / module missing,
+        so the local write path is byte-identical by default. Fail-soft inside
+        shared_memory.sync_on_write: any PG hiccup logs a warning and returns,
+        never blocking the host turn.
         """
         if getattr(self, "_shared_mem_cfg", None) is None or getattr(self, "_sm_mod", None) is None:
             return
         try:
-            self._sm_mod.sync_on_write(self, new_confirmed_ids or [])
+            self._sm_mod.sync_on_write(self, new_row_ids or [])
         except Exception as e:
-            logger.warning(f"FileMem: shared-memory sync no-op (fail-soft): {e}")
+            logger.warning(f"FileMem: shared-memory push no-op (fail-soft): {e}")
+
+    def _shared_referral_hint(self, n: int) -> str:
+        """S6 read-side (owner 定稿 2026-10-22, D1=b): the auto-inject face
+        appends at most ONE referral line when local recall came up thin
+        (n < 2) AND shared-memory is enabled. It is a POINTER only — it names
+        the tool + the count, it NEVER embeds central-row content (the
+        "never auto-inject central data" ruling). Central data reaches the
+        model only if the model (or a human) explicitly calls
+        shared_memory_search; that result lives in this turn's tool return
+        and is never re-landed into the local shard / auto face.
+        Byte-identical (returns "") when shared_memory cfg is absent or
+        n >= 2 — machines without the config block see zero change."""
+        if getattr(self, "_shared_mem_cfg", None) is None:
+            return ""
+        if n >= 2:
+            return ""
+        return (
+            f"\n[提示] 本地相关共享记忆仅 {n} 条; 需参考其他设备的共享记忆, "
+            "可调用 shared_memory_search (全量 / confirmed_only=true 查共识)。"
+        )
+
+    def _tool_shared_search(self, args: Dict) -> str:
+        """S6 read-side: read-only query against the CENTRAL memory pool
+        (memory_all) — "别人的参考记忆". Pure SQL read: no local shard
+        write, no auto-inject, no re-landing. D2: results only exist in this
+        tool's return for the current turn. cfg absent / disabled -> clean
+        error (never an exception). Fail-soft inside search_central: a PG
+        hiccup returns an empty result set, not a failure."""
+        cfg = getattr(self, "_shared_mem_cfg", None)
+        if cfg is None:
+            return json.dumps({"success": False,
+                               "error": "shared_memory 未启用 (config 缺 shared_memory 段或 enabled=false)"})
+        sm_mod = getattr(self, "_sm_mod", None)
+        if sm_mod is None:
+            return json.dumps({"success": False,
+                               "error": "shared_memory 模块不可用"})
+        query = (args.get("query") or "").strip()
+        if not query:
+            return json.dumps({"success": False,
+                               "error": "query 不能为空"})
+        confirmed_only = bool(args.get("confirmed_only", True))
+        limit = int(args.get("limit", 50))
+        try:
+            rows = sm_mod.search_central(cfg, query, confirmed_only=confirmed_only,
+                                         limit=limit)
+        except Exception as e:
+            return json.dumps({"success": False,
+                               "error": f"shared_memory_search 查询失败: {e}"})
+        # Normalize rows for the model: keep provenance (agent_id /
+        # source_profile) so the reader can see WHOSE memory this is.
+        out_rows = []
+        for r in rows:
+            out_rows.append({
+                "id": r.get("id"),
+                "type": r.get("mem_type"),
+                "content": r.get("content"),
+                "level": r.get("level"),
+                "confirmed": r.get("confirmed"),
+                "source_profile": r.get("source_profile"),
+                "agent_id": r.get("agent_id"),
+                "updated_at": r.get("updated_at"),
+            })
+        return json.dumps({"success": True, "query": query,
+                           "confirmed_only": confirmed_only,
+                           "count": len(out_rows), "results": out_rows})
 
     def _drain_write_native(self, entry: str, target: str, sid: str) -> str:
         """Land one drained entry in the pool (L0, source=auto, D5 category
@@ -3551,7 +3619,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 with open(mem_file, "w", encoding="utf-8") as f:
                     json.dump(items, f, ensure_ascii=False, indent=2)
 
-                # S2: B' 写前拉后推 — factory rule row is confirmed (L2) -> notify
+                # S2-v3: 门 1 全量沉淀 — factory rule row (L2 confirmed) 落盘后推中央
                 self._sm_notify([self.FACTORY_TASK_PRIORITY_ID])
             logger.info("FileMem: factory-seeded L2 task-priority meta-rule")
         except Exception as e:
@@ -3915,7 +3983,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             # call's counters, and a 0-hit recall reinforced nothing.
             self._audit_recall(0, reason_trivial=False, reinforced=0, durable_hits=0)
             return self._pending_draft_notice(
-                self._handoff_pin_tail_summary(session_id),
+                self._handoff_pin_tail_summary(session_id)
+                + self._shared_referral_hint(0),
                 session_id=session_id)
 
         # v2 egress (P2 self-test cut): items stamped metadata.self_test are
@@ -3949,7 +4018,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             # rides the tail even on a 0-hit early exit (the auto face still
             # renders; nothing else to lose). Fail-soft: '' when no valid pin.
             return self._pending_draft_notice(
-                self._handoff_pin_tail_summary(session_id),
+                self._handoff_pin_tail_summary(session_id)
+                + self._shared_referral_hint(0),
                 session_id=session_id)
 
         _mem_dir = getattr(self, "memories_dir", None)
@@ -3974,7 +4044,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             # call's counters, and a 0-hit recall reinforced nothing.
             self._audit_recall(0, reason_trivial=False, reinforced=0, durable_hits=0)
             return self._pending_draft_notice(
-                self._handoff_pin_tail_summary(session_id),
+                self._handoff_pin_tail_summary(session_id)
+                + self._shared_referral_hint(0),
                 session_id=session_id)
 
         # SEC-1-2 injection-face trust gate (pure, zero LLM): after egress,
@@ -4080,7 +4151,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             # call's counters, and a 0-hit recall reinforced nothing.
             self._audit_recall(0, reason_trivial=False, reinforced=0, durable_hits=0)
             return self._pending_draft_notice(
-                self._handoff_pin_tail_summary(session_id),
+                self._handoff_pin_tail_summary(session_id)
+                + self._shared_referral_hint(0),
                 session_id=session_id)
 
         # P0-2 denoise ①: cap the AUTO-inject row count (top-N by the existing
@@ -4211,6 +4283,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # pin / no materials — the recall+footer face is byte-identical to
         # today in that case (owner T4 byte-level regression sentinel).
         context = context + self._handoff_pin_tail_summary(session_id)
+        # S6 read-side (owner D1=b): local recall came up thin (<2) -> one
+        # referral pointer line (names the tool + count, NEVER central data).
+        # "" when shared_memory disabled or >=2 local hits — byte-identical.
+        context = context + self._shared_referral_hint(len(results))
         return self._pending_draft_notice(context, session_id=session_id)
 
     # ── P3 cache-stability: last-injection snapshot ─────────────────────────────
@@ -6583,11 +6659,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     _ts = getattr(self, "_turn_active_sid", None) or self.session_id
                     self._push_pending_confirm(_ts, item.id, level, content, kind="l0")
 
-                # S2: B' 写前拉后推 — only a row that lands CONFIRMED (source
-                # manual / confirmed / confirmed_draft) pushes; auto-unconfirmed
-                # L0 stays local-only until its confirm chain flips it.
-                if source in ("manual", "confirmed", "confirmed_draft", "factory"):
-                    self._sm_notify([item.id])
+                # S2-v3: 门 1 全量沉淀 — 所有落盘行都推中央 (confirmed+unconfirmed),
+                # 由 shared_memory 按 metadata.confirmed 原样带列上中央. 中央行只读
+                # 可查, 不自动注入, 不回写本地. (旧 S2 的 "只推 confirmed 过滤" 已废.)
+                self._sm_notify([item.id])
 
                 # LLM pass target: only a NEW auto-extract item (source="auto",
                 # unconfirmed at creation) is distilled. manual / confirmed_draft
@@ -7461,11 +7536,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         entry.setdefault("metadata", {}).update(metadata)
                         with open(mem_file, "w", encoding="utf-8") as f:
                             json.dump(items, f, ensure_ascii=False, indent=2)
-                        # S2: a metadata update that flips/sets confirmed=True
-                        # is a "row confirm into shard" -> B' pull-then-push.
-                        # Pure metadata refreshes (no confirmed flip) stay local.
-                        if metadata.get("confirmed") is True:
-                            self._sm_notify([item_id])
+                        # S2-v3: 门 1 全量沉淀 — 任何落盘行 (含纯元数据刷新) 都推中央,
+                        # 中央行只读可查. 不区分 confirmed 翻转 (旧 S2 只在 confirm
+                        # 翻转时推, 已随"全量存中央"定稿放宽).
+                        self._sm_notify([item_id])
                         return
         except Exception as e:
             logger.warning(f"FileMem: metadata update failed for {item_id}: {e}")
@@ -7547,12 +7621,11 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 if new_this_type:
                     with open(mem_file, "w", encoding="utf-8") as f:
                         json.dump(items, f, ensure_ascii=False, indent=2)
-                    # S2: B' 写前拉后推 — batch door: only rows that carry
-                    # confirmed=True metadata push to central (unconfirmed L0
-                    # batch extracts stay local-only, same as the single door).
+                    # S2-v3: 门 1 全量沉淀 — 本批所有新落盘行都推中央
+                    # (confirmed+unconfirmed), 由 shared_memory 按 metadata.confirmed
+                    # 原样带列. 旧 S2 的 "批门只推 confirmed" 过滤已废.
                     _sm_batch_ids = [
                         _item["id"] for _item in items[-new_this_type:]
-                        if (_item.get("metadata") or {}).get("confirmed") is True
                     ]
                     if _sm_batch_ids:
                         self._sm_notify(_sm_batch_ids)
@@ -10004,6 +10077,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 return self._tool_write(args)
             elif tool_name == "filemem_search":
                 return self._tool_search(args)
+            elif tool_name == "shared_memory_search":
+                return self._tool_shared_search(args)
             elif tool_name == "filemem_delete":
                 return self._tool_delete(args)
             elif tool_name == "filemem_supersede":
