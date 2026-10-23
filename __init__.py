@@ -3223,6 +3223,87 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                            "confirmed_only": confirmed_only,
                            "count": len(out_rows), "results": out_rows})
 
+    def _tool_shared_handoff(self, args: Dict) -> str:
+        """门 3 交棒 (跨机): 把棒子 (task_ref + summary + 可选 plan_id 指针)
+        推上中央 handoffs, 另一台机器的 agent 用 shared_memory_take 取棒.
+
+        边界 (与 filemem_set_bringback 不重叠): 门 3 = 跨机 agent 移交工作项
+        (中央 Postgres handoffs 表, 事件驱动, 需双方都配了 shared_memory);
+        bringback = 本机 session 接续 (last_closed_sessions.jsonl, 自动注入面,
+        单机单 profile, 不碰中央库). 本机接着干上次没干完的 -> bringback;
+        跨机把活交给另一台 agent -> 门 3. 交棒/取棒 handler 薄封装调
+        shared_memory 模块层 handoff/take_handoff (中央 6 参函数, token 硬
+        约束在中央 SQL 层). plan_id 可选, 交棒时带上"属于哪条 plan"的指针
+        (不传 PRD 正文, 接手方按 plan_id 调 filemem_plan 还原上下文)."""
+        cfg = getattr(self, "_shared_mem_cfg", None)
+        if cfg is None:
+            return json.dumps({"success": False,
+                               "error": "shared_memory 未启用 (config 缺 shared_memory 段或 enabled=false)"})
+        sm_mod = getattr(self, "_sm_mod", None)
+        if sm_mod is None:
+            return json.dumps({"success": False, "error": "shared_memory 模块不可用"})
+
+        task_ref = str(args.get("task_ref") or "").strip()
+        to_agent = str(args.get("to") or "").strip()
+        summary = str(args.get("summary") or "").strip()
+        plan_id = (str(args.get("plan_id") or "").strip() or None)
+        if not task_ref or not to_agent or not summary:
+            return json.dumps({"success": False,
+                               "error": "task_ref / to / summary 均必填"})
+        out = sm_mod.handoff(cfg, task_ref, to_agent, summary, plan_id)
+        if out is None:
+            return json.dumps({"success": False,
+                               "error": "交棒失败 (token 拒 / PG 不可达 / 单活约束: 该 task_ref 已有 pending 棒)"})
+        return json.dumps({"success": True, "task_ref": task_ref,
+                           "version": out.get("version"), "plan_id": plan_id})
+
+    def _tool_shared_take(self, args: Dict) -> str:
+        """门 3 取棒 (跨机, 原子翻 pending->taken): 取回行 dict (含 plan_id 指针).
+
+        边界 (与 bringback 不重叠): 门 3 取棒 = 跨机接另一台 agent 交来的棒
+        (中央 handoffs 表); bringback = 本机 session 接续 (last_closed_sessions.
+        jsonl, 自动注入面, 不碰中央库). 取不到 (不是交给我 / 已被取 / 无此
+        task_ref) -> success=false."""
+        cfg = getattr(self, "_shared_mem_cfg", None)
+        if cfg is None:
+            return json.dumps({"success": False,
+                               "error": "shared_memory 未启用 (config 缺 shared_memory 段或 enabled=false)"})
+        sm_mod = getattr(self, "_sm_mod", None)
+        if sm_mod is None:
+            return json.dumps({"success": False, "error": "shared_memory 模块不可用"})
+        task_ref = str(args.get("task_ref") or "").strip()
+        if not task_ref:
+            return json.dumps({"success": False, "error": "task_ref 必填"})
+        row = sm_mod.take_handoff(cfg, task_ref)
+        if row is None:
+            return json.dumps({"success": False,
+                               "error": f"取棒失败: task {task_ref} 无交给我 (agent {cfg.get('agent_id')}) 的 pending 棒 (可能已被取 / 非交给我)"})
+        return json.dumps({"success": True,
+                           "results": {k: row.get(k) for k in
+                                       ("task_ref", "version", "from_agent",
+                                        "to_agent", "summary", "state", "plan_id")}})
+
+    def _handoff_plan_hint(self) -> str:
+        """S6b (owner 定稿, 选 B): 交棒提示行 — 本地有未完成 plan
+        (in_progress / blocked) 时, 列 plan_id + 标题, 模型交棒时照填.
+        程序不自动塞 plan_id (D1=b 只指路), 只把"我现在握着哪条 plan"摆出来.
+        无未完成 plan / 无 shared_memory 配置 -> 返回 "" (字节级不变)."""
+        if getattr(self, "_shared_mem_cfg", None) is None:
+            return ""
+        rows = self._plan_load_rows()
+        unfinished = []
+        for r in rows:
+            meta = r.get("metadata") or {}
+            if meta.get("plan_state") in ("in_progress", "blocked"):
+                unfinished.append(f"  · {meta.get('plan_id') or r.get('id')} — {r.get('content')}")
+        if not unfinished:
+            return ""
+        listing = "\n".join(unfinished)
+        return (
+            "\n[交棒提示] 本机当前握有未完成 plan, 交棒时请按 plan_id 带上对应指针:\n"
+            f"{listing}"
+        )
+
     def _drain_write_native(self, entry: str, target: str, sid: str) -> str:
         """Land one drained entry in the pool (L0, source=auto, D5 category
         stamp, source_profile stamp). Profile-scoped dedup (D4): a row already
@@ -10079,6 +10160,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 return self._tool_search(args)
             elif tool_name == "shared_memory_search":
                 return self._tool_shared_search(args)
+            elif tool_name == "shared_memory_handoff":
+                return self._tool_shared_handoff(args)
+            elif tool_name == "shared_memory_take":
+                return self._tool_shared_take(args)
             elif tool_name == "filemem_delete":
                 return self._tool_delete(args)
             elif tool_name == "filemem_supersede":
