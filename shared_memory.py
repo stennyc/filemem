@@ -366,9 +366,15 @@ def create_task(cfg: Dict[str, Any], agent_id: str, task_name: str) -> Optional[
 
 
 def handoff(cfg: Dict[str, Any], task_ref: str, to_agent: str,
-            summary: str, plan_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+            summary: str, plan_id: Optional[str] = None,
+            repo_url: Optional[str] = None, branch: Optional[str] = None,
+            commit: Optional[str] = None, setup: Optional[str] = None
+            ) -> Optional[Dict[str, Any]]:
     """门 3: 交棒 (写 pending 棒, 可带 plan_id 指针 — 不传 PRD 正文).
-    交方 = 本机 (cfg.agent_id). 单活: 该 task_ref 已有 pending 棒则中央拒."""
+    交方 = 本机 (cfg.agent_id). 单活: 该 task_ref 已有 pending 棒则中央拒.
+    门 4: 涉代码交接时带 4 指针 (repo_url/branch/commit/setup) — 代码走中央
+    Gitea 的 git push/pull, 棒只传指针 (只推不拉/中央=指针 同构). 中央 hand_off
+    硬门槛: 任一指针非空则 repo_url+commit+setup 三项必齐, 缺一拒 (选 1+3)."""
     conn = _PgConn(cfg["pg"])
     try:
         agent_id = cfg["agent_id"]
@@ -377,8 +383,9 @@ def handoff(cfg: Dict[str, Any], task_ref: str, to_agent: str,
         token_hash = hashlib.sha256((cfg.get("token") or "").encode("utf-8")).hexdigest()
         cur = conn.cur()
         cur.execute(
-            "SELECT hand_off(%s, %s, %s, %s, %s, %s)",
-            (task_ref, agent_id, to_agent, summary, token_hash, plan_id))
+            "SELECT hand_off(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (task_ref, agent_id, to_agent, summary, token_hash,
+             plan_id, repo_url, branch, commit, setup))
         row = cur.fetchone()
         conn.commit()
         return {"status": "ok", "task_ref": task_ref, "version": row[0] if row else None}
@@ -415,11 +422,13 @@ def take_handoff(cfg: Dict[str, Any], task_ref: str) -> Optional[Dict[str, Any]]
         except Exception:
             conn.close()
             return None
-        # 读回: 普通 SELECT 11 列 (物理 ordinal), 按 (task_ref, to_agent=本agent, taken).
+        # 读回: 普通 SELECT 15 列 (物理 ordinal, S8 后含门 4 的 4 指针), 按
+        # (task_ref, to_agent=本agent, taken).
         try:
             cur.execute(
                 "SELECT handoff_id, task_ref, version, from_agent, to_agent, summary, "
-                "state, taken_by, created_at, taken_at, plan_id FROM handoffs "
+                "state, taken_by, created_at, taken_at, plan_id, "
+                "repo_url, branch, commit, setup FROM handoffs "
                 "WHERE task_ref = %s AND to_agent = %s AND state = 'taken' "
                 "ORDER BY version DESC LIMIT 1",
                 (task_ref, agent_id))
@@ -431,7 +440,7 @@ def take_handoff(cfg: Dict[str, Any], task_ref: str) -> Optional[Dict[str, Any]]
             return None
         cols = ["handoff_id", "task_ref", "version", "from_agent", "to_agent",
                 "summary", "state", "taken_by", "created_at", "taken_at",
-                "plan_id"]
+                "plan_id", "repo_url", "branch", "commit", "setup"]
         return dict(zip(cols, row))
     except _TokenRejected as e:
         logger.warning(f"shared_memory take_handoff token rejected: {e}")

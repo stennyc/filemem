@@ -3247,15 +3247,24 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         to_agent = str(args.get("to") or "").strip()
         summary = str(args.get("summary") or "").strip()
         plan_id = (str(args.get("plan_id") or "").strip() or None)
+        # 门 4: 代码交接 4 指针 (全空 = 纯记忆/知识交接, 不涉代码; 涉代码则中央
+        # hand_off 硬门槛: repo_url+commit+setup 必齐, 缺一拒).
+        repo_url = (str(args.get("repo_url") or "").strip() or None)
+        branch = (str(args.get("branch") or "").strip() or None)
+        commit = (str(args.get("commit") or "").strip() or None)
+        setup = (str(args.get("setup") or "").strip() or None)
         if not task_ref or not to_agent or not summary:
             return json.dumps({"success": False,
                                "error": "task_ref / to / summary 均必填"})
-        out = sm_mod.handoff(cfg, task_ref, to_agent, summary, plan_id)
+        out = sm_mod.handoff(cfg, task_ref, to_agent, summary, plan_id,
+                             repo_url, branch, commit, setup)
         if out is None:
             return json.dumps({"success": False,
-                               "error": "交棒失败 (token 拒 / PG 不可达 / 单活约束: 该 task_ref 已有 pending 棒)"})
+                               "error": "交棒失败 (token 拒 / PG 不可达 / 单活约束: 该 task_ref 已有 pending 棒 / 门 4 代码交接门槛不过: repo_url+commit+setup 必齐)"})
         return json.dumps({"success": True, "task_ref": task_ref,
-                           "version": out.get("version"), "plan_id": plan_id})
+                           "version": out.get("version"), "plan_id": plan_id,
+                           "repo_url": repo_url, "branch": branch,
+                           "commit": commit, "setup": setup})
 
     def _tool_shared_take(self, args: Dict) -> str:
         """门 3 取棒 (跨机, 原子翻 pending->taken): 取回行 dict (含 plan_id 指针).
@@ -3281,7 +3290,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         return json.dumps({"success": True,
                            "results": {k: row.get(k) for k in
                                        ("task_ref", "version", "from_agent",
-                                        "to_agent", "summary", "state", "plan_id")}})
+                                        "to_agent", "summary", "state", "plan_id",
+                                        "repo_url", "branch", "commit", "setup")}})
 
     def _handoff_plan_hint(self) -> str:
         """S6b (owner 定稿, 选 B): 交棒提示行 — 本地有未完成 plan
