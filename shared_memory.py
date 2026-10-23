@@ -100,11 +100,19 @@ def _load_shared_memory_config() -> Optional[Dict[str, Any]]:
 
 
 def _read_config_yaml_text() -> Optional[str]:
-    """定位并读 config.yaml 全文。
+    """定位并读 config.yaml 全文 (owner 定稿 2026-10-23, 机器级 agent_id).
 
-    优先 HERMES_CONFIG env (宿主显式指定); 否则按 HERMES_HOME + HERMES_PROFILE
-    解析: 有 HERMES_PROFILE 且 <HERMES_HOME>/profiles/<name>/config.yaml 存在
-    -> 读它; 否则读 <HERMES_HOME>/config.yaml。全缺 -> None。"""
+    模型: filemem 数据源全机统一一份, 1 profile = 1 agent 但差异下沉到行级
+    source_profile 列; agent_id/token 是机器级 (跨机 50 台 = 50 个 agent_id),
+    不是 per-profile。所以本机读顺序:
+
+    1. HERMES_CONFIG env (宿主显式指定, 最高优先)
+    2. <HERMES_HOME>/config.yaml  (global, 机器级 — multiplex 宿主无 HERMES_PROFILE
+       env, 本机 12 profile 共用一份机器级配置就配在这, 全机命中)
+    3. <HERMES_HOME>/profiles/<name>/config.yaml (仅当 HERMES_PROFILE 有值且
+       global 读不到/缺 shared_memory 段时才用, 兜底部署不规范的机器)
+
+    全缺 -> None (no-op, 本地字节级不变)。"""
     import os
     explicit = os.environ.get("HERMES_CONFIG", "").strip()
     if explicit and os.path.isfile(explicit):
@@ -116,11 +124,11 @@ def _read_config_yaml_text() -> Optional[str]:
     home = os.environ.get("HERMES_HOME", "").strip()
     if not home:
         return None
+    # global 优先 (机器级 agent_id 的本机正解)
+    candidates = [f"{home}/config.yaml"]
     profile = os.environ.get("HERMES_PROFILE", "").strip()
-    candidates = []
     if profile:
         candidates.append(f"{home}/profiles/{profile}/config.yaml")
-    candidates.append(f"{home}/config.yaml")
     for p in candidates:
         if os.path.isfile(p):
             try:
