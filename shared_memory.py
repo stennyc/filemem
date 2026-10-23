@@ -452,6 +452,64 @@ def take_handoff(cfg: Dict[str, Any], task_ref: str) -> Optional[Dict[str, Any]]
         conn.close()
 
 
+def _all_local_row_ids(memories_dir) -> List[str]:
+    """本地全 shard 行 id (门 1 全量沉淀对账用). 5 shard 全扫含 plan."""
+    ids = []
+    for mem_type in ("fact", "preference", "decision", "task", "plan"):
+        mem_file = Path(memories_dir) / f"{mem_type}.json"
+        if not mem_file.exists():
+            continue
+        try:
+            with open(mem_file, "r", encoding="utf-8") as f:
+                for it in json.load(f):
+                    ids.append(it["id"])
+        except Exception:
+            continue
+    return ids
+
+
+def reconcile_local_to_central(provider) -> Dict[str, Any]:
+    """Q1 启动对账腿: provider initialize 后跑一次, 本地全 shard 行 vs 中央差集
+    补推 (幂等, 只推本地有中央无的, 不重推已在中央的). 根除"重启/宕机期间
+    auto-catch 没 fire 的缺口". 50 agent 规模控频: 每 host 生命周期一次由调用方
+    flag 守, 本函数只做差集 + 补推.
+
+    返回 {"status": "ok"|"skipped", "missing": n, "pushed": n}."""
+    cfg = _load_shared_memory_config()
+    if cfg is None:
+        return {"status": "skipped", "reason": "config-absent-or-disabled",
+                "missing": 0, "pushed": 0}
+    conn = _PgConn(cfg["pg"])
+    try:
+        agent_id = cfg["agent_id"]
+        _central_auth(conn, agent_id, cfg.get("token", ""))
+        cur = conn.cur()
+        # 查中央已有行 id (只取 id, 不取 content — 差集判定够用)
+        cur.execute(
+            "SELECT id FROM memories WHERE agent_id = %s", (agent_id,))
+        central_ids = {r[0] for r in cur.fetchall()}
+        # 本地全 shard 行 id
+        local_ids = _all_local_row_ids(provider.memories_dir)
+        missing = [rid for rid in local_ids if rid not in central_ids]
+        if not missing:
+            return {"status": "ok", "missing": 0, "pushed": 0,
+                    "reason": "in-sync"}
+        # 差集补推 (复用 _push_locked 的幂等 upsert, 只推 missing)
+        result = _push_locked(provider, cfg, missing)
+        return {"status": result.get("status", "ok"),
+                "missing": len(missing), "pushed": result.get("pushed", 0)}
+    except _TokenRejected as e:
+        logger.warning(f"shared_memory reconcile_local_to_central token rejected: {e}")
+        return {"status": "rejected", "reason": "token-rejected",
+                "missing": 0, "pushed": 0}
+    except Exception as e:
+        logger.warning(f"shared_memory reconcile_local_to_central no-op (fail-soft): {e}")
+        return {"status": "skipped", "reason": f"fail-soft: {e}",
+                "missing": 0, "pushed": 0}
+    finally:
+        conn.close()
+
+
 def _push_locked(provider, cfg: Dict[str, Any], new_row_ids: List[str]) -> Dict[str, Any]:
     conn = _PgConn(cfg["pg"])
     try:

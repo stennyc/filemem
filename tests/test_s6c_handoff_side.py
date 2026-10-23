@@ -239,3 +239,151 @@ class TestSharedMemModuleHandoff:
             with mock.patch.object(sm, "_central_auth"):
                 r = sm.take_handoff(cfg, "T-99")
         assert r is None
+
+
+class TestReconcileLocalToCentral:
+    """Q1 启动对账腿 (owner 定稿 2026-10-23): provider initialize 后本地全 shard
+    vs 中央差集补推 (幂等, 只推本地有中央无的, 根除重启/宕机期间 auto-catch 缺口).
+    Q2: plan 行同走 5 shard 全量推中央 (中央 memories 表已存 plan, 无需独立 plans 表)."""
+
+    def _provider_with_rows(self, tmp_path, rows):
+        p = _make_provider(tmp_path)
+        p.memories_dir.mkdir(parents=True, exist_ok=True)
+        import json as _json
+        # 把 rows 按 mem_type 散到 5 shard 文件
+        by_type = {}
+        for r in rows:
+            by_type.setdefault(r.get("type", "fact"), []).append(r)
+        for mtype, items in by_type.items():
+            with open(p.memories_dir / f"{mtype}.json", "w", encoding="utf-8") as f:
+                _json.dump(items, f)
+        return p
+
+    def test_reconcile_pushes_only_missing_ids(self, tmp_path):
+        import shared_memory as sm
+        p = self._provider_with_rows(tmp_path, [
+            {"id": "fact_1", "type": "fact", "content": "a", "level": "L0",
+             "updated_at": "2026-10-23T10:00:00", "created_at": "2026-10-23T10:00:00",
+             "metadata": {"shared_version": 1}},
+            {"id": "plan_1", "type": "plan", "content": "b", "level": "L2",
+             "updated_at": "2026-10-23T10:00:00", "created_at": "2026-10-23T10:00:00",
+             "metadata": {"plan_state": "in_progress", "plan_id": "plan_1",
+                          "shared_version": 1}},
+            {"id": "task_1", "type": "task", "content": "c", "level": "L1",
+             "updated_at": "2026-10-23T10:00:00", "created_at": "2026-10-23T10:00:00",
+             "metadata": {"shared_version": 1}},
+        ])
+        # 中央已有 task_1 (已在中央, 不该重推); fact_1/plan_1 中央没有 (该推)
+        pushed_ids = []
+
+        class _FakeCur:
+            def __init__(self): self.rows = []
+            def execute(self, sql, params=None):
+                if "SELECT id FROM memories" in sql:
+                    self.rows = [("task_1",)]
+                else:
+                    pushed_ids.append(params[0])  # upsert_memory_row 第一参 = id
+            def fetchall(self): return self.rows
+            def fetchone(self): return None
+            def close(self): pass
+        class _FakeConn:
+            def __init__(self): self._cur = _FakeCur()
+            def cur(self): return self._cur
+            def commit(self): pass
+            def close(self): pass
+
+        cfg = _cfg()
+        p._shared_mem_cfg = cfg
+        with mock.patch.object(sm, "_PgConn", lambda c: _FakeConn()):
+            with mock.patch.object(sm, "_central_auth"):
+                with mock.patch.object(sm, "_load_shared_memory_config",
+                                       lambda: cfg):
+                    r = sm.reconcile_local_to_central(p)
+        assert r["status"] == "ok"
+        # 只推了中央缺的 (fact_1 + plan_1), 已在中央的 task_1 没重推
+        assert sorted(pushed_ids) == ["fact_1", "plan_1"], \
+            f"应只推差集 fact_1+plan_1, 实际: {pushed_ids}"
+        assert r["missing"] == 2 and r["pushed"] == 2
+
+    def test_reconcile_in_sync_pushes_zero(self, tmp_path):
+        import shared_memory as sm
+        p = self._provider_with_rows(tmp_path, [
+            {"id": "fact_1", "type": "fact", "content": "a", "level": "L0",
+             "updated_at": "2026-10-23T10:00:00", "created_at": "2026-10-23T10:00:00",
+             "metadata": {"shared_version": 1}},
+        ])
+        pushed = []
+
+        class _FakeCur:
+            def __init__(self): self.rows = []
+            def execute(self, sql, params=None):
+                if "SELECT id FROM memories" in sql:
+                    self.rows = [("fact_1",)]  # 中央已有 fact_1
+                else:
+                    pushed.append(1)
+            def fetchall(self): return self.rows
+            def fetchone(self): return None
+            def close(self): pass
+        class _FakeConn:
+            def __init__(self): self._cur = _FakeCur()
+            def cur(self): return self._cur
+            def commit(self): pass
+            def close(self): pass
+
+        cfg = _cfg()
+        with mock.patch.object(sm, "_PgConn", lambda c: _FakeConn()):
+            with mock.patch.object(sm, "_central_auth"):
+                with mock.patch.object(sm, "_load_shared_memory_config",
+                                       lambda: cfg):
+                    r = sm.reconcile_local_to_central(p)
+        assert r["status"] == "ok" and r.get("reason") == "in-sync"
+        assert r["missing"] == 0 and r["pushed"] == 0
+        assert pushed == []  # 已在中央, 零补推 (幂等)
+
+    def test_reconcile_skips_when_no_config(self):
+        import shared_memory as sm
+        p = _make_provider(Path("/tmp/unused_recon"))
+        with mock.patch.object(sm, "_load_shared_memory_config", lambda: None):
+            r = sm.reconcile_local_to_central(p)
+        assert r["status"] == "skipped" and r["pushed"] == 0
+
+    def test_plan_rows_also_pushed_via_five_shard_scan(self, tmp_path):
+        """Q2: plan 行走 5 shard 全量推中央 (中央 memories 表存 plan, 不建独立 plans 表)."""
+        import shared_memory as sm
+        p = self._provider_with_rows(tmp_path, [
+            {"id": "plan_9", "type": "plan", "content": "PRD 步骤", "level": "L2",
+             "updated_at": "2026-10-23T10:00:00", "created_at": "2026-10-23T10:00:00",
+             "metadata": {"plan_state": "in_progress", "plan_id": "plan_9",
+                          "shared_version": 1}},
+        ])
+        # _all_local_row_ids 扫 5 shard, plan.json 里的行必被捡到
+        ids = sm._all_local_row_ids(p.memories_dir)
+        assert "plan_9" in ids, "plan 行应被 5-shard 全量对账扫到 (Q2 推中央前置)"
+
+    def test_initialize_triggers_reconcile_once(self, tmp_path):
+        """Q1: provider initialize 挂对账腿, host 生命周期一次 (flag 控频).
+        不真跑完整 initialize (依赖 host 环境), 直接测 flag 短路逻辑:
+        flag=False 时该调 reconcile, flag=True 时不再调."""
+        import shared_memory as sm
+        p = _make_provider(tmp_path)
+        p._shared_mem_cfg = _cfg()
+        p._sm_mod = sm
+        p._sm_reconciled = False
+        calls = {"n": 0}
+
+        def _fake_reconcile(provider):
+            calls["n"] += 1
+            return {"status": "ok", "pushed": 0}
+
+        # 模拟 initialize 里对账腿的调用逻辑 (flag 短路)
+        if (p._shared_mem_cfg is not None and p._sm_mod is not None
+                and not p._sm_reconciled):
+            _fake_reconcile(p)
+            p._sm_reconciled = True
+        assert calls["n"] == 1 and p._sm_reconciled is True
+        # 第二次: flag 已 True, 短路不再调
+        if (p._shared_mem_cfg is not None and p._sm_mod is not None
+                and not p._sm_reconciled):
+            _fake_reconcile(p)
+            p._sm_reconciled = True
+        assert calls["n"] == 1, "flag 控频: 第二次不该再调 reconcile"

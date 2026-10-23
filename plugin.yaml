@@ -14,3 +14,5 @@ provides_tools:
 - filemem_review_drafts
 - filemem_check_promotion
 - shared_memory_search
+- shared_memory_handoff
+- shared_memory_take

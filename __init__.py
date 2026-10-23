@@ -2626,6 +2626,27 @@ class FileMemProvider(MemoryProvider):
         self._sm_mod = _sm
         self._shared_mem_cfg = _sm._load_shared_memory_config() if _sm else None
 
+        # Q1 启动对账腿 (owner 定稿 2026-10-23): provider initialize 后做一次
+        # "本地全 shard vs 中央差集补推", 根除"重启/宕机期间 auto-catch 没 fire 的
+        # 缺口". host 生命周期一次控频 (self._sm_reconciled 守): 同 host 进程重启后
+        # 第一个 session 触发一次, 后续 session 不再跑 (50 agent 规模防高频全量对账).
+        # 只推差集 (本地有中央无), 幂等, 不重推已在中央的. fail-soft: 中央不可达
+        # 静默跳过, 不阻塞 session initialize.
+        if (self._shared_mem_cfg is not None and getattr(self, "_sm_mod", None)
+                and not getattr(self, "_sm_reconciled", False)):
+            try:
+                _rc = self._sm_mod.reconcile_local_to_central(self)
+                self._sm_reconciled = True
+                if _rc.get("pushed", 0) > 0:
+                    logger.info(f"FileMem: startup reconcile pushed "
+                                f"{_rc['pushed']} missing rows to central "
+                                f"(gap from pre-restart auto-catch)")
+            except Exception as e:
+                # 对账腿永不阻塞 initialize — 失败本 session 不再试 (flag 不置,
+                # 下个 session 还有机会), 只 warn.
+                logger.warning(f"FileMem: startup reconcile failed "
+                                f"(fail-soft, will retry next session): {e}")
+
         # Load externalized decay params (TTL/salience/lambda) — full param surface kept on provider
         self._decay = load_decay_config(self.hermetis_home)
 
