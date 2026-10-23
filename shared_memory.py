@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -48,20 +49,32 @@ def _load_shared_memory_config() -> Optional[Dict[str, Any]]:
       None  -> 缺段 / enabled != true / 读 config 失败 (no-op)
       dict   -> 含 agent_id + pg{host,port,db,user,password}
     配置缺失 = 字节级不变 (owner 验收硬指标)。
-    """
-    try:
-        from hermes_cli.config import load_config, load_config_readonly
-    except Exception:
+
+    (a) 直读 config.yaml 文件, 不借 hermes_cli.config / ruamel (owner 定稿
+    2026-10-23): host tools-python 缺 ruamel/psycopg2/pyyaml, hermes 有专门
+    给工具用的 venv (/root/.hermes/plugin-venv), 依赖路径自动检测:
+      1. ruamel.yaml 可用 (host host venv) -> 用它解析 (支持 anchor/alias)
+      2. pyyaml 可用 -> 用它 (支持 anchor/alias)
+      3. 都没有 (host tools python) -> 纯文本最小解析
+    配置段结构固定 (agent_id + enabled + pg{host,port,db,user,password} +
+    token), 纯文本解析足够; filemem 段是 pg anchor (&id001) 的定义处, 直接
+    取定义处五键值, 无需解析 alias。"""
+    raw = _read_config_yaml_text()
+    if raw is None:
         return None
+    parsed: Optional[Dict[str, Any]] = None
     try:
-        config = load_config_readonly()
+        from ruamel.yaml import YAML
+        yaml_ = YAML(typ="safe")
+        parsed = yaml_.load(raw) or {}
     except Exception:
         try:
-            config = load_config()
+            import yaml as _pyyaml
+            parsed = _pyyaml.safe_load(raw) or {}
         except Exception:
-            return None
+            parsed = _parse_shared_memory_minimal(raw)
     try:
-        entries = config.get("plugins", {}).get("entries", {})
+        entries = (parsed or {}).get("plugins", {}).get("entries", {})
         fm = entries.get("filemem") or {}
         sm = fm.get("shared_memory")
         if not isinstance(sm, dict) or not sm.get("enabled"):
@@ -82,8 +95,137 @@ def _load_shared_memory_config() -> Optional[Dict[str, Any]]:
             },
         }
     except Exception as e:
-        logger.warning(f"shared_memory: config read failed, no-op: {e}")
+        logger.warning(f"shared_memory: config parse failed, no-op: {e}")
         return None
+
+
+def _read_config_yaml_text() -> Optional[str]:
+    """定位并读 config.yaml 全文。
+
+    优先 HERMES_CONFIG env (宿主显式指定); 否则按 HERMES_HOME + HERMES_PROFILE
+    解析: 有 HERMES_PROFILE 且 <HERMES_HOME>/profiles/<name>/config.yaml 存在
+    -> 读它; 否则读 <HERMES_HOME>/config.yaml。全缺 -> None。"""
+    import os
+    explicit = os.environ.get("HERMES_CONFIG", "").strip()
+    if explicit and os.path.isfile(explicit):
+        try:
+            with open(explicit, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            return None
+    home = os.environ.get("HERMES_HOME", "").strip()
+    if not home:
+        return None
+    profile = os.environ.get("HERMES_PROFILE", "").strip()
+    candidates = []
+    if profile:
+        candidates.append(f"{home}/profiles/{profile}/config.yaml")
+    candidates.append(f"{home}/config.yaml")
+    for p in candidates:
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return f.read()
+            except Exception:
+                continue
+    return None
+
+
+def _parse_shared_memory_minimal(raw: str) -> Dict[str, Any]:
+    """纯文本最小解析: 只提取 plugins.entries.filemem.shared_memory 段。
+
+    逐行扫, 跟踪缩进 (plugins: -> entries: -> filemem: -> shared_memory:),
+    共享段内取标量键 (enabled/agent_id/token) 和 pg: 子块的五键。
+    pg 块可能是 anchor 定义 (pg: &id001) — 取值键正常取; alias (pg: *id001)
+    在 filemem 段不会出现 (filemem 是 &id001 的定义处)。"""
+    import re
+    sm_block: Dict[str, Any] = {}
+    pg_block: Dict[str, Any] = {}
+    in_plugins = in_entries = in_filemem = False
+    in_sm = in_pg = False
+    _sm_indent = 0
+    _entries_indent = 0
+    _SM_KEYS = {"enabled", "agent_id", "token"}
+    _PG_KEYS = {"host", "port", "db", "user", "password"}
+
+    def _scalar(v: str):
+        s = v.strip()
+        if s.lower() in ("true", "yes"):
+            return True
+        if s.lower() in ("false", "no"):
+            return False
+        return s
+
+    for line in raw.splitlines():
+        stripped = line.rstrip()
+        if not in_plugins:
+            if re.match(r"^plugins:\s*$", stripped):
+                in_plugins = True
+            continue
+        if not in_entries:
+            m = re.match(r"^(\s+)entries:\s*$", stripped)
+            if m:
+                in_entries = True
+                _entries_indent = len(m.group(1))
+            continue
+        if not in_filemem:
+            m = re.match(r"^(\s+)(\S+):\s*$", stripped)
+            if m and len(m.group(1)) == _entries_indent + 2 and m.group(2) == "filemem":
+                in_filemem = True
+            continue
+        m = re.match(r"^(\s+)(\S+):(.*)$", stripped)
+        if not m:
+            continue
+        indent, key, rest = len(m.group(1)), m.group(2), m.group(3)
+        if not in_sm:
+            if key == "shared_memory" and not rest.strip():
+                in_sm = True
+                _sm_indent = indent
+                continue
+            if indent <= _entries_indent + 2:
+                # left the filemem block
+                break
+            continue
+        # in_sm
+        if in_pg:
+            if key in _PG_KEYS and rest.strip():
+                pg_block[key] = _scalar(rest)
+            elif key not in _PG_KEYS and indent <= _sm_indent + 2:
+                in_pg = False
+            continue
+        if key in _SM_KEYS and rest.strip():
+            sm_block[key] = _scalar(rest)
+        elif key == "pg" and not pg_block:
+            in_pg = True
+            sm_block["pg"] = pg_block
+        # leaving shared_memory
+        if indent <= _sm_indent and key not in _SM_KEYS and key != "pg":
+            break
+    if not in_sm:
+        return {}
+    sm_block.setdefault("pg", pg_block)
+    return {"plugins": {"entries": {"filemem": {"shared_memory": sm_block}}}}
+
+
+def _ensure_pg_dep_paths() -> None:
+    """Make psycopg2 importable from the running interpreter (mirror kb's
+    _ensure_kb_dep_paths). psycopg2 lives in the shared plugin-venv, NOT the
+    host tools-python. No-op when the host already sees it; never blocks.
+    Rollback-safe: deleting this + the call restores prior host-only behaviour.
+    """
+    import importlib.util
+    import os
+    if importlib.util.find_spec("psycopg2"):
+        return
+    site = os.environ.get(
+        "FM_PG_SITE",
+        "/root/.hermes/plugin-venv/lib/python3.14/site-packages",
+    )
+    if os.path.isdir(site) and site not in sys.path:
+        sys.path.append(site)
+
+
+_ensure_pg_dep_paths()
 
 
 class _PgConn:
