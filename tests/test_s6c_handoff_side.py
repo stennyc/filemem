@@ -55,7 +55,8 @@ class TestHandoffTools:
         p._shared_mem_cfg = _cfg()
         captured = {}
 
-        def _fake_sm_handoff(cfg, task_ref, to_agent, summary, plan_id=None):
+        def _fake_sm_handoff(cfg, task_ref, to_agent, summary, plan_id=None,
+                             repo_url=None, branch=None, commit=None, setup=None):
             captured["task_ref"] = task_ref
             captured["to"] = to_agent
             captured["summary"] = summary
@@ -69,6 +70,44 @@ class TestHandoffTools:
         assert out["success"] is True
         assert captured["plan_id"] == "plan_xxx"
         assert captured["to"] == "remote_b"
+
+    def test_handoff_passes_gate4_pointers(self, tmp_path):
+        p = _make_provider(tmp_path)
+        p._shared_mem_cfg = _cfg()
+        captured = {}
+
+        def _fake_sm_handoff(cfg, task_ref, to_agent, summary, plan_id=None,
+                             repo_url=None, branch=None, commit=None, setup=None):
+            captured.update(repo_url=repo_url, branch=branch,
+                            commit=commit, setup=setup)
+            return {"status": "ok", "version": 2}
+        p._sm_mod = mock.MagicMock()
+        p._sm_mod.handoff.side_effect = _fake_sm_handoff
+        out = json.loads(p._tool_shared_handoff(
+            {"task_ref": "T-g4", "to": "remote_b", "summary": "涉代码交接",
+             "repo_url": "git://gitea.10.1.1.x:3000/owner/proj",
+             "branch": "feat/x", "commit": "abc1234", "setup": "runtime.md"}))
+        assert out["success"] is True
+        assert captured == {"repo_url": "git://gitea.10.1.1.x:3000/owner/proj",
+                            "branch": "feat/x", "commit": "abc1234",
+                            "setup": "runtime.md"}
+        # 门 4 指针回显在结果里
+        assert out["commit"] == "abc1234" and out["setup"] == "runtime.md"
+
+    def test_take_returns_gate4_pointers(self, tmp_path):
+        p = _make_provider(tmp_path)
+        p._shared_mem_cfg = _cfg()
+        p._sm_mod = mock.MagicMock()
+        p._sm_mod.take_handoff.return_value = {
+            "task_ref": "T-g4", "version": 1, "plan_id": None,
+            "from_agent": "remote_b", "to_agent": "local", "summary": "s",
+            "repo_url": "git://gitea.10.1.1.x:3000/owner/proj",
+            "branch": "feat/x", "commit": "abc1234", "setup": "runtime.md"}
+        out = json.loads(p._tool_shared_take({"task_ref": "T-g4"}))
+        assert out["success"] is True
+        r = out["results"]
+        assert r["repo_url"] == "git://gitea.10.1.1.x:3000/owner/proj"
+        assert r["commit"] == "abc1234" and r["setup"] == "runtime.md"
 
     def test_take_returns_plan_id(self, tmp_path):
         p = _make_provider(tmp_path)
