@@ -2628,24 +2628,32 @@ class FileMemProvider(MemoryProvider):
 
         # Q1 启动对账腿 (owner 定稿 2026-10-23): provider initialize 后做一次
         # "本地全 shard vs 中央差集补推", 根除"重启/宕机期间 auto-catch 没 fire 的
-        # 缺口". host 生命周期一次控频 (self._sm_reconciled 守): 同 host 进程重启后
-        # 第一个 session 触发一次, 后续 session 不再跑 (50 agent 规模防高频全量对账).
-        # 只推差集 (本地有中央无), 幂等, 不重推已在中央的. fail-soft: 中央不可达
-        # 静默跳过, 不阻塞 session initialize.
+        # 缺口". 控频 + 自愈语义 (reviewer 复盘 2026-10-23 修订, 与 kb 哨兵
+        # 语义对齐):
+        #   - 成功 ok / in-sync / rejected: 置 _sm_reconciled=True, 本 provider
+        #     实例生命周期不再跑. 宿主 agent_init 注释 (L1346-1348) 钉死:
+        #     gateway api_server 每 turn 重建 agent 时传回已 initialize 的
+        #     memory_manager (provider 实例跨 turn 存活), 所以置位 = 实际
+        #     host 生命周期一次, 不会 per-session 重跑. rejected (token 拒)
+        #     属配置性错误, 置位不反复重试.
+        #   - 临时失败 (fail-soft, 中央不可达 → status=skipped): 不置 flag —
+        #     同 host 后续 session 或下个 host 进程再试; 长期宕机的代价
+        #     只是"一个差集 SELECT", 幂等且可承受.
+        # fail-soft: 中央不可达静默跳过, 永不阻塞 session initialize.
         if (self._shared_mem_cfg is not None and getattr(self, "_sm_mod", None)
                 and not getattr(self, "_sm_reconciled", False)):
             try:
                 _rc = self._sm_mod.reconcile_local_to_central(self)
-                self._sm_reconciled = True
+                if _rc.get("status") != "skipped":
+                    self._sm_reconciled = True
                 if _rc.get("pushed", 0) > 0:
                     logger.info(f"FileMem: startup reconcile pushed "
                                 f"{_rc['pushed']} missing rows to central "
                                 f"(gap from pre-restart auto-catch)")
             except Exception as e:
-                # 对账腿永不阻塞 initialize — 失败本 session 不再试 (flag 不置,
-                # 下个 session 还有机会), 只 warn.
+                # 对账腿永不阻塞 initialize — 异常不置 flag, 下次 initialize 重试.
                 logger.warning(f"FileMem: startup reconcile failed "
-                                f"(fail-soft, will retry next session): {e}")
+                                f"(fail-soft, will retry next initialize): {e}")
 
         # Load externalized decay params (TTL/salience/lambda) — full param surface kept on provider
         self._decay = load_decay_config(self.hermetis_home)

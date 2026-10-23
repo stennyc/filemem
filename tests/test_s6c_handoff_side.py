@@ -375,11 +375,14 @@ class TestReconcileLocalToCentral:
             calls["n"] += 1
             return {"status": "ok", "pushed": 0}
 
-        # 模拟 initialize 里对账腿的调用逻辑 (flag 短路)
+        p._sm_mod.reconcile_local_to_central = lambda prov: _fake_reconcile(prov)
+
+        # 模拟 initialize 里对账腿的调用逻辑 (flag 短路 + 成功置位)
         if (p._shared_mem_cfg is not None and p._sm_mod is not None
                 and not p._sm_reconciled):
-            _fake_reconcile(p)
-            p._sm_reconciled = True
+            _rc = p._sm_mod.reconcile_local_to_central(p)
+            if _rc.get("status") != "skipped":
+                p._sm_reconciled = True
         assert calls["n"] == 1 and p._sm_reconciled is True
         # 第二次: flag 已 True, 短路不再调
         if (p._shared_mem_cfg is not None and p._sm_mod is not None
@@ -387,3 +390,28 @@ class TestReconcileLocalToCentral:
             _fake_reconcile(p)
             p._sm_reconciled = True
         assert calls["n"] == 1, "flag 控频: 第二次不该再调 reconcile"
+
+    def test_reconcile_failsoft_does_not_set_flag(self, tmp_path):
+        """语义对齐 (kb reviewer P1, filemem 侧同步修): fail-soft
+        结果 (中央不可达, status=skipped) 不置 flag — 下个 session / host
+        进程再试; rejected (token 拒, 配置性错误) 置 flag 不重试."""
+        p = _make_provider(tmp_path)
+        p._shared_mem_cfg = _cfg()
+        p._sm_reconciled = False
+
+        def _run(status):
+            if not p._sm_reconciled:
+                _rc = {"status": status, "missing": 0, "pushed": 0}
+                if _rc.get("status") != "skipped":
+                    p._sm_reconciled = True
+            return p._sm_reconciled
+
+        # fail-soft (PG 不可达): 不置 flag → 还能再试
+        p._sm_reconciled = False
+        assert _run("skipped") is False, "fail-soft 不该置 flag"
+        # rejected (token 拒): 置 flag 不重试 (配置错误重试无意义)
+        p._sm_reconciled = False
+        assert _run("rejected") is True, "rejected 该置 flag 不重试"
+        # ok: 置 flag
+        p._sm_reconciled = False
+        assert _run("ok") is True

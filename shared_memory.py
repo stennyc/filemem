@@ -472,9 +472,14 @@ def reconcile_local_to_central(provider) -> Dict[str, Any]:
     """Q1 启动对账腿: provider initialize 后跑一次, 本地全 shard 行 vs 中央差集
     补推 (幂等, 只推本地有中央无的, 不重推已在中央的). 根除"重启/宕机期间
     auto-catch 没 fire 的缺口". 50 agent 规模控频: 每 host 生命周期一次由调用方
-    flag 守, 本函数只做差集 + 补推.
+    flag 守 (filemem initialize / kb _svc() 语义), 本函数只做差集 + 补推.
 
-    返回 {"status": "ok"|"skipped", "missing": n, "pushed": n}."""
+    返回 {"status": "ok"|"skipped", "missing": n, "pushed": n}.
+    语义约定 (调用方 flag 控频依据, 与 kb 对账腿一致):
+      - "ok" (in-sync 或 补推成功) / "rejected" (token 拒, 配置性错误): 调用方置 flag 不重试.
+      - "skipped" + reason="fail-soft: ...": 临时故障 (PG 不可达), 调用方不置 flag,
+        下次 initialize 再试.
+      - "skipped" + reason="config-absent-or-disabled": 配置关闭, 调用方不跑本函数."""
     cfg = _load_shared_memory_config()
     if cfg is None:
         return {"status": "skipped", "reason": "config-absent-or-disabled",
