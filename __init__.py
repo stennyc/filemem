@@ -3770,6 +3770,185 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 json.dump([d.to_dict() for d in drafts], f, ensure_ascii=False, indent=2)
 
 
+    # ── 门 5: 用户思维逻辑底座 (worldview gate, owner 定稿 2026-10-28) ────────
+    # S3 全量无上限 (owner 拍 YAGNI): 读 worldview.json 全部 confirmed 行,
+    # 渲染成 [用户思维逻辑底座] 块, 每轮无条件注入 (选项1: 全量, 不做相关性
+    # 稀释 / 不分层 / 不截断). 字节稳定: session 内 worldview 不变 -> 前缀
+    # 缓存无惩罚. 条目天然稀少 (入库门槛: 信号硬+拍板+跨项目稳定), 到 200 条
+    # 概率极低, 故不设 max_rows 上限.
+    # 挂 pre_llm_call 面 (不碰宿主 on_session_start, 守红线③).
+    # 独立块, 不进 prefetch 召回流 (白底短路/trivial 早退路径也会带上它,
+    # 且不被相关性过滤稀释世界观).
+    # fail-soft: 读失败/无行 -> 返回空串, 不影响 [记忆上下文] 注入.
+
+    def _gate5_worldview_block(self) -> str:
+        """渲染用户思维逻辑底座块 (门 5 世界观, 全量注入).
+
+        Returns:
+            空串 (无行 / 读失败, fail-soft) 或 带引导语的世界观块.
+            块含: 引导语 (定位成"你已内化、关于用户的稳定认知底座, 直接据此
+            预判, 不当待查证事实") + 逐条 content + source 戳.
+        """
+        try:
+            path = self.memories_dir / "worldview.json"
+            if not path.exists():
+                return ""
+            with open(path, "r", encoding="utf-8") as f:
+                rows = json.load(f)
+            # 只收 confirmed 的世界观行 (门 5 条目只收用户拍板过的)
+            rows = [r for r in rows if r.get("confirmed") and r.get("type") == "worldview"]
+            if not rows:
+                return ""
+            lines = [
+                "[用户思维逻辑底座]",
+                "# 这是你已内化、关于「用户怎么做/怎么想」的稳定认知底座，跨项目、跨时间成立。",
+                "# 直接据此预判并协作：不需要怀疑、不需要重新权衡、不当作待查证事实。",
+                "# source=stated=用户明确说过；inferred-confirmed=你推断、用户已认可。",
+                "# 若本 session 内用户的即时指示与之冲突，以即时指示为准，但不回写本底座。",
+                "",
+            ]
+            for r in rows:
+                src = (r.get("metadata") or {}).get("source", "stated")
+                lines.append(f"- ({src}) {r.get('content','').strip()}")
+            block = "\n".join(lines)
+            logger.info(f"FileMem: gate5 worldview block rendered ({len(rows)} rows, {len(block)} chars)")
+            return block
+        except Exception as e:
+            logger.debug(f"FileMem: gate5 worldview block failed (fail-soft, no injection): {e}")
+            return ""
+
+    # ── 门 5 写侧: worldview upsert (owner 定稿: 仅用户拍板触发的入库/替换) ──
+    # 新增: 追加一行到 worldview.json (confirmed=TRUE, ttl_days=None 无 decay).
+    # 替换: 带 supersedes_old_id -> 给旧行打 superseded_by 指针 (和迁移脚本同语义).
+    # 写盘前备份 + flock (与现有分片写同一套锁, 不裸写). fail-soft: 任何异常
+    # 吞掉 (宿主 turn 永不被 gate5 写侧炸), 返回 None. 调用面 = 宿主 clarify
+    # 拍板放行后 agent 调 gate5_worldview_upsert tool (门 5 clarify 约定).
+    # S3 全量无上限 (owner 拍 YAGNI): 不做行数截断/分层 — 世界观天然稀少.
+    def _gate5_worldview_upsert(self, content: str, source: str = "stated",
+                                supersedes_old_id: Optional[str] = None,
+                                source_note: Optional[str] = None) -> Optional[str]:
+        """落一行门 5 世界观 (新增或替换旧烙印). 返回新行 id.
+
+        - content: 世界观条目正文 (主语=用户的思维逻辑: 怎么动手 / 要我按什么顺序做)
+        - source: 'stated' (用户明确说) | 'inferred-confirmed' (agent 推断+用户认可)
+        - supersedes_old_id: 若替换旧烙印, 传旧行 id -> 旧行打 superseded_by 指针
+        - source_note: 可选来源标注 (e.g. 无单一源行时说明)
+
+        门禁 (owner 定稿): 仅用户拍板后调用, 无 auto-decay (ttl_days=None),
+        替换/擦除仅由用户触发。fail-soft, 返回 None 表失败。
+        """
+        import time as _time
+        try:
+            path = self.memories_dir / "worldview.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # 进程内锁 + 跨进程 flock: worldview.json 是共享 store 上的
+            # read-modify-write (同 ~10 profile gateway 共写), 无锁的
+            # 并发 upsert = lost-update 窗口。对齐现有分片写协议:
+            # self._lock (进程内) 包整个 RMW, _shard_lock (flock/msvcrt)
+            # 再跨进程串行化。
+            with self._lock:
+                with self._shard_lock(path):
+                    return self._gate5_worldview_upsert_locked(path, content, source,
+                                                               supersedes_old_id, source_note)
+        except Exception as e:
+            logger.warning(f"FileMem: gate5 worldview upsert failed (fail-soft, no write): {e}")
+            return None
+
+    def _gate5_worldview_upsert_locked(self, path, content: str, source: str = "stated",
+                                       supersedes_old_id: Optional[str] = None,
+                                       source_note: Optional[str] = None) -> Optional[str]:
+        """RMW body — runs UNDER self._lock + self._shard_lock (see caller)."""
+        import time as _time
+        try:
+            # 读现有行 (不存在则空数组; 损坏则 fail-soft 拒写, 保护人工数据)
+            existing = []
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    _raw = f.read()
+                if _raw.strip():
+                    try:
+                        _loaded = json.loads(_raw)
+                    except (json.JSONDecodeError, ValueError):
+                        logger.warning(
+                            "FileMem: gate5 worldview.json is corrupt/non-JSON "
+                            f"({len(_raw)} bytes) — refusing to overwrite, "
+                            "fail-soft return None (operator must repair or remove).")
+                        return None
+                    if not isinstance(_loaded, list):
+                        logger.warning(
+                            "FileMem: gate5 worldview.json is not a JSON array "
+                            f"(got {type(_loaded).__name__}) — refusing to overwrite.")
+                        return None
+                    existing = _loaded
+            # 生成新 id (wv_ 前缀, 避免与迁移脚本固定 id 撞)
+            new_id = "wv_" + uuid.uuid4().hex[:8]
+            now = _time.strftime("%Y-%m-%dT%H:%M:%S", _time.gmtime())
+            meta = {
+                "source": source,
+                "source_profile": getattr(self, "source_profile", None) or "default",
+                "origin": {"kind": "user" if source == "stated" else "agent", "trust": "high"},
+                "gate": "worldview",
+                "category": "②" if source_note else "①",
+            }
+            if source_note:
+                meta["source_note"] = source_note
+            new_row = {
+                "id": new_id,
+                "type": "worldview",
+                "content": content.strip(),
+                "category": meta["category"],
+                "level": "L2",
+                "metadata": meta,
+                "created_at": now,
+                "updated_at": now,
+                "occurred_at": None,
+                "source": "gate5-upsert",
+                "confirmed": True,
+                "reference_count": 0,
+                "salience": 0.5,
+                "last_referenced": "",
+                "ttl_days": None,  # 无 decay (owner 定稿: 仅用户拍板替换)
+            }
+            existing.append(new_row)
+            # 替换: 给旧行打 superseded_by 指针 (不物理删, 保留审计链).
+            # 类型校验: 只给 type=='worldview' 的行打指针, 防止误传其它门
+            # (fact/decision/...) 的行 id 造成跨门审计污染. 不匹配则静默
+            # 跳过 (fail-soft, 不炸宿主 turn).
+            if supersedes_old_id:
+                for row in existing:
+                    if row.get("id") == supersedes_old_id:
+                        if row.get("type") != "worldview":
+                            logger.warning(
+                                f"FileMem: gate5 supersede target {supersedes_old_id} "
+                                f"has type={row.get('type')!r} (not 'worldview') — "
+                                "refusing to stamp a cross-gate pointer.")
+                            break
+                        row.setdefault("metadata", {})["superseded_by"] = new_id
+                        break
+            # 写盘 (备份 + 原子): 到达这里时 existing 必为合法 JSON 数组
+            # (损坏/非数组在上方读阶段已拒写 return None, 走不到这里),
+            # 故备份分支实际只处理合法 JSON — 非 JSON 探测失败是 fail-soft
+            # 兜底 (外部并发裸写污染窗口), 不备份, 直接 overwrite 为合法数组.
+            ts = _time.strftime("%Y%m%d%H%M%S")
+            if path.exists():
+                try:
+                    json.load(open(path, encoding="utf-8"))
+                except Exception:
+                    pass  # 并发污染窗口 (极小): 不备份, 首次合法化 overwrite
+                else:
+                    import shutil as _sh
+                    _sh.copy2(path, str(path) + f".bak-g5up-{ts}")
+            tmp = path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(existing, f, ensure_ascii=False, indent=2)
+            tmp.replace(path)  # 原子 rename
+            logger.info(f"FileMem: gate5 worldview upserted {new_id}"
+                        + (f" (superseded {supersedes_old_id})" if supersedes_old_id else ""))
+            return new_id
+        except Exception as e:
+            logger.warning(f"FileMem: gate5 worldview upsert failed (fail-soft, no write): {e}")
+            return None
+
     def system_prompt_block(self) -> str:
         """Return static system prompt text."""
         return "# Filemem\nYou have access to file-based memory with keyword-overlap search.\nUse the filemem tools to read and write memories.\n\nMemory Tiers:\n- L0: Environment facts (auto-saved)\n- L1: Operational经验 (confirmed at session end)\n- L2: Architecture decisions (requires explicit confirmation)"
@@ -5097,8 +5276,13 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         _p5_gate_cfg = getattr(self, "_decay", None)
         # P6-B (owner 2026-10-20): topic_guard.fail_open (default true) lets
         # the unresolvable-topic case DROP block-marker rows instead of
-        # listing everything.  The block list (default empty) is content
-        # substrings — kanban / room residue markers.  Scope: kind=='l0'
+        # listing everything.  The block list is content substrings —
+        # kanban / room residue markers.  The code-side default (DECAY_DEFAULTS
+        # block=[]) is a STRUCTURE placeholder only: at runtime the live
+        # decay.json topic_guard.block (owner hot-tunable, currently 10
+        # kanban/看板 phrases) overrides it; block=[] is effective ONLY when
+        # decay.json lacks the whole topic_guard block (-> all-keep, the
+        # pre-P5 zero-false-silence behavior).  Scope: kind=='l0'
         # ONLY (the 待拍板 L1/L2 class + plan_probe entries keep their own
         # faces and are NEVER silenced here).
         _tg = (_p5_gate_cfg or {}).get("topic_guard") if isinstance(_p5_gate_cfg, dict) else {}
@@ -9286,6 +9470,48 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 }
             },
             {
+                "name": "gate5_worldview_upsert",
+                "description": (
+                    "门 5 写侧: 落一行用户思维逻辑世界观 (新增或替换旧烙印). "
+                    "ONLY call AFTER the user has explicitly approved via the 门 5 clarify flow "
+                    "(候选: '要烙进底座吗?' / 替换: '要替换旧烙印吗?' — owner 定稿: 拍板权 100% 在用户, "
+                    "agent 永不自行判定某模式成立). Do NOT call to store plain facts/project-level "
+                    "decisions (those stay in decision/preference) — only the user's durable "
+                    "world-view / methodology / working order (cross-project + stable + about HOW "
+                    "not WHAT; ① how the user themselves acts, or ② the order the user wants you "
+                    "to act in their stead). Lands a confirmed L2 row with ttl_days=None "
+                    "(no auto-decay — replaced/erased ONLY by a later user-confirmed upsert). "
+                    "When replacing an old mark, pass supersedes_old_id to stamp a superseded_by "
+                    "pointer on the old row (audit chain kept, not physically deleted). "
+                    "source_stamp is REQUIRED audit: 'stated'=user explicitly said it, "
+                    "'inferred-confirmed'=you inferred it and the user approved. "
+                    "Returns the new row id, or None on fail-soft failure."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "The worldview entry text (subject = the user's thinking logic: how they act / the order they want you to act)."
+                        },
+                        "source": {
+                            "type": "string",
+                            "enum": ["stated", "inferred-confirmed"],
+                            "description": "AUDIT stamp (W1 soft-gate, owner 定稿): 'stated'=user explicitly said it; 'inferred-confirmed'=you inferred it and the user approved. A direct call that bypasses clarify will show here — the stamp is the留痕 that exposes an un-approved landing."
+                        },
+                        "supersedes_old_id": {
+                            "type": ["string", "null"],
+                            "description": "Optional: the id of an OLD worldview row to replace. When set, the old row gets a superseded_by pointer (kept on disk for audit, never physically deleted). Omit for a pure new entry."
+                        },
+                        "source_note": {
+                            "type": ["string", "null"],
+                            "description": "Optional provenance note (e.g. 'no single source row, owner confirmed repeatedly' or 'owner verbal in this session'). Set when the row has no single source_ref."
+                        }
+                    },
+                    "required": ["content", "source"]
+                }
+            },
+            {
                 "name": "filemem_review_drafts",
                 "description": "Review session memory drafts. action=\\\"preview\\\" lists pending entries by content and id (internal storage filenames are never exposed); action=\\\"confirm\\\"/\\\"discard\\\" dispose of pending entries in bulk. Pass target=<owner id> to act on a HISTORICAL session's drafts (internal addressing only — do NOT surface draft filenames to the user); omit target to act on the current session's drafts. SLICE-4 (owner 2026-10-17): action=\\\"plan_probe\\\" + verdict=\\\"save\\\"|\\\"dismiss\\\" is the user's nod on a pending plan-probe panel entry (the [记忆报告] lists it as a 'plan_probe_<hash>' id) — 'save' lands a PRD-shaped plan row via filemem_plan(action='create'); 'dismiss' writes nothing.",
                 "parameters": {
@@ -9727,6 +9953,48 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             return (f"anchor kind {kind!r} not in the cross-profile-verifiable "
                     "whitelist (test_pass/git_hash/file_path/no_anchor)")
         return "anchor must be a dict {kind, value} or 'no_anchor'"
+
+    def _tool_gate5_worldview_upsert(self, args: Dict) -> str:
+        """门 5 写侧: gate5_worldview_upsert tool — 落一行世界观 (新增/替换).
+
+        宿主 tool-result 契约: 返回 JSON 字符串 (同 filemem_supersede 风格).
+        失败 fail-soft (返回 {"error": ...}), 宿主 turn 永不炸.
+
+        入参 (schema 定义在 get_tool_schemas):
+          content (必填) — 世界观正文 (主语=用户思维逻辑: ①怎么动手 / ②要我按什么顺序做)
+          source (必填)   — 审计戳: 'stated' | 'inferred-confirmed'
+          supersedes_old_id (可选) — 替换旧烙印: 旧行 id -> 旧行打 superseded_by 指针
+          source_note (可选) — 来源标注 (无单一源行时说明)
+        """
+        try:
+            content = (args.get("content") or "").strip()
+            source = args.get("source") or "stated"
+            supersedes_old_id = args.get("supersedes_old_id") or None
+            source_note = args.get("source_note") or None
+            if not content:
+                return json.dumps({"error": "content required", "ok": False})
+            if source not in ("stated", "inferred-confirmed"):
+                return json.dumps({
+                    "error": f"source must be 'stated' or 'inferred-confirmed', got {source!r}",
+                    "ok": False})
+            # 落库 (复用 _gate5_worldview_upsert: 备份+原子写+superseded_by 指针)
+            new_id = self._gate5_worldview_upsert(
+                content=content,
+                source=source,
+                supersedes_old_id=supersedes_old_id,
+                source_note=source_note)
+            if new_id is None:
+                return json.dumps({"error": "upsert failed (see log, fail-soft)", "ok": False})
+            return json.dumps({
+                "ok": True,
+                "id": new_id,
+                "supersedes_old_id": supersedes_old_id,
+                "source": source,
+                "message": ("世界观 row landed "
+                            + (f"(superseded {supersedes_old_id})" if supersedes_old_id else "")),
+            })
+        except Exception as e:
+            return json.dumps({"error": f"gate5_worldview_upsert failed: {e}", "ok": False})
 
     def _tool_plan(self, args: Dict) -> str:
         """PLAN-type PRD §6: filemem_plan tool — list / create / advance.
@@ -10215,6 +10483,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 return self._tool_handoff_extract(args)
             elif tool_name == "filemem_plan":
                 return self._tool_plan(args)
+            elif tool_name == "gate5_worldview_upsert":
+                return self._tool_gate5_worldview_upsert(args)
             else:
                 return json.dumps({"error": f"Unknown tool: {tool_name}"})
         except Exception as e:
@@ -15405,10 +15675,22 @@ def filemem_auto_retrieve(session_id: str, user_message: str, conversation_histo
             provider.drain_native_md(session_id=session_id)
 
         context = provider.prefetch(user_message, session_id=session_id)
+        # 门 5: 用户思维逻辑底座 — 独立块, 无条件全量注入 (不依赖 prefetch 召回命中).
+        # 拼在 [记忆上下文] 之前 (更早进注意力); 字节稳定 (session 内 worldview 不变),
+        # 前缀缓存无惩罚. fail-soft: 无块/读失败 -> "" -> 退回现状 (纯 [记忆上下文] 或 None).
+        worldview_block = provider._gate5_worldview_block()
+        if not context and not worldview_block:
+            return None
         if context:
             line_count = len(context.split("\n"))
             logger.info(f"FileMem: injected {line_count} memories for session={session_id}")
-            return {"context": f"[记忆上下文]\n{context}\n"}
+            parts = []
+            if worldview_block:
+                parts.append(worldview_block)
+            parts.append(f"[记忆上下文]\n{context}\n")
+            return {"context": "\n".join(parts)}
+        # context 空但 worldview 块在 (本轮无召回命中, 但世界观底座仍注入):
+        return {"context": worldview_block}
     except Exception as e:
         logger.debug(f"FileMem: pre_llm_call hook failed: {e}")
     return None
