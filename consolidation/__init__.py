@@ -8,6 +8,18 @@ DECAY_DEFAULTS = {
     "salience_threshold": 0.5,
     "salience_boost": 1.2,
     "ttl_days": {"L0": 30, "L1": 90, "L2": None},
+    # P6-B (owner 2026-10-20): topic-guard 词面硬闸 (topic-guard 词面 hard
+    # gate): a draft/candidate matching ANY decay.json topic_guard.block
+    # phrase is blocked from auto-confirmation (kanban / 看板 relay noise
+    # must never become a confirmed memory). enable=true + fail_open=false
+    # = the active posture this owner runs; block is the keyword list
+    # (hot-tunable in decay.json; the code-side defaults keep the two in
+    # lockstep per the S2 egress parity test).
+    "topic_guard": {
+        "enable": True,
+        "fail_open": False,
+        "block": [],
+    },
     "search": {
         "fallback": "keyword",
         # SA2-3: BM25 keyword-axis knobs (Okapi; read by search_index.py).

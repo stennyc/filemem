@@ -47,6 +47,7 @@ import pathlib
 import threading
 import types
 import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -286,7 +287,7 @@ def test_f1_spawn_thread_is_started(monkeypatch, tmp_path):
     store = _make_store(
         tmp_path,
         {"fact": [_row(f"f{i}", f"fact number {i} content") for i in range(5)]},
-        raw_pending_rows=[{"topic": f"t{i}", "content": f"raw {i}", "created_ts": "2026-09-28T00:00:00"}
+        raw_pending_rows=[{"topic": f"t{i}", "content": f"raw {i}", "created_ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")}
                           for i in range(5)],
     )
     decay = _decay_copy(interval_min=0)
@@ -469,7 +470,7 @@ def test_f4_ctx_none_llm_skip_but_c_section_runs(tmp_path):
     store = _make_store(
         tmp_path,
         {},
-        raw_pending_rows=[{"topic": f"t{i}", "content": f"raw {i}", "created_ts": "2026-09-28T00:00:00"}
+        raw_pending_rows=[{"topic": f"t{i}", "content": f"raw {i}", "created_ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")}
                           for i in range(5)],
     )
     decay = _decay_copy(interval_min=0)
@@ -604,7 +605,8 @@ def test_reg_tick_body_fail_soft_all_green(tmp_path, monkeypatch):
     store = _make_store(
         tmp_path,
         {},  # empty memory pool -> no episodic / no candidates
-        raw_pending_rows=[{"topic": "t", "content": "raw", "created_ts": "2026-09-28T00:00:00"}],
+        raw_pending_rows=[{"topic": "t", "content": "raw",
+                           "created_ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")}],
     )
     decay = _decay_copy(interval_min=0)
     fake_ctx = types.SimpleNamespace(llm=None)  # ctx present but LLM unavailable

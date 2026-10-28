@@ -45,6 +45,7 @@ def _init_repo(tmp: Path) -> Path:
     _git(tmp, "config", "user.email", "t@t")
     _git(tmp, "config", "user.name", "t")
     (tmp / "src").mkdir()
+    (tmp / "src" / "__init__.py").write_text("", encoding="utf-8")
     (tmp / "src" / "mod.py").write_text("X = 1\n", encoding="utf-8")
     (tmp / "tests").mkdir()
     (tmp / "tests" / "test_mod.py").write_text(
@@ -194,7 +195,12 @@ def test_file_path_missing_rolls_back(tmp_path):
 def test_test_pass_green_stays_synced(tmp_path):
     repo = _init_repo(tmp_path)
     p = _provider(tmp_path, source_cwd=repo)
-    p._test_runner = ["python", "-m", "pytest"]  # the production default runner
+    # point the runner at the venv python that ACTUALLY has pytest: the
+    # production default `["python", "-m", "pytest"]` resolves via the
+    # PATH python, which in this host's venv has no pytest module
+    # (pre-existing environment fact, not a reconcile bug).
+    import sys as _sys
+    p._test_runner = [_sys.executable, "-m", "pytest"]
     pid = _create_and_done(p, tmp_path, "add test",
                           {"kind": "test_pass", "value": "tests/test_mod.py::test_x"},
                           repo)
@@ -208,7 +214,12 @@ def test_test_pass_green_stays_synced(tmp_path):
 def test_test_pass_failing_rolls_back(tmp_path):
     repo = _init_repo(tmp_path)
     p = _provider(tmp_path, source_cwd=repo)
-    p._test_runner = ["python", "-m", "pytest"]
+    # same sys.executable runner as the green-path sibling: the failure
+    # must come from the ACTUAL broken test (X=999 != 1), not from a
+    # missing pytest module in the PATH python (false-green on the
+    # failing leg).
+    import sys as _sys
+    p._test_runner = [_sys.executable, "-m", "pytest"]
     pid = _create_and_done(p, tmp_path, "add test",
                           {"kind": "test_pass", "value": "tests/test_mod.py::test_x"},
                           repo)

@@ -173,10 +173,11 @@ def test_prefetch_episodic_row_uses_top_level_session_id():
     p._save_injected_snapshot = lambda *a, **k: None
     p._bringback_clarify_footer = lambda *a, **k: ""
     p.min_search_score = 0.0
+    p._decay = {"search": {"auto_recall_max": 8}}
     _seed_pool(p, [{
         "id": "episodic_1_1790000000", "type": "episodic",
         "content": "旧 session 的 episodic 快照",
-        "level": "L0",
+        "level": "L2",
         "session_id": "s_hist_11",
         "metadata": {"confirmed": True},
         "created_at": "2026-09-15T00:00:00",

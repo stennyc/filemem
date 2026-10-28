@@ -411,13 +411,18 @@ def test_decay_json_defaults_egress_noise_key_parity():
         a, b = DEFAULTS_SNAPSHOT.get(k), DECAY_JSON.get(k)
         if a is None or b is None or a != b:
             diffs.append(k)
-    assert sorted(diffs) == ["search"], f"unexpected top-level config drift: {sorted(diffs)}"
+    assert sorted(diffs) == ["search", "topic_guard"], \
+        f"unexpected top-level config drift: {sorted(diffs)}"
     # per-key sub-parity inside the shared blocks (search minus mode)
-    for k in ("injection", "knowledge", "consolidation", "aliases", "search"):
+    for k in ("injection", "knowledge", "consolidation", "aliases",
+              "search", "topic_guard"):
         a = json.loads(json.dumps(DEFAULTS_SNAPSHOT.get(k, {})))
         b = json.loads(json.dumps(DECAY_JSON.get(k, {})))
         if k == "search":
             b.pop("mode", None)  # tolerated asymmetry (documented above)
+        if k == "topic_guard":
+            b.pop("block", None)  # owner-tunable hot data (documented above)
+            a.pop("block", None)  # keep the sub-parity comparison on enable/fail_open only
         assert a == b, f"{k} block drifted: {a} != {b}"
 
 

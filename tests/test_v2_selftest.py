@@ -9,6 +9,7 @@ Covers:
 6. negative leg: count_untagged_room_markers window semantics
 """
 import json, sys, pathlib, tempfile, threading, traceback
+from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from __init__ import (  # noqa: E402
@@ -27,6 +28,7 @@ def _make_provider(tmpdir: pathlib.Path) -> FileMemProvider:
     p = FileMemProvider.__new__(FileMemProvider)
     p._lock = threading.Lock()
     p.session_id = None
+    p.storage_dir = tmpdir  # audit / alias faces read this; __new__ skips __init__
     p.memories_dir = tmpdir / "memories"
     p.memories_dir.mkdir(parents=True, exist_ok=True)
     p.sessions_dir = None
@@ -137,16 +139,25 @@ def test_stale_lease_guard_resets_flags():
 def test_prefetch_drops_selftest_keeps_ordinary():
     tmp = pathlib.Path(tempfile.mkdtemp())
     p = _make_provider(tmp)
-    # Seed two items directly (bypass trigger): one tagged, one not.
+    # created_at kept fresh relative to NOW: the L0 default TTL (30 days,
+    # TTL_CONFIG) would expire a DATE-FIXED fixture ("2026-09-25") and the
+    # recall face would silently drop BOTH items (pre-existing fixture
+    # staleness — the self_test filter is what this test actually locks).
+    # per-row fresh timestamps (staggered by 10s) so created_at stays
+    # TTL-valid at any future run AND the two rows carry distinct stamps
+    # (protects any future uniqueness / sort-stability assertion).
+    _base = datetime.now(timezone.utc)
+    _ts0 = _base.strftime("%Y-%m-%dT%H:%M:%S")
+    _ts1 = (_base + timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%S")
     items = [
         MemoryItem(id="fact_0", type="fact",
                    content="port 8080 endpoint reachable", level="L0",
                    metadata={"source_profile": "test", "self_test": True},
-                   created_at="2026-09-25T00:00:00").to_dict(),
+                   created_at=_ts0).to_dict(),
         MemoryItem(id="fact_1", type="fact",
                    content="port 8080 endpoint healthy", level="L0",
                    metadata={"source_profile": "test", "confirmed": True},
-                   created_at="2026-09-25T00:00:00").to_dict(),
+                   created_at=_ts1).to_dict(),
     ]
     with open(tmp / "memories" / "fact.json", "w") as f:
         json.dump(items, f)
