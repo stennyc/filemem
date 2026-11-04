@@ -553,13 +553,26 @@ def _normalize_profile_stamp(value: Optional[str]) -> Optional[str]:
     return value or None
 
 
-# C (owner 2026-10-11): the BRINGBACK footer is offered ONLY when the previous
-# session's close stamp is FRESH — within this window of now. A stale
-# closed_ts (an old session whose provider was rebuilt, NOT a real /new just
-# after a close) falls outside the window, so the footer stays off. 30 min is
-# the chosen default: wide enough to survive a gateway cold-start + a short
-# user pause, narrow enough that a session that closed hours ago is NOT
-# re-offered as "the one you just finished". Pure data side, zero host dep.
+# C (owner 2026-10-11, 2026-11-04 scope change; auto-leg window decision
+# owner 2026-11-04: NO window on the auto leg — the manual-trigger philosophy
+# means the auto 'last closed' leg is the default follow-along when the user
+# does not pick a session explicitly, and it ALWAYS follows the most-recent
+# closed session for this profile, regardless of how long ago it closed
+# (pinning only reorders the auto-inject face, it never adds/removes rows,
+# so a 3-hour-old follow-along is not '串'). _BRINGBACK_FRESH_WINDOW_S is
+# therefore UNREFERENCED in code as of this commit — a legacy constant kept
+# only as the historical default; the original C design (window gated the
+# footer face) is fully superseded by the 2026-11-04 manual trigger.
+#
+# C (owner 2026-10-11, original, superseded): the BRINGBACK footer was offered
+# ONLY when the previous session's close stamp was FRESH (within this window).
+# A stale closed_ts (an old session whose provider was rebuilt, NOT a real
+# /new just after a close) fell outside the window, so the footer stayed off.
+# 30 min was the chosen default: wide enough to survive a gateway cold-start
+# + a short user pause, narrow enough that a session that closed hours ago
+# was NOT re-offered as "the one you just finished". Pure data side, zero
+# host dep. — GONE with the footer-face gate (owner 2026-11-04 manual
+# trigger); the constant now has no caller.
 _BRINGBACK_FRESH_WINDOW_S = 1800.0
 
 
@@ -4567,10 +4580,15 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         logger.debug(f"FileMem: prefetch returned {len(results)} items (confidence={confidence:.2f})")
         if session_id and _recall_block:
             self._save_injected_snapshot(session_id, _recall_block)
-        # BRINGBACK P3: one-shot clarify footer (the three continuity choices).
+        # BRINGBACK P3: one-shot neutral bring-back hint (owner 2026-11-04
+        # manual trigger; the 4 continuity choices moved to the user-driven
+        # clarify card — see _bringback_clarify_footer + filemem_set_bringback
+        # tool description).
         # Rides the return face only — appended AFTER the snapshot freeze so it
-        # never leaks into a cold-start replay block. Fail-soft: '' when no
-        # target / already-asked / no storage_dir (context unchanged).
+        # never leaks into a cold-start replay block. Fail-soft: '' when
+        # already-asked / answered / P1-3 subagent gate (context unchanged);
+        # the hint now fires even with no last_closed target (manual trigger:
+        # the user may name any closed session).
         context = context + self._bringback_clarify_footer(
             session_id, user_query=query)
         # HANDOFF owner ② (pin -> auto-face TAIL): an EXPLICIT valid pin's
@@ -11841,9 +11859,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
 
     def _tool_set_bringback(self, args: Dict) -> str:
         """BRINGBACK P4: the model-driven write for this session's continuity
-        choice. The bring-back footer (P3) is injected on the first non-trivial
-        prefetch; the model resolves the user's choice (via clarify) and calls
-        this tool exactly ONCE to persist it.
+        choice. The bring-back footer (P3) is now a neutral 1-line hint
+        (owner 2026-11-04 manual trigger); when the user says '带回', the
+        model emits the clarify card and calls this tool exactly ONCE to
+        persist the choice.
 
         THREE choices (owner 2026-10-10, B2-A + fresh), PLUS the P1-2 fourth
         option (owner 2026-10-14):
@@ -11922,24 +11941,56 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # silently re-pin the same dead session (one-shot, like the footer).
         if pin_requested:
             self._clear_pending_user_pin(sid)
-        # For bring_back, confirm the pin target actually exists (per-profile
-        # last_closed stamp). If no target, the pin is a no-op — report it
-        # honestly. fresh/clean_start carry no pin target.
-        pin_target = (self._resolve_bringback_session_id(sid)
-                      if choice == "bring_back" else None)
-        # Honest pin report (face 2): did the NAMED pin land, or did it fall
-        # through to the auto leg?
+        # owner 2026-11-04 (active 接手语义, 「欲召回 active session 理应先
+        # close」): a pin target is VALID when it EITHER (a) already has a
+        # closed-stamp row in this profile's last_closed ledger, OR (b) has
+        # a session trace jsonl in sessions_dir (an ACTIVE session the user
+        # wants to hand off — close it on the data side NOW, before the
+        # pin-target resolution below, so the resolution sees the fresh
+        # stamp and returns the NAMED active sid instead of falling through
+        # to the auto 'last closed' leg). The host's own later real close
+        # for that session is deduped by _record_last_closed_session's
+        # first-close-wins guard, so no duplicate stamp. A sid with NEITHER
+        # a closed stamp NOR a trace (typo / foreign profile / never-seen
+        # session) is still rejected and falls through to the auto leg
+        # (fail-soft, 不误伤).
         pin_note = None
         if choice == "bring_back" and pin_requested:
-            pin_valid = self._last_closed_session_exists_for_profile(pin_requested)
-            if pin_valid:
-                pin_note = ("pinned requested session "
-                            f"{pin_requested} (bypasses the freshness window)")
+            pin_closed = self._last_closed_session_exists_for_profile(pin_requested)
+            pin_trace_exists = False
+            if not pin_closed:
+                sess_dir = getattr(self, "sessions_dir", None)
+                if sess_dir is not None:
+                    try:
+                        pin_trace_exists = (Path(sess_dir) / f"{pin_requested}.jsonl").exists()
+                    except Exception:
+                        pin_trace_exists = False
+            if pin_closed:
+                pin_note = (f"pinned requested session {pin_requested} "
+                            "(closed stamp present, bypasses the freshness window)")
+            elif pin_trace_exists:
+                # active session: close it on the data side (append a
+                # last_closed row) so it becomes a valid pin target, then
+                # report the close honestly. The host's later real close is
+                # deduped (first-close-wins) — no duplicate stamp.
+                self._record_last_closed_session(pin_requested)
+                pin_note = (f"requested pin {pin_requested} is an ACTIVE "
+                            "session (no closed stamp, trace jsonl present) — "
+                            "closed it on the data side (appended a last_closed "
+                            "row) so it is now a valid pin target; the host's "
+                            "later real close is deduped (first-close-wins)")
             else:
                 pin_note = (f"requested pin {pin_requested} has no closed "
-                            "stamp for this profile (typo / never closed / "
-                            "foreign profile) — fell back to the auto "
-                            "'last closed' target")
+                            "stamp and no session trace for this profile "
+                            "(typo / never seen / foreign profile) — fell "
+                            "back to the auto 'last closed' target")
+        # For bring_back, confirm the pin target actually exists (per-profile
+        # last_closed stamp; the active-close above already stamped a trace-
+        #only pin target, so a valid pin resolves to itself). If no target,
+        # the pin is a no-op — report it honestly. fresh/clean_start carry
+        # no pin target.
+        pin_target = (self._resolve_bringback_session_id(sid)
+                      if choice == "bring_back" else None)
         note = ("auto-inject face updated ("
                 + ("fresh: nothing auto-injected this session"
                    if choice == "fresh"
@@ -15115,7 +15166,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
     def _has_bringback_choice(self, session_id: str) -> bool:
         """P4: True when ANY choice was recorded for this session (the choice
         file exists) — used to suppress the one-shot footer AFTER the user has
-        answered (any of the three; all are an answered state)."""
+        answered (any of the 4 choices; all are an answered state)."""
         p = self._bringback_choice_path(session_id)
         if p is None:
             return False
@@ -15230,11 +15281,16 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
     # The provider CANNOT synchronously call `clarify` (the engine drops
     # on_session_end / post_llm_call returns; the model is the clarify caller).
     # So the footer is text appended to the FIRST non-trivial prefetch of a
-    # session, directing the model to resolve the user's choice via clarify and
-    # then persist it with filemem_set_bringback (P4). One-shot per session via
-    # a session-keyed gate (mirrors _pending_drafts_notified). Fail-soft: no
-    # bring-back target or already-asked or no storage_dir => "" (context
-    # untouched) — a foot-degradation must never raise into the prefetch face.
+    # session. owner 2026-11-04 (manual trigger): it is now a byte-stable
+    # NEUTRAL 1-line hint (no choice list, no hard clarify directive, no
+    # prev_sid / handoff_note / topic interpolation, no 30-min freshness
+    # gate); when the user says '带回' the model itself emits the clarify
+    # card (4 choices, driven by the filemem_set_bringback tool description +
+    # _recent_sessions_for_clarify) and persists the answer with
+    # filemem_set_bringback (P4). One-shot per session via a session-keyed
+    # gate (mirrors _pending_drafts_notified). Fail-soft: already-asked /
+    # answered / P1-3 subagent gate => "" (context untouched) — a
+    # foot-degradation must never raise into the prefetch face.
 
     def _bringback_persisted_gate_path(self) -> Optional[Path]:
         """A-fix (owner 2026-10-16): storage_dir/bringback_asked.jsonl — the
@@ -15505,7 +15561,9 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         """Return the one-shot bring-back footer for THIS session's first
         non-trivial prefetch, or '' when: already asked (one-shot gate), a
         bring-back choice was already recorded for this session (idempotent —
-        never re-ask), or no per-profile last_closed stamp to offer.
+        never re-ask), or the P1-3 subagent gate suppressed it (the neutral
+        hint now fires even when no per-profile last_closed target exists —
+        manual trigger, owner 2026-11-04).
 
         owner 2026-11-04 (manual trigger) rewrite: the footer no longer lists
         the 3-or-4 clarify choices, no longer hard-directs the model to emit

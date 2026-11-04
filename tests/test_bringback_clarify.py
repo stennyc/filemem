@@ -918,6 +918,103 @@ def test_a_hydrate_missing_file_rechecks_next_call(tmp_path):
 
 # ── (10) owner 2026-11-04 manual trigger: _recent_sessions_for_clarify +
 #         session_id_override ─────────────────────────────────────────────────
+# ── (11) owner 2026-11-04 (active 接手语义): active pin -> data-side close
+#         before resolution ─────────────────────────────────────────────────
+
+
+def test_active_pin_closed_before_resolve_pins_itself(tmp_path):
+    """owner 2026-11-04: a pin target with NO closed stamp but a session trace
+    jsonl (an ACTIVE session) is closed on the data side (a last_closed row is
+    appended) BEFORE the pin-target resolution, so the resolution returns the
+    NAMED active sid instead of falling through to the auto 'last closed'
+    leg. This is the 「欲召回 active session 理应先 close」 semantic: the pin
+    lands on the session the user named, not on whatever happened to be the
+    most recent closed session for this profile."""
+    p = _make_provider(tmp_path, sid="s_cur", profile="default")
+    # A closed prev exists (so the auto leg would have a target to fall
+    # through to — proves the pin did NOT fall through):
+    p.session_id = "s_prev"
+    p._record_last_closed_session("s_prev")
+    # The NAMED target is an ACTIVE session: trace jsonl present, no closed
+    # stamp:
+    (p.sessions_dir / "s_active.jsonl").write_text(
+        json.dumps({"session_id": "s_active", "ts": "2026-11-04T05:00:00",
+                    "role": "user", "content": "active topic",
+                    "source_profile": "default"}),
+        encoding="utf-8")
+    out = json.loads(p.handle_tool_call(
+        "filemem_set_bringback",
+        {"choice": "bring_back", "session_id": "s_cur",
+         "session_id_override": "s_active"}))
+    assert out["success"] is True
+    # The pin resolves to the NAMED active sid (not the auto 's_prev'):
+    assert out["pin_target"] == "s_active", (
+        f"active pin must resolve to the named sid, not fall through to the "
+        f"auto last-closed leg; got pin_target={out['pin_target']!r}")
+    # The active-close was reported honestly:
+    assert "ACTIVE" in out["pin_note"] and "closed" in out["pin_note"]
+    # The data-side close landed a real last_closed row for the active sid:
+    assert p._last_closed_session_exists_for_profile("s_active") is True
+    # The persisted pin file carries the named sid:
+    assert p._get_bringback_pin_sid("s_cur") == "s_active"
+
+
+def test_active_pin_dedupes_later_host_close(tmp_path):
+    """first-close-wins: after the data-side close stamps the active sid,
+    the host's LATER real on_session_end for that same sid must NOT append a
+    second last_closed row (no duplicate stamp — the existing idempotent
+    guard is what keeps this clean)."""
+    p = _make_provider(tmp_path, sid="s_cur", profile="default")
+    (p.sessions_dir / "s_active2.jsonl").write_text(
+        json.dumps({"session_id": "s_active2", "ts": "2026-11-04T05:00:00",
+                    "role": "user", "content": "active topic 2",
+                    "source_profile": "default"}),
+        encoding="utf-8")
+    p.handle_tool_call("filemem_set_bringback",
+                       {"choice": "bring_back", "session_id": "s_cur",
+                        "session_id_override": "s_active2"})
+    # The host later really closes s_active2 (the end-flow re-stamps):
+    p.session_id = "s_active2"
+    p._record_last_closed_session("s_active2")
+    # Exactly ONE row for s_active2 (the data-side close), not two:
+    ledger_rows = []
+    ledger = p._last_closed_stamp_path()
+    for line in ledger.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if row.get("session_id") == "s_active2":
+            ledger_rows.append(row)
+    assert len(ledger_rows) == 1, (
+        f"first-close-wins dedup must hold: a later host close re-stamping "
+        f"the same sid adds no duplicate row; got {len(ledger_rows)} rows")
+
+
+def test_typo_pin_still_falls_through_to_auto_leg(tmp_path):
+    """A sid with NEITHER a closed stamp NOR a trace jsonl (typo / foreign
+    profile / never-seen session) is still rejected and falls through to the
+    auto 'last closed' leg — the active-close must NOT stamp a session that
+    has no material to bring back."""
+    p = _make_provider(tmp_path, sid="s_cur", profile="default")
+    p.session_id = "s_prev"
+    p._record_last_closed_session("s_prev")
+    out = json.loads(p.handle_tool_call(
+        "filemem_set_bringback",
+        {"choice": "bring_back", "session_id": "s_cur",
+         "session_id_override": "s_typed_typo"}))
+    assert out["success"] is True
+    # The typo'd sid has no trace -> NOT stamped -> resolution falls through
+    # to the auto last-closed leg (s_prev):
+    assert out["pin_target"] == "s_prev", (
+        f"a sid with no closed stamp AND no trace must fall through to the "
+        f"auto last-closed leg; got pin_target={out['pin_target']!r}")
+    assert "fell back to the auto" in out["pin_note"]
+    # And the typo'd sid was NOT stamped as closed:
+    assert p._last_closed_session_exists_for_profile("s_typed_typo") is False
 
 
 def _write_trace(p, sid: str, title: str, profile: Optional[str] = "default",
