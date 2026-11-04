@@ -324,12 +324,14 @@ def test_d_last_closed_concurrent_same_session_single_row(tmp_path):
 
 
 def test_c_stale_closed_stamp_is_not_offered(tmp_path):
-    """C (owner 2026-10-11): the footer is offered ONLY when the previous
-    close stamp is FRESH (within _BRINGBACK_FRESH_WINDOW_S = 30min). A stale
-    closed_ts — an OLD session whose provider was rebuilt, NOT a real /new
-    just after a close — must yield no footer. This is the pure-data-side
-    fix for 'an old session's provider rebuild re-fires the bring-back
-    question': the window makes a stale closed_ts un-offerable."""
+    """owner 2026-11-04: the footer no longer depends on the last_closed
+    freshness window — it fires as a neutral 1-line hint for any session's
+    first non-trivial prefetch, regardless of the last_closed stamp's age.
+    The 30-min freshness window (_BRINGBACK_FRESH_WINDOW_S) still governs the
+    auto 'last closed' pin RESOLUTION (_resolve_bringback_session_id), but
+    the footer face is now manual-trigger (the user says '带回' and names any
+    session they want, old or new). Keep the data-side stale-stamp read as
+    its original invariant (the RESOLVER still respects the window)."""
     import json
     from datetime import timedelta
     p = _make_provider(tmp_path, sid="s_cur", profile="default")
@@ -344,11 +346,15 @@ def test_c_stale_closed_stamp_is_not_offered(tmp_path):
     with open(path, "w") as f:
         for l in lines:
             f.write(json.dumps(l) + "\n")
-    # The stale stamp must NOT be offered as a bring-back target:
+    # The stale stamp must NOT be offered as the AUTO last-closed target
+    # (the resolver's data-side invariant is unchanged):
     assert p._last_closed_session_for_profile(
         exclude_session_id="s_cur",
         max_age_s=_BRINGBACK_FRESH_WINDOW_S) is None
-    assert p._bringback_clarify_footer("s_cur") == ""
+    # The footer, however, now fires as a neutral hint regardless of the
+    # last_closed stamp (manual trigger):
+    foot = p._bringback_clarify_footer("s_cur")
+    assert "如需带回旧 session 自动注入面" in foot
 
 
 def test_c_fresh_closed_stamp_is_offered(tmp_path):
@@ -361,7 +367,7 @@ def test_c_fresh_closed_stamp_is_offered(tmp_path):
         exclude_session_id="s_cur",
         max_age_s=_BRINGBACK_FRESH_WINDOW_S) == "s_prev"
     foot = p._bringback_clarify_footer("s_cur")
-    assert "带回" in foot and "clarify" in foot
+    assert "如需带回旧 session 自动注入面" in foot
 
 
 
@@ -371,15 +377,18 @@ def test_c_fresh_closed_stamp_is_offered(tmp_path):
 def test_p3_footer_offered_when_target_exists(tmp_path):
     p = _provider_with_prev_closed(tmp_path)
     foot = p._bringback_clarify_footer("s_cur")
-    assert "带回账本" in foot
-    assert "filemem_set_bringback" in foot
+    assert "如需带回旧 session 自动注入面" in foot
     # One-shot: the second call is suppressed (session-keyed gate set).
     assert p._bringback_clarify_footer("s_cur") == ""
 
 
-def test_p3_footer_silenced_when_no_target(tmp_path):
+def test_p3_footer_neutral_hint_fires_regardless_of_target(tmp_path):
+    """owner 2026-11-04: the footer no longer depends on a last_closed target
+    — a session with NO closed stamp at all still gets the neutral hint
+    (manual trigger: the user may name any closed session, old or new)."""
     p = _make_provider(tmp_path, sid="s_cur", profile="default")
-    assert p._bringback_clarify_footer("s_cur") == ""
+    foot = p._bringback_clarify_footer("s_cur")
+    assert "如需带回旧 session 自动注入面" in foot
 
 
 def test_p3_footer_suppressed_when_already_answered(tmp_path):
@@ -395,34 +404,44 @@ def test_p3_footer_fail_soft_no_session(tmp_path):
     assert p._bringback_clarify_footer("") == ""
 
 
-def test_p3_footer_lists_three_choices_including_fresh(tmp_path):
+def test_p3_footer_no_longer_lists_choices(tmp_path):
+    """owner 2026-11-04: the footer no longer lists the choice enum values
+    (bring_back / clean_start / fresh / topic_mismatch) — those moved to the
+    manual-trigger clarify card (driven by the user, per the tool
+    description). The footer itself is the neutral 1-line hint; the removed
+    option 'confirmed_global_only' must also not reappear in the footer."""
     p = _provider_with_prev_closed(tmp_path)
     foot = p._bringback_clarify_footer("s_cur")
-    assert "bring_back" in foot
-    assert "clean_start" in foot
-    assert "fresh" in foot
+    assert "bring_back" not in foot
+    assert "clean_start" not in foot
+    assert "fresh" not in foot
+    assert "topic_mismatch" not in foot
     # The removed option must NOT reappear.
     assert "confirmed_global_only" not in foot
 
 
-def test_a_footer_hard_directive_to_emit_clarify_tool(tmp_path):
-    """A (owner 2026-10-11): the footer must HARD-direct the model to call the
-    clarify TOOL (native single-select card, keyboard ↑↓ + Enter), not
-    paraphrase the three options as plain chat text. Pin the directive so a
-    future rewrite that softens it back to '请用 clarify 问用户一次' (which
-    let the model re-state options in prose → text box, not native card) is
-    caught. (The plugin only INSTRUCTS; model compliance is an LLM behavior,
-    but the hard '必须/不要' wording is the part we can lock in a test.)"""
+def test_footer_neutral_hint_no_clarify_directive(tmp_path):
+    """owner 2026-11-04: the footer is now a NEUTRAL 1-line hint - it no
+    longer hard-directs the model to call the clarify tool, no longer lists
+    the 4 clarify options. The user drives the flow: when they say
+    '带回' / '接着上次' / 'bringback', the model (per the
+    filemem_set_bringback tool description) emits the clarify card. Pin the
+    neutral wording so a future rewrite that re-adds the hard directive or
+    the 4-option list is caught."""
     p = _provider_with_prev_closed(tmp_path)
     foot = p._bringback_clarify_footer("s_cur")
-    # The native-window directive is present:
-    assert "必须调用 clarify 工具" in foot
-    # The soft old wording is gone:
-    assert "请用 clarify 问用户" not in foot
-    # Explicitly forbids prose paraphrase:
-    assert "不要用纯文字" in foot
-    # The 3 options are still listed for the clarify choices array:
-    assert "bring_back" in foot and "clean_start" in foot and "fresh" in foot
+    # The neutral hint is present:
+    assert "如需带回旧 session 自动注入面" in foot
+    assert "『带回』" in foot
+    # The old hard-directive wording is GONE:
+    assert "必须调用 clarify 工具" not in foot
+    assert "不要用纯文字" not in foot
+    # The 4 clarify options are no longer listed in the footer:
+    assert "bring_back" not in foot
+    assert "clean_start" not in foot
+    assert "fresh" not in foot
+    # The old option-list phrasing is gone:
+    assert "clarify 选项" not in foot
 
 
 def test_b1_footer_not_frozen_into_p3_snapshot(tmp_path):
@@ -442,13 +461,13 @@ def test_b1_footer_not_frozen_into_p3_snapshot(tmp_path):
     snap_file = p._injected_snapshot_path("s_cur")
     assert snap_file is not None and snap_file.exists()
     frozen_bytes = snap_file.read_text(encoding="utf-8")
-    assert "带回账本" not in frozen_bytes  # the footer must NOT be frozen
+    assert "如需带回旧 session 自动注入面" not in frozen_bytes  # the footer must NOT be frozen
     # The live footer is a SEPARATE string; producing it does not touch the
     # frozen file.
     foot = p._bringback_clarify_footer("s_cur")
-    assert "带回账本" in foot or foot == ""  # live face only
+    assert "如需带回旧 session 自动注入面" in foot or foot == ""  # live face only
     # Re-read: the frozen file is still footer-free after the live ask.
-    assert "带回账本" not in snap_file.read_text(encoding="utf-8")
+    assert "如需带回旧 session 自动注入面" not in snap_file.read_text(encoding="utf-8")
 
 
 # ── (4) P4 tool: filemem_set_bringback (3-value) ───────────────────────────────
@@ -686,21 +705,21 @@ def test_g1_p3_replay_path_fires_footer_end_to_end(tmp_path):
     p._save_injected_snapshot("s_replay", "[fact] replay fact content")
     snap_path = p._injected_snapshot_path("s_replay")
     # Confirm the snapshot file itself carries no footer opener (B1).
-    assert snap_path is not None and "带回账本" not in snap_path.read_text(encoding="utf-8")
+    assert snap_path is not None and "如需带回旧 session 自动注入面" not in snap_path.read_text(encoding="utf-8")
     # A fresh provider shell -> _p3_replay_armed is unset (False) -> replay
     # branch is live. The query must Jaccard-match the frozen .tokens.
     ctx1 = p.prefetch("replay fact", session_id="s_replay")
     # G1 assertion ①: the replay path's return face surfaces the footer:
-    assert "带回账本" in ctx1, (
+    assert "如需带回旧 session 自动注入面" in ctx1, (
         f"P3 replay path must fire the bring-back footer on the return face; "
         f"got: {ctx1!r}")
     # B1 invariant: the on-disk snapshot was re-frozen WITHOUT the footer
     # (the footer only rides the return face, never the frozen block).
-    assert "带回账本" not in snap_path.read_text(encoding="utf-8")
+    assert "如需带回旧 session 自动注入面" not in snap_path.read_text(encoding="utf-8")
     # G1 assertion ②: one-shot — a SECOND prefetch for the same session does
     # NOT re-fire the footer (session-keyed gate held by the first call).
     ctx2 = p.prefetch("replay fact", session_id="s_replay")
-    assert "带回账本" not in ctx2, (
+    assert "如需带回旧 session 自动注入面" not in ctx2, (
         "footer must be one-shot per session: second prefetch must not "
         f"re-ask; got: {ctx2!r}")
 
@@ -716,7 +735,7 @@ def test_g1_replay_footer_absent_without_last_closed_stamp(tmp_path):
     p._save_injected_snapshot("s_replay", "[fact] replay fact content")
     ctx = p.prefetch("replay fact", session_id="s_replay")
     assert "replay fact" in ctx            # the recall block itself replays
-    assert "带回账本" not in ctx            # but no footer (no target)
+    assert "如需带回旧 session 自动注入面" in ctx  # neutral hint fires (no target dependency)
 
 
 # ── (8) G2: _normalize_profile_stamp unit (owner 2026-10-11, reviewer round-3)
@@ -770,7 +789,7 @@ def test_a_rebuild_footer_suppressed_by_persisted_gate(tmp_path):
     the persisted ledger hydrates the gate before the footer decision."""
     p1 = _provider_with_prev_closed(tmp_path)
     foot1 = p1._bringback_clarify_footer("s_cur")
-    assert "带回账本" in foot1  # first provider: footer fires (control)
+    assert "如需带回旧 session 自动注入面" in foot1  # first provider: footer fires (control)
     p2 = _fresh_shell(tmp_path, sid="s_cur", profile="default")
     foot2 = p2._bringback_clarify_footer("s_cur")
     assert foot2 == "", (
@@ -796,17 +815,23 @@ def test_a_new_session_reasks_despite_shared_ledger(tmp_path):
     p1._bringback_clarify_footer("s_cur")  # fires + persists s_cur
     p2 = _fresh_shell(tmp_path, sid="s_new", profile="default")
     foot = p2._bringback_clarify_footer("s_new")
-    assert "带回账本" in foot, "new session must re-ask (persisted gate is per-sid)"
+    assert "如需带回旧 session 自动注入面" in foot, "new session must re-ask (persisted gate is per-sid)"
 
 
 def test_a_persisted_gate_survives_no_target_session(tmp_path):
-    """Fail-soft: a rebuilt provider whose session has no fresh last_closed
-    target yields '' for the USUAL reason (no target), independent of the
-    persisted gate — both gates are per-sid and neither raises."""
+    """owner 2026-11-04: the footer no longer depends on a last_closed target
+    — it fires as a neutral hint for ANY session's first non-trivial
+    prefetch. A session with NO closed stamp at all still gets the hint
+    (the user may want to bring back a manually-named session, not just the
+    auto last-closed one). The persisted gate remains per-sid (rebuild-safe)
+    — the 2nd provider must not re-fire it."""
     p1 = _make_provider(tmp_path, sid="s_notarget", profile="default")
-    assert p1._bringback_clarify_footer("s_notarget") == ""
+    foot1 = p1._bringback_clarify_footer("s_notarget")
+    assert "如需带回旧 session 自动注入面" in foot1, \
+        "neutral hint must fire even without a last_closed target"
     p2 = _fresh_shell(tmp_path, sid="s_notarget", profile="default")
-    assert p2._bringback_clarify_footer("s_notarget") == ""
+    assert p2._bringback_clarify_footer("s_notarget") == "", \
+        "rebuilt provider must not re-fire (persisted gate is per-sid)"
 
 
 def test_a_subagent_suppress_mark_persists(tmp_path):
@@ -882,10 +907,163 @@ def test_a_hydrate_missing_file_rechecks_next_call(tmp_path):
     # p2 hydrates while the ledger does not exist yet (p1 has not marked):
     p2._bringback_footer_state()
     # p1 now fires its footer -> persists a mark for s_cur:
-    assert "带回账本" in p1._bringback_clarify_footer("s_cur")
+    assert "如需带回旧 session 自动注入面" in p1._bringback_clarify_footer("s_cur")
     # p2's NEXT gate read must still see p1's mark despite the earlier
     # empty-state cache (the fix: do NOT cache the absent-file state).
     st = p2._bringback_footer_state()
     assert st.get("s_cur") is True, (
         "a later hydrate must pick up a mark that landed after this "
         "instance's first (empty) hydrate")
+
+
+# ── (10) owner 2026-11-04 manual trigger: _recent_sessions_for_clarify +
+#         session_id_override ─────────────────────────────────────────────────
+
+
+def _write_trace(p, sid: str, title: str, profile: Optional[str] = "default",
+                 ts: Optional[str] = None) -> None:
+    """Write a minimal session trace jsonl (first user line carries the
+    title) so _session_title_hint can read it. ts sets the file mtime so the
+    active leg's ordering is controllable."""
+    trace = p.sessions_dir / f"{sid}.jsonl"
+    row = {"session_id": sid, "role": "user", "content": title}
+    if ts:
+        row["ts"] = ts
+    if profile is not None:
+        row["source_profile"] = profile
+    with open(trace, "w", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    if ts:
+        import os as _os
+        from datetime import datetime as _dt, timezone as _tz
+        mtime = _dt.fromisoformat(ts).replace(tzinfo=_tz.utc).timestamp()
+        _os.utime(trace, (mtime, mtime))
+
+
+def test_recent_sessions_merges_closed_and_active_sorted_desc(tmp_path):
+    """_recent_sessions_for_clarify(n=2): the top-2 items are the two most-
+    recent by ts across BOTH the closed ledger and active trace jsonl, state
+    tagged correctly, title filled from the trace (falling back to the bare
+    sid when no trace exists)."""
+    p = _make_provider(tmp_path, sid="s_cur", profile="default")
+    p.session_id = "s_prev_a"
+    p._record_last_closed_session("s_prev_a")
+    p.session_id = "s_prev_b"
+    p._record_last_closed_session("s_prev_b")
+    # s_prev_b is the most recent closed; a still-active trace s_active_1 is
+    # newer than s_prev_b's mtime (utime set later)
+    _write_trace(p, "s_prev_a", "topic A", profile="default")
+    _write_trace(p, "s_prev_b", "topic B", profile="default")
+    _write_trace(p, "s_active_1", "topic active", profile="default")
+    # nudge the active trace's mtime to be the newest of all
+    import os as _os
+    import time as _time
+    _os.utime(p.sessions_dir / "s_active_1.jsonl",
+              (_time.time() + 1, _time.time() + 1))
+    items = p._recent_sessions_for_clarify(n=2)
+    assert len(items) == 2
+    # s_active_1 (newest mtime) must be first
+    assert items[0]["session_id"] == "s_active_1"
+    assert items[0]["state"] == "active"
+    assert items[0]["title"] == "topic active"
+    # s_prev_b (newest closed) must be second (its closed_ts is > s_prev_a's)
+    assert items[1]["session_id"] == "s_prev_b"
+    assert items[1]["state"] == "closed"
+    assert items[1]["title"] == "topic B"
+
+
+def test_recent_sessions_fall_back_to_bare_sid_without_trace(tmp_path):
+    """A closed session with NO trace jsonl: _session_title_hint returns ""
+    -> the item's title falls back to the bare sid (fail-soft, never crashes
+    the clarify card's option 1/2 rendering)."""
+    p = _make_provider(tmp_path, sid="s_cur", profile="default")
+    p.session_id = "s_noftrace"
+    p._record_last_closed_session("s_noftrace")
+    items = p._recent_sessions_for_clarify(n=1)
+    assert len(items) == 1
+    assert items[0]["session_id"] == "s_noftrace"
+    assert items[0]["title"] == "s_noftrace"  # bare id, not ""
+
+
+def test_recent_sessions_per_profile_isolation(tmp_path):
+    """Cross-profile closed rows / traces must NOT leak into another
+    profile's clarify card (the closed leg already filters by
+    source_profile; the active leg must cut foreign traces too)."""
+    p_coder = _make_provider(tmp_path, sid="s_coder", profile="coder")
+    p_coder.session_id = "s_prev_coder"
+    p_coder._record_last_closed_session("s_prev_coder")
+    _write_trace(p_coder, "s_prev_coder", "coder topic", profile="coder")
+    # An 'orchestrator' profile provider must NOT see the coder's closed row:
+    p_orch = _make_provider(tmp_path, sid="s_orch", profile="orchestrator")
+    items = p_orch._recent_sessions_for_clarify(n=5)
+    assert all(i["session_id"] != "s_prev_coder" for i in items), (
+        "a foreign-profile closed row must not leak into this profile's "
+        f"clarify card; got: {items}")
+
+
+def test_recent_sessions_fail_soft_no_storage_dir():
+    """No storage_dir (a fixture shell that was never initialize()'d) ->
+    empty list, never raises. (Pyright's Path-typing complaint on the
+    provider's storage_dir attr is intentional here: the provider is a bare
+    __new__ shell deliberately holding None — the fail-soft branch is what
+    this test is pinning.)"""
+    p = FileMemProvider.__new__(FileMemProvider)
+    p.storage_dir = None
+    p.sessions_dir = None
+    p.source_profile = "default"
+    p._lock = threading.Lock()
+    assert p._recent_sessions_for_clarify(n=2) == []
+
+
+def test_recent_sessions_n_zero_or_negative(tmp_path):
+    p = _make_provider(tmp_path, sid="s_cur", profile="default")
+    assert p._recent_sessions_for_clarify(n=0) == []
+    assert p._recent_sessions_for_clarify(n=-1) == []
+
+
+def test_p4_tool_session_id_override_lands_pin(tmp_path):
+    """owner 2026-11-04 manual trigger: session_id_override (the user's
+    typed/picked sid from the clarify card) lands as the pin under
+    choice='bring_back'."""
+    p = _make_provider(tmp_path, sid="s_cur", profile="default")
+    # No last_closed stamp at all — the override must still land the pin:
+    out = json.loads(p.handle_tool_call(
+        "filemem_set_bringback",
+        {"choice": "bring_back", "session_id": "s_cur",
+         "session_id_override": "s_named"}))
+    assert out["success"] is True
+    assert out["choice"] == "bring_back"
+    assert out["bring_back_active"] is True
+    assert out["pin_requested"] == "s_named"
+    assert p._get_bringback_pin_sid("s_cur") == "s_named"
+
+
+def test_p4_tool_session_id_override_ignored_under_clean_start(tmp_path):
+    """session_id_override only takes effect under choice='bring_back'; under
+    any other choice it is ignored (no pin side effect)."""
+    p = _make_provider(tmp_path, sid="s_cur", profile="default")
+    out = json.loads(p.handle_tool_call(
+        "filemem_set_bringback",
+        {"choice": "clean_start", "session_id": "s_cur",
+         "session_id_override": "s_named"}))
+    assert out["success"] is True
+    assert out["bring_back_active"] is False
+    # The override was NOT persisted as a pin (clean_start ignores it):
+    assert p._get_bringback_pin_sid("s_cur") is None
+
+
+def test_p4_tool_session_id_override_beats_pin_session_id(tmp_path):
+    """When both are supplied, session_id_override wins (owner 2026-11-04:
+    the user's typed sid is the most explicit signal)."""
+    p = _make_provider(tmp_path, sid="s_cur", profile="default")
+    p.session_id = "s_auto_prev"
+    p._record_last_closed_session("s_auto_prev")
+    out = json.loads(p.handle_tool_call(
+        "filemem_set_bringback",
+        {"choice": "bring_back", "session_id": "s_cur",
+         "session_id_override": "s_typed",
+         "pin_session_id": "s_pin_param"}))
+    assert out["success"] is True
+    # The override (s_typed) is the recorded pin, not the legacy param:
+    assert out["pin_requested"] == "s_typed"
+    assert p._get_bringback_pin_sid("s_cur") == "s_typed"

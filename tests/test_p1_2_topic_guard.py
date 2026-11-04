@@ -364,9 +364,13 @@ def test_t8_topic_gate_on_filters_cross_class_row(tmp_path, monkeypatch):
 
 # ── T9: footer carries the previous session's topic (修复 1) ───────────
 
-def test_t9_footer_carries_prev_session_topic(tmp_path):
-    """T9: _bringback_clarify_footer text carries _session_title_hint(prev_sid)
-    (non-empty topic) AND the 4th-option 'topic_mismatch' wording."""
+def test_t9_footer_no_longer_carries_prev_session_topic(tmp_path):
+    """owner 2026-11-04 (manual trigger): the footer no longer interpolates
+    the previous session's topic hint or lists the 4 clarify options — both
+    moved to the user-driven clarify card (option 1/2 titles come from
+    _recent_sessions_for_clarify at the moment the user says '带回'). The
+    footer itself is the byte-stable neutral 1-line hint; pin that the old
+    topic/handoff interpolation is GONE."""
     p = _make_provider(tmp_path)
     p_prev = _make_provider(tmp_path, sid=PREV_SID)
     p_prev._record_last_closed_session(PREV_SID)
@@ -374,10 +378,15 @@ def test_t9_footer_carries_prev_session_topic(tmp_path):
     _seed_session_traces(tmp_path, {PREV_SID: prev_topic})
     ctx = p._bringback_clarify_footer(CUR_SID)
     assert ctx, "footer must fire (fresh prev-session stamp exists)"
-    assert prev_topic in ctx, (
-        f"footer must carry the prev session's topic hint {prev_topic!r}")
-    assert "topic_mismatch" in ctx, \
-        "footer must expose the 4th option (owner 裁决 5)"
+    # The neutral hint is present:
+    assert "如需带回旧 session 自动注入面" in ctx
+    # The old topic interpolation is GONE:
+    assert prev_topic not in ctx, (
+        "footer no longer carries the prev session's topic hint "
+        f"(moved to the manual-trigger clarify card); got: {ctx!r}")
+    # The 4th-option wording is GONE from the footer:
+    assert "topic_mismatch" not in ctx, \
+        "footer no longer lists the clarify options (owner 2026-11-04)"
 
 
 # ── T10-T11: P1-3 子进程闸（platform=subagent → 完全不 bring-back + 不 clarify footer）─

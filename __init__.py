@@ -9546,20 +9546,36 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             {
                 "name": "filemem_set_bringback",
                 "description": ("Set THIS session's cross-session continuity choice (BRINGBACK P3/P4). "
-                    "Call it ONCE after the session's first turn when the bring-back footer asked. "
-                    "choice='bring_back' pins the previous closed session's CONFIRMED summaries to the "
-                    "TOP of this session's auto-inject face (reorder only — no new rows; a confirmed "
-                    "prev-session row is already kept by the confirmed-global leg). "
-                    "Optional pin_session_id names a SPECIFIC closed session to pin instead of the "
-                    "auto 'last closed' target (the life-line for deadlocked old sessions — the pin "
-                    "bypasses the 30-min freshness window; only honored under choice='bring_back'; "
-                    "a pin with no matching closed stamp or from a foreign profile falls through to "
-                    "the auto target, reported honestly). "
-                    "'clean_start' = V2 default (confirmed global skeleton + this session's own rows). "
-                    "'fresh' = this session injects NOTHING on the auto face (even the confirmed "
-                    "skeleton is folded out); a truly clean start. "
-                    "The search face (filemem_search) ALWAYS recalls across sessions regardless — any "
-                    "choice (incl. 'fresh') never makes an old session unretrievable (全新 ≠ 失联). "
+                    "MANUAL TRIGGER (owner 2026-11-04): the session's auto-inject face no longer "
+                    "forces a bring-back clarify card — bring-back is user-driven. When the user "
+                    "says '带回' / '接着上次' / 'bringback' (or similar), emit a clarify card "
+                    "with 4 choices: [最近 session A (title), 最近 session B (title), 取消 "
+                    "bringback, 输入指定 session id (Other free-text row)]. The first 2 titles "
+                    "come from _recent_sessions_for_clarify(n=2) (merges the last_closed "
+                    "ledger + active trace jsonl, top-2 by ts, title from "
+                    "_session_title_hint, fail-soft to bare id). Map the user's selection "
+                    "to: 1/2 -> call filemem_set_bringback(choice='bring_back', "
+                    "session_id_override=<the chosen sid>); 3 -> no tool call (the default "
+                    "clean_start stays active; cancel is a no-op); 4 -> the user types a "
+                    "sid in the Other free-text row, then call "
+                    "filemem_set_bringback(choice='bring_back', session_id_override=<the "
+                    "typed sid>). "
+                    "choice='bring_back' pins the named session's CONFIRMED summaries to the "
+                    "TOP of this session's auto-inject face (reorder only — no new rows; a "
+                    "confirmed prev-session row is already kept by the confirmed-global leg). "
+                    "Optional pin_session_id (legacy param) names a SPECIFIC closed session "
+                    "to pin instead of the auto 'last closed' target (the life-line for "
+                    "deadlocked old sessions — the pin bypasses the 30-min freshness "
+                    "window; only honored under choice='bring_back'; a pin with no matching "
+                    "closed stamp or from a foreign profile falls through to the auto "
+                    "target, reported honestly). "
+                    "'clean_start' = V2 default (confirmed global skeleton + this session's "
+                    "own rows). "
+                    "'fresh' = this session injects NOTHING on the auto face (even the "
+                    "confirmed skeleton is folded out); a truly clean start. "
+                    "The search face (filemem_search) ALWAYS recalls across sessions "
+                    "regardless — any choice (incl. 'fresh') never makes an old session "
+                    "unretrievable (全新 ≠ 失联). "
                     "Per-session: a fresh session re-asks."),
                 "parameters": {
                     "type": "object",
@@ -9583,6 +9599,15 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                                            "honored when choice='bring_back'; a pin with no closed stamp for this "
                                            "profile (typo / never closed / foreign profile) falls through to the auto "
                                            "target and is reported via pin_note."
+                        },
+                        "session_id_override": {
+                            "type": "string",
+                            "description": "Optional (owner 2026-11-04, manual trigger): the session id the user "
+                                           "picked from the clarify card's options 1/2 (recent-session titles, mapped "
+                                           "back to sid by the model) or option 4 (typed in the Other free-text row). "
+                                           "Lands as pin_session_id when choice='bring_back'. Only honored under "
+                                           "choice='bring_back'; under any other choice it is ignored (no side "
+                                           "effect). Takes precedence over pin_session_id when both are supplied."
                         }
                     },
                     "required": ["choice"]
@@ -11866,7 +11891,14 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # HANDOFF face 2: the optional named pin (only stored under
         # bring_back; under other choices it is ignored + noted, not
         # persisted — no side effect outside bring_back).
-        pin_requested = (args.get("pin_session_id") or "").strip() or None
+        # owner 2026-11-04 (manual trigger): session_id_override — the
+        # session id the user picked from the clarify card's options 1/2
+        # (recent-session titles, mapped back to sid by the model) or option
+        # 4 (typed in the Other free-text row). Lands as pin_session_id
+        # when choice='bring_back'. Takes precedence over pin_session_id
+        # when both are supplied.
+        pin_requested = (args.get("session_id_override") or "").strip() \
+            or (args.get("pin_session_id") or "").strip() or None
         # HANDOFF owner ④ (C-gate bridge): when the model's tool call did NOT
         # carry an explicit pin_session_id, fall back to the pin intent the
         # C-gate recorded in _pending_user_pins (the user's own message named
@@ -15355,6 +15387,119 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         的 bring-back footer）。"""
         return getattr(self, "_last_platform", None) == "subagent"
 
+    def _recent_sessions_for_clarify(self, n: int = 2) -> List[Dict[str, str]]:
+        """BRINGBACK 手动 trigger (owner 2026-11-04): the N most-recent
+        sessions for the clarify card's "最近 session A / B" title rows.
+
+        Data source merge (zero new deps):
+          - closed: last_closed_sessions.jsonl (append-only, per-profile filter)
+          - active: sessions_dir/*.jsonl that have a trace but are NOT in the
+                    closed ledger (still-running sessions count too)
+        Both sides go through _normalize_profile_stamp so cross-profile rows
+        never leak. Items are sorted by ts (closed_ts for closed, mtime for
+        active) DESC and truncated to N. Each item's title comes from
+        _session_title_hint (fail-soft to the bare sid when the trace has no
+        user-first line yet).
+
+        Returns [{'session_id': sid, 'title': title, 'state': 'closed'|'active',
+                  'ts': iso}, ...]. Any hiccup (no storage_dir / unreadable
+        ledger / missing sessions_dir / n <= 0) returns [] — the clarify
+        card then falls back to showing a bare sid placeholder for options
+        1/2, and option 4 (typed sid) remains the escape hatch. Zero locks,
+        sequential reads, O(ledger + traces).
+        """
+        try:
+            if n <= 0:
+                return []
+            sd = getattr(self, "storage_dir", None)
+            if sd is None:
+                return []
+            cur_sp = _normalize_profile_stamp(
+                getattr(self, "source_profile", None))
+            merged: Dict[str, Dict[str, str]] = {}
+            # closed leg
+            p = self._last_closed_stamp_path()
+            if p is not None and p.exists():
+                for line in p.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    row_sp = _normalize_profile_stamp(
+                        row.get("source_profile"))
+                    if row_sp != cur_sp:
+                        continue
+                    sid = row.get("session_id")
+                    if not sid:
+                        continue
+                    merged[str(sid)] = {
+                        "session_id": str(sid),
+                        "state": "closed",
+                        "ts": row.get("closed_ts") or "",
+                        "title": "",
+                    }
+            # active leg: trace jsonl exists but not in the closed ledger
+            closed_ids = set(merged.keys())
+            sess_dir = getattr(self, "sessions_dir", None)
+            if sess_dir is not None:
+                for trace in sorted(sess_dir.glob("*.jsonl")):
+                    sid = trace.stem
+                    if sid in closed_ids:
+                        continue
+                    # foreign-profile traces (a different provider writing to
+                    # the same store dir) are cut by the trace's first
+                    # source_profile row — fail-soft: no source_profile row in
+                    # the trace -> keep it (neutral, like the P0-2 fail-open
+                    # posture).
+                    row_sp_first = None
+                    try:
+                        for tline in trace.open(encoding="utf-8"):
+                            tline = tline.strip()
+                            if not tline:
+                                continue
+                            try:
+                                trow = json.loads(tline)
+                            except Exception:
+                                continue
+                            if isinstance(trow, dict) and \
+                                    trow.get("source_profile") is not None:
+                                row_sp_first = trow.get("source_profile")
+                                break
+                    except Exception:
+                        row_sp_first = None
+                    if row_sp_first is not None:
+                        if _normalize_profile_stamp(row_sp_first) != cur_sp:
+                            continue
+                    try:
+                        ts_iso = datetime.fromtimestamp(
+                            trace.stat().st_mtime, timezone.utc).isoformat()
+                    except Exception:
+                        ts_iso = ""
+                    merged[sid] = {
+                        "session_id": sid,
+                        "state": "active",
+                        "ts": ts_iso,
+                        "title": "",
+                    }
+            items = sorted(merged.values(),
+                           key=lambda v: v["ts"] or "",
+                           reverse=True)[:n]
+            for v in items:
+                v["title"] = self._session_title_hint(v["session_id"]) \
+                    or v["session_id"]
+            return items
+        except Exception as e:
+            logger.warning(
+                "FileMem: _recent_sessions_for_clarify failed (%s); "
+                "falling back to empty list (clarify options 1/2 will "
+                "show bare-id placeholders)" % e)
+            return []
+
     def _bringback_clarify_footer(self, session_id: str,
                                    user_query: Optional[str] = None) -> str:
         """Return the one-shot bring-back footer for THIS session's first
@@ -15362,47 +15507,43 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         bring-back choice was already recorded for this session (idempotent —
         never re-ask), or no per-profile last_closed stamp to offer.
 
-        HANDOFF owner ④ (2026-10-17, C-gate): when the user's own message
-        (``user_query``, the current user-turn text available at the
-        prefetch face) EXPLICITLY names a KNOWN closed session id, the
-        footer is suppressed — the user already stated their intent (a named
-        recall), so re-asking via the clarify card is redundant and violates
-        "不要把已经明确表达的意向再问一遍". The named sid is recorded as a
-        pending pin intent (``_record_pending_user_pin``) so the agent's
-        follow-up ``filemem_set_bringback`` call can carry ``pin_session_id``
-        (= the user's named session, which the pin machinery then routes
-        through the handoff summary). ONLY a session-id-shaped token that is
-        in THIS profile's known closed-set suppresses — an unknown /
-        foreign / typo'd token falls through to today's footer (fail-soft,
-        不误伤). user_query=None (no message available) -> today's footer,
-        byte-identical. The P1-3 subagent gate and the one-shot gate still
-        run FIRST and are unaffected by the C-gate.
+        owner 2026-11-04 (manual trigger) rewrite: the footer no longer lists
+        the 3-or-4 clarify choices, no longer hard-directs the model to emit
+        the clarify tool, and no longer interpolates prev_sid / handoff_note /
+        topic. It is a byte-stable NEUTRAL 1-line hint. The 30-min freshness
+        gate (_BRINGBACK_FRESH_WINDOW_S) is intentionally NOT applied on the
+        footer face anymore — manual trigger means the user is in charge of
+        naming any closed session. The C-gate (named sid in user_query) is
+        kept: a known named session suppresses the hint and records a pending
+        pin intent (orthogonal to the freshness gate).
 
-        P1-3 子进程闸（owner 2026-10-14）：delegate_task 子进程 session
-        （platform == "subagent"）完全不生成 bring-back footer —— 不 clarify
-        3 选、不置顶、不 bring-back（子进程是一次性 leaf，开它不是为了"接着
-        上个 session 干"，弹 footer 只会把父 session 的 confirmed 摘要串进
-        子进程 prompt，导致子进程锚定回父 session 最早任务）。主 session
-        （platform != "subagent"）行为完全不变。
+        B1 (owner 2026-10-10): the footer rides the RETURN string of the live
+        prefetch face and MUST NOT be part of the P3 snapshot that gets frozen
+        for cold-start replay — a frozen footer would re-fire on every cold
+        start. The snapshot is written BEFORE the footer is appended (see
+        prefetch).
 
-        THREE choices (owner 2026-10-10, B2-A + fresh option), mapped to
-        filemem_set_bringback choice values:
+        THREE choices (owner 2026-10-10, B2-A + fresh option) plus P1-2's
+        fourth (owner 2026-10-14), mapped to filemem_set_bringback choice
+        values — still honored on the tool side, just no longer listed in the
+        footer:
           1) bring_back   — 接着刚才干：把上一个 session 的 confirmed 摘要【置顶】
                             本次 auto 面（排序，不新增行；收行仍 V2 两腿）
           2) clean_start  — 不接着刚才：只留全局确认骨架 + 当前 session 行（V2 现状）
           3) fresh        — 全新：本 session 彻底不自动注入（连 confirmed 骨架也
                             折出）；检索面不受影响（全新 ≠ 失联，search 仍能全捞）
-
-        NOTE (B1): the footer rides the RETURN string of the live prefetch
-        face, and MUST NOT be part of the P3 snapshot that gets frozen for
-        cold-start replay — a frozen footer would re-fire on every cold start.
-        The snapshot is written BEFORE the footer is appended (see prefetch).
+          4) topic_mismatch — 主题不连续：只折出带 session 戳的跨 session
+                            confirmed 行，保留全局骨架 + 当前 session 自己的行
         """
         sid = session_id or getattr(self, "session_id", None)
         if not sid:
             return ""
-        # P1-3 子进程闸：delegate_task 子进程 session 完全不弹 bring-back
-        # footer（不 clarify、不置顶、不 bring-back）。父 session 行为不变。
+        # P1-3 subagent gate (owner 2026-10-14): delegate_task sub-agent
+        # sessions (platform == "subagent") NEVER get a bring-back footer —
+        # no clarify, no pin, no bring-back (sub-agents are one-shot leaves;
+        # a footer would pin the parent session's confirmed summaries into
+        # the sub-agent's prompt, anchoring the sub-agent back to the parent's
+        # earliest task). Main-session behavior is unchanged.
         if self._is_subagent_session():
             logger.info(
                 "FileMem: P1-3 subagent gate: bring-back footer suppressed "
@@ -15425,7 +15566,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         if st.get(sid, False):
             return ""  # already asked this session (one-shot held)
         if self._has_bringback_choice(sid):
-            return ""  # user already answered THIS session (any of 3 choices;
+            return ""  # user already answered THIS session (any of 4 choices;
                       # answered state, one-shot held)
         # HANDOFF owner ④ (C-gate): the user's OWN message names a KNOWN
         # closed session -> they've already stated their intent, so the
@@ -15448,86 +15589,36 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                     f"{named_sid} in their message; clarify footer "
                     f"suppressed for {sid} (pin intent recorded)")
                 return ""
-        prev_sid = self._last_closed_session_for_profile(
-            exclude_session_id=sid,
-            # C (owner 2026-10-11): only offer the bring-back question when the
-            # previous close stamp is FRESH (within the 30-min window). A stale
-            # stamp — e.g. an OLD session whose provider was rebuilt, not a
-            # real /new just after a close — yields None -> footer stays off.
-            max_age_s=_BRINGBACK_FRESH_WINDOW_S,
-        )
-        if prev_sid is None:
-            return ""  # no per-profile last_closed stamp -> nothing to bring back
         st[sid] = True  # mark asked NOW so a re-fetch this turn does not re-fire
         # A-fix (owner 2026-10-16): persist the mark so a REBUILT provider
         # (preflight compression / gateway cold-start) sees it via the
         # ledger hydrate on its next _bringback_footer_state() read.
         self._persist_bringback_asked(sid)
-        # P1-2 修复 1（owner 2026-10-14）: carry the PREVIOUS session's topic
-        # (its first user message via _session_title_hint, fail-soft to a bare
-        # id) so the model/owner sees WHICH topic is about to be crossed —
-        # the "串了谁" signal that the bare session id cannot give.
-        prev_topic = self._session_title_hint(prev_sid)
-        # HANDOFF face 3 (owner 裁决 A, 2026-10-17): when the last-closed
-        # session carries a handoff artifact (face 1's
-        # handoffs/<prev_sid>.json), the footer announces it — one line,
-        # riding the existing clarify card: no new option, no
-        # acknowledgement lifecycle (that's face B, a later round).
-        # Choosing bring_back pins prev_sid, so the summary rides the pin
-        # automatically. Fail-soft: no artifact / unreadable -> line
-        # omitted (footer byte-identical to today's).
-        handoff_note = ""
-        hd = self._handoff_dir()
-        if hd is not None:
-            art = hd / f"{prev_sid}.json"
-            if art.exists():
-                handoff_note = (
-                    f"\n【交接摘要】上一个 session（{prev_sid}）留有 filemem 生成的"
-                    "交接摘要（handoffs/ 工件）：选『带回』时该摘要会追加到本次"
-                    "自动注入面【尾部】（独立段落，不置顶、不新增 confirmed 行、"
-                    "检索面不动）。"
-                )
-        # A (owner 2026-10-11): the footer is text that DIRECTS the model to
-        # resolve the choice — it must emit the clarify TOOL (the native
-        # single-select card, keyboard ↑↓ + Enter), NOT paraphrase the three
-        # options as plain chat text. The prior wording ("请用 clarify 问用户
-        # 一次") was too soft: a model that merely wants to be terse re-states
-        # the options in prose, and the user gets a text box instead of a
-        # native select card. The instruction below is a hard directive
-        # ("必须/不要"), so the native window actually shows up. (Plugin-side
-        # limit: the footer only INSTRUCTS; whether the model obeys is an LLM
-        # behavior we cannot guarantee in code — if it still paraphrases, that
-        # is an A-limitation, not a bug in this patch.)
+        # owner 2026-11-04 (manual trigger): the footer is now a NEUTRAL 1-line
+        # hint — it no longer lists the 4 clarify choices, no longer hard-
+        # directs the model to emit the clarify tool, and no longer re-asks on
+        # every first non-trivial prefetch. Bring-back is user-driven: when the
+        # user says '带回' / '接着上次' / 'bringback' (or similar), the model
+        # (per the filemem_set_bringback tool description) emits a clarify card
+        # with 4 choices: [最近 session A (title), 最近 session B (title),
+        # 取消 bringback, 输入指定 session id (Other free-text)]. The model maps
+        # the user's selection to filemem_set_bringback(choice='bring_back',
+        # session_id_override=<chosen sid>) — options 1/2 land the pin via
+        # _recent_sessions_for_clarify(n=2) title->sid mapping, option 4 lands
+        # the user's typed sid verbatim. Option 3 (cancel) is a no-op tool call
+        # (the default clean_start stays active; no pin recorded). The footer
+        # itself is now byte-stable (1 neutral line, no dynamic prev_sid /
+        # handoff_note / topic interpolation) so a later prefetch does not
+        # re-inject a footer that would drift the session's prefix cache.
+        #
+        # Plugin-side limit (unchanged from the 2026-10-11 A-limitation): the
+        # footer + tool description only INSTRUCT the model; whether the model
+        # actually obeys (emits the clarify card on the user's trigger phrase,
+        # maps the selected title back to a sid) is an LLM behavior we cannot
+        # guarantee in code. The same-limitation, new-trigger-point.
         return (
-            "\n\n---\n🔁 [带回账本] 上一个 session（"
-            f"{prev_sid}"
-            + (f" · 主题「{prev_topic}」" if prev_topic else "")
-            + "）已关闭。本次 session 的自动注入面如何处理？\n"
-            + handoff_note
-            + "【指令：必须调用 clarify 工具（原生单选卡，用户可键盘 ↑↓ 选择）问用户"
-            "一次，把下列 4 个选项作为 clarify 的 choices 传入；"
-            "不要用纯文字把人话转述这几个选项。】\n"
-            "clarify 选项（4 个，按顺序传入 choices）：\n"
-            "  1) 带回 — 接着刚才干，把上一个 session 确认过（confirmed）的摘要"
-            "【置顶】本次自动注入（只改排序、不新增行；收行仍是 V2 两腿）\n"
-            "     → 用户选它后用 filemem_set_bringback(choice=\"bring_back\", "
-            "session_id=...) 落选\n"
-            "  2) 干净开局 — 不接着刚才，只留全局确认骨架 + 当前 session 行"
-            "（= V2 现状）\n"
-            "     → 用 filemem_set_bringback(choice=\"clean_start\", "
-            "session_id=...) 落选\n"
-            "  3) 全新 — 本 session 彻底不自动注入（连全局确认骨架也不带）；"
-            "检索面（filemem_search）仍全捞，全新 ≠ 失联\n"
-            "     → 用 filemem_set_bringback(choice=\"fresh\", session_id=...) 落选\n"
-            "  4) 主题不连续（topic_mismatch）— 上一个 session 与本次主题不同类"
-            "（如串了别的项目）：只折出『带 session 戳的跨 session confirmed 行』，"
-            "保留无 session 戳的全局确认骨架 + 当前 session 自己的 confirmed 行；"
-            "检索面仍全捞\n"
-            "     → 用 filemem_set_bringback(choice=\"topic_mismatch\", "
-            "session_id=...) 落选\n"
-            "不变式：检索面始终能跨 session 全捞，本选择只控制“要不要自动灌/带什么”，"
-            "不控制“能不能拿到”。\n"
-            "用户不答时按 fail-soft 默认“干净开局”（= V2 现状，不置顶、不折骨架）。"
+            "\n\n---\n"
+            "如需带回旧 session 自动注入面，说『带回』口令。"
         )
 
 

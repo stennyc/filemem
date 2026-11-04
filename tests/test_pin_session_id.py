@@ -295,18 +295,26 @@ def _write_handoff_artifact(tmp_path, sid: str, profile="default"):
         "llm_used": True}, ensure_ascii=False), encoding="utf-8")
 
 
-def test_f1_footer_announces_last_closed_handoff(tmp_path):
+def test_f1_footer_no_longer_announces_last_closed_handoff(tmp_path):
+    """owner 2026-11-04 (manual trigger): the footer no longer announces the
+    last-closed handoff artifact — that interpolation was part of the old
+    hard-directive clarify card, which moved to the user-driven manual
+    trigger. The footer is now the byte-stable neutral 1-line hint. The
+    handoff artifact STILL rides the pin on the auto-inject face tail when
+    the user picks bring_back (that consumer is unchanged)."""
     _stale_close(tmp_path, "s_stale")
     _close(tmp_path, "s_fresh")
     _write_handoff_artifact(tmp_path, "s_fresh")
     p = _make_provider(tmp_path, sid="s_cur", profile="default")
     foot = p._bringback_clarify_footer("s_cur")
-    assert "带回" in foot, foot
-    assert "交接" in foot and "s_fresh" in foot, (
-        f"the footer must announce the last-closed handoff artifact; got: "
-        f"{foot!r}")
-    # Choosing bring_back pins the last-closed target (which carries the
-    # handoff), so the summary rides the pin:
+    assert "如需带回旧 session 自动注入面" in foot, foot
+    # The old handoff artifact announcement is GONE from the footer:
+    assert "交接" not in foot, (
+        "footer no longer announces the last-closed handoff artifact "
+        "(moved to the auto-inject face tail on the pin, not the footer); "
+        f"got: {foot!r}")
+    # Choosing bring_back STILL pins the last-closed target (which carries
+    # the handoff), so the summary rides the pin:
     p2 = _make_provider(tmp_path, sid="s_cur", profile="default")
     out = json.loads(p2.handle_tool_call("filemem_set_bringback", {
         "choice": "bring_back", "session_id": "s_cur"}))
