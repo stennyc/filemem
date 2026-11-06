@@ -57,6 +57,7 @@ def _fake_ctx():
     return types.SimpleNamespace(
         register_memory_provider=lambda prov: None,
         register_hook=lambda name, fn: None,
+        register_system_prompt_section=lambda id, content: None,
     )
 
 

@@ -408,6 +408,7 @@ def test_f3_register_new_session_instance_gets_ctx(tmp_path, monkeypatch):
     fake_ctx = types.SimpleNamespace(
         register_memory_provider=lambda prov: None,
         register_hook=lambda name, fn: None,
+        register_system_prompt_section=lambda id, content: None,
     )
     fm.register(fake_ctx)
     # The 'default' instance got the ctx directly...

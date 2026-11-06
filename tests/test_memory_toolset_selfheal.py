@@ -176,6 +176,7 @@ def test_register_invokes_self_heal(tmp_path, monkeypatch):
         ctx = types.SimpleNamespace(
             register_memory_provider=lambda prov: None,
             register_hook=lambda name, fn: None,
+            register_system_prompt_section=lambda id, content: None,
         )
         fm.register(ctx)
         assert spy.call_count == 1
