@@ -325,6 +325,9 @@ def _looks_like_tool_dump(content: str) -> bool:
 #       tool dump via the _looks_like_tool_dump single source of truth)
 #   (c) whole task prompts (>=1000 chars AND step-numbered / step-listed
 #       task-type text)
+#   (e) whole kanban dispatch prompts ('# Kanban task t_…' card head +
+#       '## Body' + 'Assignee: ' — the dispatcher's per-task user prompt;
+#       owner 2026-11-06 three-gap autopsy, the P8 incident)
 # Reject = NOT written to the memory pool; the raw data is quarantined
 # (rollback-able on disk) + a rejection_reason stamp + an audit row. Pure rule
 # + stdlib re/len, zero LLM.
@@ -351,6 +354,47 @@ _TASK_PROMPT_MIN_STEPS = 3
 _RELAY_BLOCK_TAIL_MARKER = "Full live transcript"   # 回传块尾行特征（硬门 (i)）
 _RELAY_BLOCK_HEAD_MARKERS = ("[ASYNC DELEGATION",)  # 回传块头特征（(ii) 之一）
 _RELAY_BLOCK_DELEG_RE = re.compile(r"deleg_[0-9a-f]{8}")  # 回传块必含批次 id
+
+# ── P0-1(e) 整卡 kanban 任务 prompt 污染面（owner 2026-11-06 复盘定稿）──
+# kanban dispatcher 把整张任务卡（`# Kanban task t_xxxx: …` + Assignee/Status/
+# Workspace + ## Body 全文）作为 user prompt 派给 worker。worker session 收尾时
+# 失败捕获（kanban_block tool_error / patch retry_loop）把整张卡抽成 L0 行，
+# 再经蒸馏被提升 confirmed/value=high → 读侧 auto-inject 把 4-7K 字任务卡原文
+# 灌进 [记忆上下文]，模型跳回旧任务（2026-11-05 22:14 P8 实例：
+# task_429 = t_24d4791b 卡全文 4707 字，last_referenced 精确对齐幻觉时刻）。
+# 既有腿全漏：(c) task-prompt 腿要 >=1000 字 + >=3 步编号，卡正文是
+# `- [ ]` checkbox 无 `\n1.` 步编号；(a)(b)(b2) 开头是 `# Kanban` prose。
+# 双特征判据（宁漏勿错：真经验行提 t_xxx 但无卡结构 → 不命中；截断卡缺
+# 尾特征 → 漏一行，接受 fail-soft，同 P1 姿态）：
+#   (i)   开头（lstrip 后前 20 字符）"# Kanban task t_" 卡片头
+#   (ii)  正文含 "## Body"（卡结构锚点，dispatcher prompt 必有）
+#   (iii) 正文含 "Assignee: "（卡片字段行，增强项，非硬门）
+_KANBAN_TASK_HEAD = "# Kanban task t_"
+_KANBAN_TASK_HEAD_WINDOW = 20          # 只匹配卡片头（lstrip 后前 20 字符）
+_KANBAN_TASK_BODY_MARKER = "## Body"
+_KANBAN_TASK_ASSIGNEE_MARKER = "Assignee: "
+
+
+def _is_kanban_task_prompt(content: Optional[str]) -> bool:
+    """P0-1(e): single-source kanban whole-task-card detector (write ingress).
+
+    TRUE iff the content carries the kanban dispatch prompt shape:
+      (i)   opens with '# Kanban task t_' (head window, lstrip), AND
+      (ii)  body carries the '## Body' structural marker.
+    The 'Assignee: ' field line is the documented third marker of the
+    dispatcher card shape — kept as a constant for the future read-side
+    fold / egress table, NOT a hard gate here: a truncated card that
+    lost the Assignee line still carries (i)+(ii) and MUST be rejected
+    (owner ruling 2026-11-06: dual-feature head + ## Body is the gate).
+    Pure stdlib (str scan), zero LLM, never raises on any input. A
+    clean experience line that merely MENTIONS a t_xxx id lacks both
+    card-structure markers and passes (零误杀, P1 posture)."""
+    s = (content or "").strip()
+    if not s:
+        return False
+    if not s.lstrip()[:_KANBAN_TASK_HEAD_WINDOW].startswith(_KANBAN_TASK_HEAD):
+        return False
+    return _KANBAN_TASK_BODY_MARKER in s
 
 
 def _is_relay_block(content: Optional[str]) -> bool:
@@ -437,9 +481,10 @@ def ingress_reject_class(content: Optional[str],
     """P0-1: classify content against the shared-store contamination
     classes. Returns the reject-class string
     (``host_instruction_block`` / ``raw_tool_output`` /
-    ``whole_task_prompt`` / ``host_relay_block`` / ``structural_opener``)
+    ``whole_task_prompt`` / ``host_relay_block`` /
+    ``whole_kanban_task_prompt`` / ``structural_opener``)
     when the content must NOT enter the memory pool, else None to pass.
-    Order (a)->(b)->(b2)->(c)->(d)->None. Pure rule + stdlib re/len, zero
+    Order (a)->(b)->(b2)->(c)->(d)->(e)->None. Pure rule + stdlib re/len, zero
     LLM; never raises on any input (the caller's fail-open contract is
     enforced upstream).
 
@@ -506,6 +551,19 @@ def ingress_reject_class(content: Optional[str],
     # tool-opener dump, and it carries no step-numbering).
     if _is_relay_block(s):
         return "host_relay_block"
+    # (e) whole kanban task card (owner 2026-11-06): the dispatcher's
+    # '# Kanban task t_…' + '## Body' prompt mis-captured as an L0
+    # experience row by the failure-catch auto path, later distilled to
+    # confirmed/value=high and re-injected whole-card via the auto-inject
+    # face (the P8 incident: task_429/430). Dual-feature detector
+    # _is_kanban_task_prompt (single source, write ingress only — no read
+    # fold, confirmed-skeleton doctrine unchanged). After (d), before
+    # return None: zero cross-interaction ((e)'s head is not in
+    # _HOST_INSTRUCTION_PREFIXES, the body is not a JSON/tool-opener dump,
+    # and the card carries no step-numbering — exactly the three-gap
+    # shape the card slipped through (a)(b)(c)).
+    if _is_kanban_task_prompt(s):
+        return "whole_kanban_task_prompt"
     return None
 
 
