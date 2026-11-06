@@ -369,6 +369,14 @@ _RELAY_BLOCK_DELEG_RE = re.compile(r"deleg_[0-9a-f]{8}")  # 回传块必含批�
 #   (i)   开头（lstrip 后前 20 字符）"# Kanban task t_" 卡片头
 #   (ii)  正文含 "## Body"（卡结构锚点，dispatcher prompt 必有）
 #   (iii) 正文含 "Assignee: "（卡片字段行，增强项，非硬门）
+# 跨仓契约（reviewer deleg_8d423cdb RISK #2，2026-11-06）：上面两个锚点的
+# 唯一定义处在上游 hermes-agent 的 hermes_cli/kanban_db_context.py
+# （_ctx_header L88 卡片头 + L107 "## Body" 锚点，body 非空才输出）。本插件
+# 侧的常量与上游逐字硬编码，无自动同步——上游若改头/锚点字样，必须同步改
+# 这里四个常量 + tests/test_kanban_ingress_leg.py。契约由
+# tests/test_kanban_ingress_leg.py::test_upstream_anchor_contract 锁定
+# （grep 断言上游文件仍含两个锚点字样；上游文件缺失时 fail-soft 跳过，
+# 不锁宿主）。
 _KANBAN_TASK_HEAD = "# Kanban task t_"
 _KANBAN_TASK_HEAD_WINDOW = 20          # 只匹配卡片头（lstrip 后前 20 字符）
 _KANBAN_TASK_BODY_MARKER = "## Body"

@@ -148,3 +148,29 @@ def test_save_memory_manual_source_unaffected():
     p = _make_provider(tmp)
     rid = p._save_memory(KANBAN_CARD, level="L0", source="manual")
     assert rid != "", "manual save is unaffected by the ingress gate"
+
+
+def test_upstream_anchor_contract():
+    """Cross-repo contract (reviewer deleg_8d423cdb RISK #2): the (e)
+    leg's two anchor constants are hardcoded here, but their SOLE
+    definition site is upstream hermes-agent's
+    hermes_cli/kanban_db_context.py (_ctx_header: '# Kanban task {id}: …'
+    head + a '## Body' marker line emitted only when the card body is
+    non-empty). If the upstream renames either string, the (e) leg
+    silently stops matching — this test greps the upstream file for
+    both anchors so a rename FAILS the filemem suite instead of
+    drifting. Fail-soft (owner posture): if the upstream file does not
+    exist on this host (plugin installed standalone), the test is
+    SKIPPED, never a host lock.
+    """
+    upstream = pathlib.Path("/usr/local/lib/hermes-agent/hermes_cli/kanban_db_context.py")
+    if not upstream.exists():
+        # standalone install — upstream not present, nothing to pin
+        return
+    src = upstream.read_text(encoding="utf-8")
+    assert '# Kanban task ' in src, (
+        "upstream kanban_db_context.py no longer emits the '# Kanban task ' "
+        "head — update _KANBAN_TASK_HEAD in filemem/__init__.py")
+    assert '"## Body"' in src or "'## Body'" in src, (
+        "upstream kanban_db_context.py no longer emits the '## Body' marker — "
+        "update _KANBAN_TASK_BODY_MARKER in filemem/__init__.py")
