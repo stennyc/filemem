@@ -1085,9 +1085,14 @@ def refine_draft(main_runtime: Optional[Dict[str, Any]],
 
     Returns {'refined': str|None, 'trigger': str|None,
              'source_tag': stated|inferred|raw|None, 'model_used': bool}.
-    ANY failure (no snapshot / host down / unparseable / invalid enum) ->
+    ANY total failure (no snapshot / host down / unparseable reply) ->
     refined=None + model_used=False (the caller keeps the RAW draft —
     不吞脏: the raw text is already the draft's content on disk).
+    Reviewer I-4 (2026-11-08): note the MIDDLE STATE is legal — a call can
+    succeed (refined non-empty, model_used=True) while source_tag is None
+    (the LLM returned a valid refined statement but an out-of-enum /
+    missing source_tag). The caller treats source_tag=None as "skip the
+    tag write only"; it is NOT a whole-call failure.
     """
     try:
         text = f"(session topic: {session_title})\n" if session_title else ""

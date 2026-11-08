@@ -5433,18 +5433,26 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
     @classmethod
     def _draft_source_tag(cls, row: Dict[str, Any]) -> str:
         """Heuristic source-type tag for a draft row lacking an explicit
-        `metadata.source_tag`. Returns stated / inferred / raw."""
+        `metadata.source_tag`. Returns stated / inferred / raw.
+
+        Reviewer I-3 (2026-11-08): raw-fragment FEATURES are checked FIRST —
+        a numbered complaint list / multi-line transcript that merely MENTIONS
+        "用户要求" is still an unrefined fragment, and stamping it "stated"
+        would falsely imply user-verbatim backing (more misleading than "raw").
+        Order: explicit stamp -> raw features -> stated wording ->
+        inferred wording -> default inferred.
+        """
         meta = row.get("metadata") if isinstance(row, dict) else None
         if isinstance(meta, dict) and meta.get("source_tag"):
             return str(meta["source_tag"])
         content = str(row.get("content") or "").strip() if isinstance(row, dict) else ""
+        # multi-sentence raw fragment or numbered complaint list -> raw
+        if content.count("\n") >= 2 or re.search(r"^\s*\d+[.、]", content, re.MULTILINE):
+            return "raw"
         if cls._SOURCE_TAG_STATED_RE.search(content):
             return "stated"
         if cls._SOURCE_TAG_INFERRED_RE.search(content):
             return "inferred"
-        # multi-sentence raw fragment or numbered complaint list -> raw
-        if content.count("\n") >= 2 or re.search(r"^\s*\d+[.、]", content, re.MULTILINE):
-            return "raw"
         return "inferred"
 
     @classmethod
@@ -5513,6 +5521,12 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             # L1/L2 (the 待拍板 class, kind != 'l0') are never silenced here.
             if it.get("kind", "l0") != "l0":
                 return True
+            # 2026-11-08 reviewer I-2: the topic-extraction window here stays
+            # 80 chars ON PURPOSE — this is a cheap per-row BM25 pre-filter
+            # (decide whether to LIST the row), not the user-facing judgment
+            # surface (the 240-cap line in _turn_report_line below). Two
+            # different jobs; do NOT "unify" the two constants without first
+            # checking the P5 gate tests that pin this 80-char window.
             _row_topic = ((it.get("content") or "").strip().replace("\n", " ")[:80])
             # No resolvable current topic:
             #   P6-B fail-closed + a block-marker hit -> drop the row.
@@ -11932,7 +11946,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                             {"id": d.id, "type": d.type,
                              "content": d.content, "level": d.level,
                              "source_tag": self._draft_item_source_tag(d),
-                             "trigger": getattr(d, "trigger", None)}
+                             "trigger": (d.metadata or {}).get("draft_trigger")}
                             for d in drafts[:_lim]
                         ],
                     })
@@ -12000,7 +12014,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     {"id": d.id, "type": d.type,
                      "content": d.content, "level": d.level,
                      "source_tag": self._draft_item_source_tag(d),
-                     "trigger": getattr(d, "trigger", None)}
+                     "trigger": (d.metadata or {}).get("draft_trigger")}
                     for d in drafts[:_lim]
                 ],
             })

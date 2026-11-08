@@ -84,8 +84,7 @@ def test_2_preview_returns_full_content_and_tags():
     p = _make_provider(tmp, "s_cur")
     # current-session draft, full content survives in preview (no truncation)
     p._session_drafts["s_cur"] = [
-        MemoryItem(id="c1", type="fact", content="F" * 500).to_dict()
-        if False else MemoryItem(id="c1", type="fact", content="F" * 500)
+        MemoryItem(id="c1", type="fact", content="F" * 500)
     ]
     out = json.loads(p._tool_review_drafts({"action": "preview"}))
     assert out["success"] is True
@@ -124,6 +123,14 @@ def test_3_source_tag_heuristic_on_legacy_rows():
     tags = {i["id"]: i["source_tag"] for i in out["items"]}
     assert "stated" in tags["a"], tags
     assert "raw" in tags["b"], tags
+    # I-3 (reviewer P2): raw-fragment FEATURES beat stated WORDING — a numbered
+    # list that merely MENTIONS "用户要求" is still an unrefined fragment.
+    p._session_drafts["s_cur"] = [
+        MemoryItem(id="c", type="fact",
+                   content="1. 用户要求先出 patch\n2. 小步推进\n3. 验收全绿")
+    ]
+    out4 = json.loads(p._tool_review_drafts({"action": "preview"}))
+    assert out4["items"][0]["source_tag"] == "raw", out4["items"]
     # new rows carry an explicit stamp from generation (no heuristic needed)
     p._session_drafts["s_cur"] = [
         MemoryItem(id="n1", type="fact", content="提炼后的一句话陈述")
@@ -131,6 +138,26 @@ def test_3_source_tag_heuristic_on_legacy_rows():
     p._session_drafts["s_cur"][0].metadata["source_tag"] = "inferred"
     out3 = json.loads(p._tool_review_drafts({"action": "preview"}))
     assert out3["items"][0]["source_tag"] == "inferred", out3["items"]
+
+
+def test_6_preview_trigger_reads_metadata_draft_trigger():
+    """I-1 (reviewer P1): the preview 'trigger' key must read
+    metadata.draft_trigger — MemoryItem has no top-level trigger attribute,
+    so the old getattr(d, 'trigger', None) always returned None."""
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    p = _make_provider(tmp, "s_cur")
+    item = MemoryItem(id="c1", type="fact", content="提炼后的陈述")
+    item.metadata["draft_trigger"] = "当讨论 9200 右键菜单时想起这条"
+    item.metadata["source_tag"] = "inferred"
+    p._session_drafts["s_cur"] = [item]
+    out = json.loads(p._tool_review_drafts({"action": "preview"}))
+    assert out["items"][0]["trigger"] == "当讨论 9200 右键菜单时想起这条", out["items"]
+    # historical face (dict rows) reads the same key
+    with open(tmp / "drafts_s_old.json", "w", encoding="utf-8") as f:
+        json.dump([item.to_dict()], f, ensure_ascii=False)
+    out2 = json.loads(p._tool_review_drafts({"action": "preview",
+                                             "target": "s_old"}))
+    assert out2["items"][0]["trigger"] == "当讨论 9200 右键菜单时想起这条", out2["items"]
 
 
 def test_4_turn_report_line_widened_to_240():
