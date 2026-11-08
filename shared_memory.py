@@ -634,10 +634,18 @@ def search_central(
         params.append(limit)
         cur.execute(sql, params)
         rows = cur.fetchall()
+        def _ts(v):
+            """timestamptz -> ISO string (json.dumps 前必须去掉 datetime 对象)."""
+            if v is None:
+                return None
+            if hasattr(v, "isoformat"):
+                return v.isoformat()
+            return v
         return [
             dict(zip(
                 ["id", "mem_type", "content", "level", "confirmed",
-                 "source_profile", "agent_id", "version", "updated_at", "metadata"], r
+                 "source_profile", "agent_id", "version", "updated_at", "metadata"],
+                [r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], _ts(r[8]), r[9]]
             )) for r in rows
         ]
     except _TokenRejected:
