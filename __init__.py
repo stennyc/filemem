@@ -10072,6 +10072,61 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     },
                     "required": ["action"]
                 }
+            },
+            {
+                "name": "shared_memory_search",
+                "description": "S6 read-side (owner 定稿 2026-10-22): read-only query against the CENTRAL shared memory pool (PostgreSQL sharedmem). '别人的参考记忆' — cross-device consensus. NEVER writes; results exist only in this tool's return for the current turn. Requires shared_memory.enabled=true in config; absent/disabled returns a clean error, never an exception. Fail-soft inside: PG hiccup returns empty result set, not a failure."
+                ,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query (latin words and/or CJK terms). Required, non-empty."
+                        },
+                        "confirmed_only": {
+                            "type": "boolean",
+                            "default": true,
+                            "description": "If true (default), only return confirmed rows (consensus layer). If false, return all rows including unconfirmed."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "default": 50,
+                            "description": "Maximum number of results to return."
+                        }
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "shared_memory_handoff",
+                "description": "Hand off a memory row from this agent to the central shared pool, making it visible to other agents/devices via shared_memory_search. Requires shared_memory.enabled=true. Fail-soft: PG hiccup returns an error string, not an exception."
+                ,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "The memory ID to hand off (e.g. 'fact_502_1794098451')."
+                        }
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
+                "name": "shared_memory_take",
+                "description": "Take ownership of a central shared memory row, landing it into this agent's local shard for auto-inject/recall. Requires shared_memory.enabled=true. Fail-soft: PG hiccup returns an error string, not an exception."
+                ,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "The central memory ID to take."
+                        }
+                    },
+                    "required": ["id"]
+                }
             }
         ]
 
