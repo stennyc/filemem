@@ -160,6 +160,39 @@ def test_6_preview_trigger_reads_metadata_draft_trigger():
     assert out2["items"][0]["trigger"] == "当讨论 9200 右键菜单时想起这条", out2["items"]
 
 
+def test_7_confirm_promotion_carries_refine_verdict_into_pool_row():
+    """I-7 (owner 落池保留拍板): the draft-stage source_tag + draft_trigger
+    must ride into the pool row's metadata at confirm-promotion, not be
+    dropped. A legacy unrefined draft (no tag/trigger) promotes unchanged."""
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    p = _make_provider(tmp, "s_cur")
+    p._session_drafts["s_cur"] = []
+    # a refined draft (LLM face succeeded)
+    refined = MemoryItem(id="r1", type="fact", content="提炼后陈述")
+    refined.metadata["source_tag"] = "inferred"
+    refined.metadata["draft_trigger"] = "讨论 9200 右键时想起"
+    p._session_drafts["s_cur"].append(refined)
+    out = json.loads(p._tool_review_drafts({"action": "confirm"}))
+    assert out["success"] is True and out["count"] == 1, out
+    pool_rows = json.loads(
+        (p.memories_dir / "fact.json").read_text(encoding="utf-8"))
+    rows = [r for r in pool_rows if r.get("content") == "提炼后陈述"]
+    assert rows, pool_rows
+    assert rows[0]["metadata"].get("source_tag") == "inferred", rows[0]
+    assert rows[0]["metadata"].get("draft_trigger") == "讨论 9200 右键时想起", rows[0]
+    # legacy unrefined draft: no tag/trigger keys on the pool row
+    legacy = MemoryItem(id="l1", type="fact", content="普通原始片段")
+    p._session_drafts["s_cur"] = [legacy]
+    out2 = json.loads(p._tool_review_drafts({"action": "confirm"}))
+    assert out2["count"] == 1, out2
+    pool_rows2 = json.loads(
+        (p.memories_dir / "fact.json").read_text(encoding="utf-8"))
+    lrows = [r for r in pool_rows2 if r.get("content") == "普通原始片段"]
+    assert lrows, pool_rows2
+    assert "source_tag" not in lrows[0]["metadata"], lrows[0]
+    assert "draft_trigger" not in lrows[0]["metadata"], lrows[0]
+
+
 def test_4_turn_report_line_widened_to_240():
     """[记忆报告] L0 auto-save lines: same 240 judgment-basis rule."""
     tmp = pathlib.Path(tempfile.mkdtemp())

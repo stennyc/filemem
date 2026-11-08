@@ -5461,6 +5461,27 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         face) — delegates to the row-shape heuristic on its to_dict()."""
         return cls._draft_source_tag(item.to_dict())
 
+    def _draft_extra_meta(self, draft: "MemoryItem") -> Dict[str, Any]:
+        """I-7 (owner 落池保留, 2026-11-08): the draft-stage refine verdict
+        that rides into the pool row at confirm-promotion time.
+
+        Carries ONLY the two LLM-refine artifacts (source_tag /
+        draft_trigger) — nothing else from the draft's metadata (the pool
+        row gets its own origin / settled / origin_session stamps through
+        the normal _save_memory door). Empty/None values are dropped so
+        a legacy unrefined draft promotes byte-identically to the
+        pre-I-7 behavior (零回归 on the common path).
+        """
+        meta = getattr(draft, "metadata", None) or {}
+        out: Dict[str, Any] = {}
+        tag = meta.get("source_tag")
+        if tag:
+            out["source_tag"] = str(tag)
+        trig = meta.get("draft_trigger")
+        if trig:
+            out["draft_trigger"] = str(trig)
+        return out
+
     def _turn_report_line(self, sid: str) -> str:
         """T4①: the turn-level memory-confirmation line (@user requirement:
         list WHAT will be saved, one item per line with its id, then a
@@ -6840,7 +6861,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
 
     def _save_memory(self, content: str, level: str = "L0", source: str = "auto",
                      _marker_count: int = 1, _force_write: bool = False,
-                     validity_scope: Optional[str] = None) -> str:
+                     validity_scope: Optional[str] = None,
+                     _extra_meta: Optional[Dict[str, Any]] = None) -> str:
         """Save a memory with automatic level detection and deduplication.
 
         _force_write: the flusher re-enters already-queued items — they must
@@ -7074,6 +7096,15 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 # (the single door through which every persistent row is born:
                 # auto / manual / confirmed_draft all flow here).
                 _stamp_origin_in_meta(_item_meta, source)
+                # 2026-11-08 I-7 (owner 落池保留拍板): draft-stage refine
+                # verdict (source_tag + draft_trigger) rides into the pool
+                # row via _extra_meta — only the confirmed-draft callers
+                # pass it; None/absent keeps the byte-identical legacy path
+                # for every other source (零回归).
+                if _extra_meta:
+                    for _k, _v in _extra_meta.items():
+                        if _v is not None:
+                            _item_meta[_k] = _v
                 # owner 2026-10-12: stamp the originating session on the
                 # memories-pool row (metadata.origin_session) so the read-side
                 # auto-inject face can annotate "来自 session <sid>" on
@@ -11957,9 +11988,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     confirmed_items = []
                     for draft in drafts:
                         if not memory_id or draft.id == memory_id:
+                            _em = self._draft_extra_meta(draft)
                             item_id = self._save_memory(
-                                draft.content, level=draft.level, source="confirmed_draft"
-                            )
+                                draft.content, level=draft.level,
+                                source="confirmed_draft", _extra_meta=_em)
                             saved_ids.append(item_id)
                             confirmed_items.append(draft)
                         else:
@@ -12041,9 +12073,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     confirmed_items = []
                     for draft in cur_drafts:
                         if not memory_id or draft.id == memory_id:
+                            _em = self._draft_extra_meta(draft)
                             item_id = self._save_memory(
                                 draft.content, level=draft.level,
-                                source="confirmed_draft")
+                                source="confirmed_draft", _extra_meta=_em)
                             saved_ids.append(item_id)
                             eligible_total += 1
                             confirmed_items.append(draft)
@@ -12134,9 +12167,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                                                          # keep in place
                                     continue
                                 if action == "confirm":
+                                    _em = self._draft_extra_meta(draft)
                                     item_id = self._save_memory(
                                         draft.content, level=draft.level,
-                                        source="confirmed_draft")
+                                        source="confirmed_draft", _extra_meta=_em)
                                     saved_ids.append(item_id)
                                     eligible_total += 1
                                 # discard: nothing to write, just drop it
