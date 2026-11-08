@@ -193,6 +193,82 @@ def test_7_confirm_promotion_carries_refine_verdict_into_pool_row():
     assert "draft_trigger" not in lrows[0]["metadata"], lrows[0]
 
 
+def test_8_register_is_idempotent_on_section_collision():
+    """2026-11-08: register(ctx) tolerates a DOUBLE register() call in the
+    same process (multiplex gateway / force-reload cycle) — the host's
+    process-global section registry raises ValueError on the second
+    registration of the same id; filemem must swallow it as a no-op
+    (first registration stays authoritative) instead of propagating it
+    into the host's memory-provider registration path (which would log a
+    scary WARNING every reload)."""
+    import __init__ as filemem_pkg
+    from unittest import mock
+
+    registered_ids = set()
+
+    class FakeCtx:
+        """Mimics the host ctx: register_system_prompt_section is backed by a
+        PROCESS-GLOBAL registry (plugins.py PluginManager._system_prompt_sections),
+        so two separate FakeCtx instances must share `registered_ids` to
+        reproduce the real collision (first register wins, second raises)."""
+        def register_system_prompt_section(self, section_id, content, **_kw):
+            if section_id in registered_ids:
+                raise ValueError(
+                    f"system prompt section {section_id!r} is already "
+                    f"registered by plugin 'filemem'")
+            registered_ids.add(section_id)
+            return None
+        def register_hook(self, *_a, **_kw):
+            return None
+        def register_memory_provider(self, provider):
+            return None
+
+    # Stub every other register() call site so the test exercises ONLY the
+    # section-registration idempotency branch in isolation.
+    #
+    # CRITICAL (test-isolation fix, 2026-11-08): register() has MODULE-LEVEL
+    # global side effects beyond the two functions we patch here — it calls
+    # `provider._live_main_runtime()` and, when non-None, writes
+    # `_HOST_MAIN_RUNTIME` / `_HOST_MAIN_RUNTIME_BY_HOME` / `_HOST_LLM_CTX` /
+    # `_HOST_LLM_CTX_BY_HOME`. With `_get_cached_provider` mocked to return a
+    # Mock, `_live_main_runtime()` returns a Mock (non-None), so those globals
+    # get polluted with Mock objects. `with mock.patch` restores ONLY the two
+    # patched attributes on exit — it does NOT restore register()'s writes to
+    # the module-level globals, leaking into any test that runs AFTER this one
+    # and reads `_HOST_MAIN_RUNTIME` (ep_2_confirm / ep_3_alias /
+    # epic_card3 depend on it being None or a clean dict). Snapshot all four
+    # module-level runtime globals BEFORE the call and restore them AFTER, so
+    # this test's global writes never escape its scope.
+    real_register = filemem_pkg.register
+    _snap = {
+        "_HOST_MAIN_RUNTIME": filemem_pkg._HOST_MAIN_RUNTIME,
+        "_HOST_MAIN_RUNTIME_BY_HOME": dict(filemem_pkg._HOST_MAIN_RUNTIME_BY_HOME),
+        "_HOST_LLM_CTX": filemem_pkg._HOST_LLM_CTX,
+        "_HOST_LLM_CTX_BY_HOME": dict(filemem_pkg._HOST_LLM_CTX_BY_HOME),
+    }
+    try:
+        with mock.patch.object(filemem_pkg, "_get_cached_provider",
+                               return_value=mock.Mock()), \
+             mock.patch.object(filemem_pkg, "_resolve_current_hermes_home",
+                               return_value="/tmp/fake_home"):
+            real_register(FakeCtx())  # first call: registers cleanly
+            real_register(FakeCtx())  # second call: section already in the
+                                       # shared registry -> ValueError;
+                                       # register() must swallow it as an
+                                       # idempotent no-op
+    finally:
+        # Restore the module-level globals so register()'s side effects do not
+        # leak into later tests (no-op when the values are unchanged; a real
+        # reset when they were written to Mock values above).
+        filemem_pkg._HOST_MAIN_RUNTIME = _snap["_HOST_MAIN_RUNTIME"]
+        filemem_pkg._HOST_MAIN_RUNTIME_BY_HOME.clear()
+        filemem_pkg._HOST_MAIN_RUNTIME_BY_HOME.update(_snap["_HOST_MAIN_RUNTIME_BY_HOME"])
+        filemem_pkg._HOST_LLM_CTX = _snap["_HOST_LLM_CTX"]
+        filemem_pkg._HOST_LLM_CTX_BY_HOME.clear()
+        filemem_pkg._HOST_LLM_CTX_BY_HOME.update(_snap["_HOST_LLM_CTX_BY_HOME"])
+    assert "filemem_tool_routing" in registered_ids, registered_ids
+
+
 def test_4_turn_report_line_widened_to_240():
     """[记忆报告] L0 auto-save lines: same 240 judgment-basis rule."""
     tmp = pathlib.Path(tempfile.mkdtemp())

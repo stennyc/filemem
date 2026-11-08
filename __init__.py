@@ -16490,8 +16490,35 @@ def register(ctx) -> None:
 
     # Tool routing guard (owner ruling 2026-11-06): freeze the filemem tool-routing
     # text into every session's system prompt (symmetric with code_map_root_policy).
-    ctx.register_system_prompt_section("filemem_tool_routing", _FILEMEM_TOOL_ROUTING_TEXT)
-    logger.info("Registered system prompt section (filemem_tool_routing)")
+    # 2026-11-08 idempotency fix: register(ctx) can be invoked TWICE for the same
+    # profile home in a multiplexed gateway / plugin force-reload cycle (the host
+    # re-runs discover_and_load), but the host's section registry
+    # (hermes_cli/plugins.py PluginManager._system_prompt_sections) is a single
+    # PROCESS-GLOBAL table keyed by section id — a second register of the same id
+    # RAISES "already registered by plugin 'filemem'", which the host's memory-
+    # provider registration path swallows into a per-occurrence WARNING
+    # ("Memory provider 'filemem' failed to register_system_prompt_section").
+    # Catch that specific collision as a NO-OP (first registration is
+    # authoritative; the section is already frozen into the prompt) instead of
+    # letting it log a scary-looking WARNING on every reload. Any OTHER
+    # register error still propagates (fail-loud: a genuinely broken section
+    # id / content / position must surface, never be masked by the idempotency
+    # guard swallowing it).
+    try:
+        ctx.register_system_prompt_section(
+            "filemem_tool_routing", _FILEMEM_TOOL_ROUTING_TEXT)
+        logger.info("Registered system prompt section (filemem_tool_routing)")
+    except ValueError as exc:
+        # The ONLY ValueError the host's register_system_prompt_section raises
+        # for an already-registered id (plugins.py:984-986). The id validation
+        # error ("must be 1-128 lowercase ...") is a DIFFERENT ValueError,
+        # caught here too — but it only fires if _FILEMEM_TOOL_ROUTING_TEXT's
+        # companion id constant is malformed, which it is not (fixed literal),
+        # so in practice only the collision path reaches this handler. Treat
+        # both as "already present / not mine to fix" and stay silent.
+        logger.debug(
+            "filemem_tool_routing section already registered (idempotent no-op): %s",
+            exc)
 
 
     # No auxiliary task slot: the host main-model face (agent/auxiliary_client.
