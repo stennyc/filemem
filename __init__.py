@@ -10086,7 +10086,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         },
                         "confirmed_only": {
                             "type": "boolean",
-                            "default": true,
+                            "default": True,
                             "description": "If true (default), only return confirmed rows (consensus layer). If false, return all rows including unconfirmed."
                         },
                         "limit": {
