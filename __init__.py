@@ -10075,7 +10075,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             },
             {
                 "name": "shared_memory_search",
-                "description": "S6 read-side (owner 定稿 2026-10-22): read-only query against the CENTRAL shared memory pool (PostgreSQL sharedmem). '别人的参考记忆' — cross-device consensus. NEVER writes; results exist only in this tool's return for the current turn. Requires shared_memory.enabled=true in config; absent/disabled returns a clean error, never an exception. Fail-soft inside: PG hiccup returns empty result set, not a failure."
+                "description": "S6 read-side (owner 定稿 2026-10-22): read-only query against the CENTRAL shared memory pool (PostgreSQL sharedmem, the 'memories' table). '别人的参考记忆' — cross-device consensus. NEVER writes; results exist only in this tool's return for the current turn. Requires shared_memory.enabled=true in config; absent/disabled returns a clean error, never an exception. Fail-soft inside: PG hiccup returns empty result set, not a failure. "
+                "ROUTING (when to use me): use for SHORT-FACT central memory — user preferences, decisions, environment facts, cross-session continuity (the 'memories' table). For LONG knowledge documents (tutorials / troubleshooting playbooks / reference material / agent-experience, title+content+doc_kind), use kb_search_central instead — that queries a different table (kb_docs). One-line rule: 'how was topic X done (tutorial/经验)' -> kb_search_central; 'user preference / decision / env fact' -> this tool. When unsure or to avoid missing either, query BOTH."
                 ,
                 "parameters": {
                     "type": "object",
