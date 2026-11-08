@@ -89,10 +89,11 @@ def test_11_gate_sites_are_wired():
     gate + pin->tail summary gate + plan-probe LLM gate) — bump it in
     lock-step when a new LLM face lands."""
     src = (Path(__file__).resolve().parents[1] / "__init__.py").read_text()
-    # 14 call sites (incl. handoff face 1 + pin-tail face 3 + plan-probe)
-    # + 1 method definition = 15 occurrences
-    assert src.count("self._live_main_runtime()") == 14, \
-        f"expected 14 gate call sites, found {src.count('self._live_main_runtime()')}"
+    # 15 call sites (incl. handoff face 1 + pin-tail face 3 + plan-probe +
+    # draft-refine face 1, 2026-11-08) + 1 method definition = 16 occurrences
+    # (bump in lock-step when a new LLM face lands)
+    assert src.count("self._live_main_runtime()") == 15, \
+        f"expected 15 gate call sites, found {src.count('self._live_main_runtime()')}"
     assert src.count("def _live_main_runtime(") == 1
     # No bare main_runtime gate may remain on the LLM-face path
     assert 'if not getattr(self, "_main_runtime", None):' not in src, \

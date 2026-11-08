@@ -238,5 +238,7 @@ def test_10_hint_off_default_is_byte_identical_base_format():
     # the eligible row's content line, cross-profile rows never listed.
     # Numbered list format (owner 2026-10-11): lines carry a 1-based
     # index so the clarify panel can reference items by number.
+    # 2026-11-08: every row now carries a [来源: …] tag (judgment basis);
+    # an unstamped row -> the heuristic default "inferred".
     line = [l for l in ctx.splitlines() if "条待处置" in l or "mine" in l]
-    assert line == ["  1. [L0] mine"], ctx
+    assert line == ["  1. [L0] [来源: inferred] mine"], ctx

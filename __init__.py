@@ -2513,6 +2513,17 @@ class FileMemProvider(MemoryProvider):
         self._distill_call_limit: int = 5
         self._distill_budget: Dict[str, int] = {}
 
+        # 2026-11-08 (①): draft-refine face budget — a fresh L1/L2 draft is
+        # refined into a self-contained statement + trigger note BEFORE it
+        # lands in the pending-confirm queue (the user can't judge a raw
+        # fragment). Per-session cap, tunable via decay.json
+        # memory_draft_refine.llm_per_session (default 3; 0 = off -> pure
+        # raw-draft legacy behavior = clean rollback). Fail-soft: no
+        # main_runtime / over-cap / any host failure -> the RAW draft lands
+        # unrefined (宁可漏提炼, 不吞脏).
+        self._draft_refine_limit: int = 3
+        self._draft_refine_budget: Dict[str, int] = {}
+
         # t_090d6f3d: type-classification fallback budget. The LLM reclassify
         # face only fires on a regex `fact`-miss (a content that matched no
         # en/zh strong-signal type row), upgrades that item's shard type, and
@@ -2791,6 +2802,18 @@ class FileMemProvider(MemoryProvider):
         _lps = _mt.get("llm_per_session")
         if isinstance(_lps, int) and _lps >= 0:
             self._type_classify_limit = _lps
+
+        # 2026-11-08 (①): apply the decay memory_draft_refine block to the
+        # draft-refine budget knob (default 3) — a user-tunable
+        # llm_per_session overrides it; 0 / enable=False = clean rollback to
+        # pure raw-draft legacy behavior.
+        _mrd = self._decay.get("memory_draft_refine") or {}
+        if _mrd.get("enable", True):
+            _mrd_lps = _mrd.get("llm_per_session")
+            if isinstance(_mrd_lps, int) and _mrd_lps >= 0:
+                self._draft_refine_limit = _mrd_lps
+        else:
+            self._draft_refine_limit = 0
 
         # Ensure base files exist
         self._ensure_base_files()
@@ -5197,14 +5220,20 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     content = _row_content
                     if not content:
                         continue
-                    if len(content) > 80:
-                        content = content[:80] + "…"
+                    # 2026-11-08 owner feedback (D-site): 80 chars gave no
+                    # judgment basis for confirm/discard. Widened to 240.
+                    if len(content) > 240:
+                        content = content[:240] + "…"
                     level = row.get("level") or "L0"
+                    # ③ source-type tag: explicit stamp from generation
+                    # time (in metadata), else the display-time heuristic on
+                    # legacy rows (a no-migration readability fix).
+                    _src_tag = _meta.get("source_tag") or self._draft_source_tag(row)
                     line_idx += 1
                     if last_hdr_owner != _owner:
                         lines.append(_header)
                         last_hdr_owner = _owner
-                    lines.append(f"  {line_idx}. [{level}] {content}")
+                    lines.append(f"  {line_idx}. [{level}] [来源: {_src_tag}] {content}")
                 # P1-3 5b companion: a file listed as pending (the zero-
                 # eligible LIST path) whose rows are ALL unrenderable (not
                 # dicts) must still surface ONE fallback line — otherwise
@@ -5385,6 +5414,45 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 return True  # CJK "词": / "词"： key pattern
             return False
 
+    # 2026-11-08 (③): display-time source-type heuristic for LEGACY draft rows
+    # (no explicit `source_tag` in metadata). New rows are stamped at
+    # generation time by _add_draft; this covers the existing stock without a
+    # data migration. Three classes the user can judge on:
+    #   stated  — 用户明确说过的 (explicit user-statement wording)
+    #   inferred— agent 推断/总结的
+    #   raw     — 未提炼对话片段 (raw fragment: numbered complaints, tool-
+    #              output residue, multi-sentence raw transcript)
+    _SOURCE_TAG_STATED_RE = re.compile(
+        r"用户(?:明确|要求|要求我|规定|偏好|希望|决定|拍板)"
+        r"|我(?:要求|明确|规定|偏好)|user (?:requires?|insisted|prefers?)"
+        r"|owner (?:ruling|insisted)", re.IGNORECASE)
+    _SOURCE_TAG_INFERRED_RE = re.compile(
+        r"推断|推测|建议|应当|应该|可能|预计|inferred|suggested?",
+        re.IGNORECASE)
+
+    @classmethod
+    def _draft_source_tag(cls, row: Dict[str, Any]) -> str:
+        """Heuristic source-type tag for a draft row lacking an explicit
+        `metadata.source_tag`. Returns stated / inferred / raw."""
+        meta = row.get("metadata") if isinstance(row, dict) else None
+        if isinstance(meta, dict) and meta.get("source_tag"):
+            return str(meta["source_tag"])
+        content = str(row.get("content") or "").strip() if isinstance(row, dict) else ""
+        if cls._SOURCE_TAG_STATED_RE.search(content):
+            return "stated"
+        if cls._SOURCE_TAG_INFERRED_RE.search(content):
+            return "inferred"
+        # multi-sentence raw fragment or numbered complaint list -> raw
+        if content.count("\n") >= 2 or re.search(r"^\s*\d+[.、]", content, re.MULTILINE):
+            return "raw"
+        return "inferred"
+
+    @classmethod
+    def _draft_item_source_tag(cls, item: "MemoryItem") -> str:
+        """Same tag for a MemoryItem object (the current-session preview
+        face) — delegates to the row-shape heuristic on its to_dict()."""
+        return cls._draft_source_tag(item.to_dict())
+
     def _turn_report_line(self, sid: str) -> str:
         """T4①: the turn-level memory-confirmation line (@user requirement:
         list WHAT will be saved, one item per line with its id, then a
@@ -5465,8 +5533,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         lines = []
         for i, it in enumerate(pending, 1):
             content = (it.get("content") or "").strip().replace("\n", " ")
-            if len(content) > 100:
-                content = content[:100] + "…"
+            # 2026-11-08: widened 100 -> 240 (same judgment-basis rule as the
+            # [未决草稿] face — the user needs the full statement to decide).
+            if len(content) > 240:
+                content = content[:240] + "…"
             level = it.get("level", "L0")
             kind = it.get("kind", "l0")
             # t_plan_slice4: plan-probe panel entries (kind="plan_probe") show
@@ -7412,19 +7482,30 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # file persists via to_dict; a later confirm re-enters _save_memory
         # where the idempotent re-stamp keeps this value).
         meta["origin"] = origin_stamp_for_source("draft")
+        # 2026-11-08 (①+③): budget-gated host-LLM refine BEFORE the draft
+        # lands: rewrite the raw fragment into a self-contained statement +
+        # trigger note + source_tag (stated/inferred/raw). Runs OUTSIDE any
+        # lock; fail-soft (no main_runtime / over-cap / any host failure) ->
+        # the RAW content lands unrefined (legacy behavior, 不吞脏).
+        _refined_content, _refined_trigger, _refined_tag = (
+            self._refine_draft_llm(content))
         item = MemoryItem(
             id=f"draft_{int(now * 10**6)}_{_n_drafts}",
             type="fact",
-            content=content,
+            content=_refined_content,
             level=level,
             source="draft",
             created_at=_utcnow().isoformat(),
             updated_at=_utcnow().isoformat(),
             # SA2-1: drafts carry the deterministic event-date stamp too —
             # they promote into the pool at review time with the key intact.
-            occurred_at=extract_occurred_at(content),
+            occurred_at=extract_occurred_at(_refined_content),
             metadata=meta,
         )
+        if _refined_trigger:
+            item.metadata["draft_trigger"] = _refined_trigger
+        if _refined_tag:
+            item.metadata["source_tag"] = _refined_tag
 
         self._session_drafts[self.session_id].append(item)
         # T4①: list this NEW draft in the pending-confirm panel so the next
@@ -7722,6 +7803,73 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # LLM agreed with fact / returned an invalid verdict / said plan ->
         # no override.
         return None
+
+    def _refine_draft_llm(self, content: str) -> tuple:
+        """2026-11-08 (①): budget-gated host-LLM refine of a fresh draft.
+
+        Rewrites a raw draft fragment (a user complaint list, a tool-output
+        residue, a multi-sentence transcript) into a SELF-CONTAINED
+        statement + a short trigger note ("when to recall this") + a
+        source_tag (stated/inferred/raw), so the pending-confirm notice
+        gives the user an actual basis to confirm/discard.
+
+        Runs OUTSIDE any write lock; ANY failure (no main_runtime / over-cap
+        / host down / unparseable / feature off) returns the RAW content
+        unchanged (legacy behavior, 不吞脏 — a failed refine never blocks
+        the draft from landing).
+
+        Returns (refined_content, trigger, source_tag):
+          refined_content = the LLM's self-contained statement on success,
+                            else the original raw content
+          trigger         = short recall-trigger clause, or None
+          source_tag      = stated/inferred/raw from the LLM, or None
+        """
+        raw = content
+        # Feature gate (clean rollback): decay block off / zero budget ->
+        # pure raw-draft legacy behavior (byte-identical pre-2026-11-08).
+        limit = getattr(self, "_draft_refine_limit", 3)
+        if not isinstance(limit, int) or limit <= 0:
+            return (raw, None, None)
+        main_runtime = self._live_main_runtime()
+        if not main_runtime:
+            return (raw, None, None)  # standalone / non-host: zero call
+        sid = self.session_id or "default"
+        budget = getattr(self, "_draft_refine_budget", None)
+        if not isinstance(budget, dict):
+            budget = {}
+            self._draft_refine_budget = budget
+        if budget.get(sid, 0) >= limit:
+            # Over-cap: the RAW draft lands unrefined (no silent drop, no
+            # call — the refined text is convenience, not load-bearing; the
+            # raw fragment is already the draft's on-disk content).
+            logger.info(f"FileMem: draft-refine budget hit ({sid} >= {limit}), "
+                        f"keeping raw draft")
+            return (raw, None, None)
+        try:
+            llm = _load_llm_caller()
+            res = llm.refine_draft(
+                main_runtime, raw,
+                session_title=self._session_title_hint(sid) or "")  # fail-soft inside
+            self._append_llm_call_telemetry(llm, "refine_draft")
+        except Exception as e:
+            # A loader / host failure must NOT block the draft — raw lands.
+            logger.warning(f"FileMem: draft-refine loader failed ({e}); "
+                          f"keeping raw draft")
+            return (raw, None, None)
+        # Count the call against the budget (a call happened, whatever the
+        # verdict).
+        budget[sid] = budget.get(sid, 0) + 1
+        refined = res.get("refined")
+        trigger = res.get("trigger")
+        source_tag = res.get("source_tag")
+        # A miss (refined None / model_used False) -> the RAW draft stands.
+        if not res.get("model_used") or not refined:
+            return (raw, None, None)
+        # A "raw" verdict means the LLM itself judged the fragment too
+        # contextual to rewrite: keep the raw content, keep the tag.
+        if source_tag == "raw":
+            return (raw, trigger, "raw")
+        return (refined, trigger, source_tag)
 
     def _plan_probe(self, content: str) -> Optional[Dict[str, Any]]:
         """t_plan_slice4: budget-gated host-LLM plan-PROBE face.
@@ -11772,6 +11920,9 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     if _lim is None:
                         _lim = len(drafts)
                     _shown = max(0, min(len(drafts), _lim))
+                    # 2026-11-08 (②): preview exposes FULL content (no
+                    # truncation) + the source-type tag + any trigger note,
+                    # so the user has a basis to confirm/discard.
                     return json.dumps({
                         "success": True,
                         "scope": "historical",
@@ -11779,7 +11930,9 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         "shown": _shown,
                         "items": [
                             {"id": d.id, "type": d.type,
-                             "content": d.content, "level": d.level}
+                             "content": d.content, "level": d.level,
+                             "source_tag": self._draft_item_source_tag(d),
+                             "trigger": getattr(d, "trigger", None)}
                             for d in drafts[:_lim]
                         ],
                     })
@@ -11832,6 +11985,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         if action == "preview":
             # F-site read-only preview of the CURRENT session's in-memory
             # drafts (the model never opens the internal drafts_<sid>.json).
+            # 2026-11-08 (②): FULL content + source_tag + trigger — no
+            # truncation (the judgment basis must be readable in full).
             _lim = args.get("limit")
             if _lim is None:
                 _lim = len(drafts)
@@ -11843,7 +11998,9 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 "shown": _shown,
                 "items": [
                     {"id": d.id, "type": d.type,
-                     "content": d.content, "level": d.level}
+                     "content": d.content, "level": d.level,
+                     "source_tag": self._draft_item_source_tag(d),
+                     "trigger": getattr(d, "trigger", None)}
                     for d in drafts[:_lim]
                 ],
             })

@@ -175,7 +175,9 @@ def test_unresolved_header_carries_session_title():
     ctx = p._pending_draft_notice("", session_id="s_cur")
     assert "[未决草稿]" in ctx
     assert "[session hist1 · code_map root 拆分讨论]" in ctx
-    assert f"  1. [L2] {HUMAN_TEXT}" in ctx
+    # 2026-11-08: the [来源: …] tag is now always shown on each row (the
+    # user's judgment basis). HUMAN_TEXT is unstamped -> heuristic default.
+    assert f"  1. [L2] [来源: inferred] {HUMAN_TEXT}" in ctx
 
 
 def test_unresolved_header_falls_back_to_bare_id_without_trace():

@@ -1033,6 +1033,81 @@ def recurring_directive(main_runtime, rows: List[Dict]) -> Dict[str, Any]:
                 "model_used": False}
 
 
+# ── 2026-11-08: draft-refine face (owner feedback: truncated raw-fragment
+# drafts give the user no basis to confirm/discard) ──────────────────────────
+# Refines one freshly-caught draft into a self-contained, readable memory
+# statement + a trigger note ("什么时候该想起这条"). The SAME posture as
+# distill / classify_type: explicit main_runtime snapshot, host call_llm
+# surface only, temperature 0.0, fail-soft to a raw-keep verdict (宁可漏
+# 提炼, 不吞脏 — a failed refine keeps the raw draft, never blocks it).
+_REFINE_DRAFT_FAIL = {"refined": None, "trigger": None,
+                      "source_tag": None, "model_used": False}
+
+REFINE_DRAFT_INSTRUCTIONS = """You are a memory curator for an AI agent.
+One raw draft line was just caught from a conversation. Rewrite it into a
+memory item the user can judge in isolation (they will NOT have the
+conversation context at confirm time).
+
+Output JSON:
+{
+  "refined": "self-contained statement, <= 300 chars",
+  "trigger": "one short clause: when the agent should recall this, <= 60 chars",
+  "source_tag": "stated|inferred|raw"
+}
+
+Rules:
+- "stated": the user explicitly said / required / decided it themselves.
+- "inferred": the agent summarized / concluded it (user did not spell it out).
+- "raw": the fragment is too contextual / too noisy to rewrite safely ->
+  set refined to the original text verbatim and source_tag "raw".
+- Never invent facts; keep all concrete values (paths, numbers, names) intact.
+"""
+
+REFINE_DRAFT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "refined": {"type": "string",
+                    "description": "self-contained statement, <= 300 chars"},
+        "trigger": {"type": "string",
+                    "description": "when to recall this, <= 60 chars"},
+        "source_tag": {"type": "string",
+                       "enum": ["stated", "inferred", "raw"]},
+    },
+    "required": ["refined", "source_tag"],
+}
+
+
+def refine_draft(main_runtime: Optional[Dict[str, Any]],
+                 content: str,
+                 session_title: str = "") -> Dict[str, Any]:
+    """LLM refinement of one fresh draft (host main-model face,
+    temperature 0.0 / max_tokens 256).
+
+    Returns {'refined': str|None, 'trigger': str|None,
+             'source_tag': stated|inferred|raw|None, 'model_used': bool}.
+    ANY failure (no snapshot / host down / unparseable / invalid enum) ->
+    refined=None + model_used=False (the caller keeps the RAW draft —
+    不吞脏: the raw text is already the draft's content on disk).
+    """
+    try:
+        text = f"(session topic: {session_title})\n" if session_title else ""
+        parsed = _structured_call(main_runtime, REFINE_DRAFT_INSTRUCTIONS,
+                                  REFINE_DRAFT_SCHEMA, text + content,
+                                  temperature=0.0, max_tokens=256) or {}
+        refined = str(parsed.get("refined") or "").strip()
+        trigger = str(parsed.get("trigger") or "").strip() or None
+        source_tag = parsed.get("source_tag")
+        if source_tag not in ("stated", "inferred", "raw"):
+            source_tag = None
+        if not refined:
+            return dict(_REFINE_DRAFT_FAIL)
+        return {"refined": refined, "trigger": trigger,
+                "source_tag": source_tag, "model_used": True}
+    except Exception as exc:
+        _record_face_fallback(main_runtime, exc)
+        return dict(_REFINE_DRAFT_FAIL, **{"reason": f"model_unavailable_fallback={exc}"})
+
+
 # ③ salience-decay downweight is DETERMINISTIC (zero LLM) — it lives in the
 # provider (_salience_decay_downweight), not here. It only reuses the existing
 # reference-count / last-referenced / superseded signals; no host call.
