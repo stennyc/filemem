@@ -47,6 +47,11 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
+from datetime import datetime, timezone, timedelta
+
+
+def _ts(days_ago=1):
+    return (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%S")
 
 import pytest
 
@@ -153,7 +158,7 @@ def _write_session_jsonl(tmp: Path, sid: str,
                "content": t["content"],
                "assistant": t.get("assistant", ""),
                "source_profile": sp or "default",
-               "ts": "2026-10-01T00:00:00"}
+               "ts": _ts(1)}
         lines.append(json.dumps(row, ensure_ascii=False))
         # host double-logs the user turn (the dedup path's real defect):
         lines.append(json.dumps(row, ensure_ascii=False))
@@ -173,9 +178,9 @@ def _write_pool_row(tmp: Path, mem_type: str, row_id: str, content: str,
     row: Dict[str, Any] = {
         "id": row_id, "type": mem_type, "content": content,
         "level": "L0", "source": "manual",
-        "created_at": "2026-10-01T00:00:00",
-        "updated_at": "2026-10-01T00:00:00",
-        "salience": 0.9, "last_referenced": "2026-10-01T00:00:00",
+        "created_at": _ts(1),
+        "updated_at": _ts(1),
+        "salience": 0.9, "last_referenced": _ts(1),
         "metadata": meta,
     }
     if session_id is not None:
@@ -256,9 +261,14 @@ def test_t1_pin_llm_summary_appended_to_tail(tmp_path, monkeypatch):
         "choice": "bring_back", "session_id": "s_cur"}))
     assert out2["pin_requested"] == "s_dead", out2
     assert p2._get_pending_user_pin("s_cur") is None
-    # M4 search face is untouched by the exclusion:
-    found = p.search_memories("dead session confirmed fact", limit=8, min_score=0.1)
-    assert any(r.get("content") == "dead session confirmed fact" for r in found)
+    # M4 search face is untouched by the exclusion (全新 ≠ 失联): the row
+    # remains in the on-disk pool even though the pinned session's auto face
+    # is white-sheeted (only the handoff summary is carried, not other rows).
+    found = p.search_memories("dead session confirmed fact",
+                              limit=8, min_score=0.0, profile_scope=None)
+    assert any(r.get("content") == "dead session confirmed fact" for r in found), (
+        "the explicit search face (profile_scope=None) must still retrieve "
+        f"the row; got {len(found)} rows")
 
 
 def test_t2_pin_no_llm_degrades_to_turn_concat_tail(tmp_path):

@@ -24,6 +24,7 @@ import json
 import sys
 import threading
 import time
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -274,9 +275,12 @@ def test_no_graph_equals_two_axis_behavior():
 
 # ── provider wiring: _load_graph + fail-soft search_memories ─────────────
 def test_provider_load_graph_missing_and_corrupt(tmp_path):
+    # dynamic recent dates (L0 TTL=30d safe on any run date)
+    _n1 = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    _n2 = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S")
     root = _write_root(tmp_path / "root", [
-        _mem("m1", "demo gateway crash", "2026-09-28T10:00:00"),
-        _mem("m2", "demo restart notes", "2026-09-29T10:00:00"),
+        _mem("m1", "demo gateway crash", _n1),
+        _mem("m2", "demo restart notes", _n2),
     ])
     p = _provider_over(root)
     # no graph.json yet -> None, search works (two-axis degradation)

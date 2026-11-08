@@ -161,6 +161,11 @@ def test_prefetch_drops_selftest_keeps_ordinary():
     ]
     with open(tmp / "memories" / "fact.json", "w") as f:
         json.dump(items, f)
+    # owner 2026-11-08: the no-choice default is now 'fresh' (empty auto face).
+    # This test exercises the self_test filter specifically — record an
+    # explicit 'clean_start' choice so the cross-session confirmed rows
+    # flow through and the assertion targets the self_test semantics.
+    p._set_bringback_choice("s1", "clean_start")
     ctx = p.prefetch("port endpoint", session_id="s1", confidence=0.5)
     assert "port 8080 endpoint healthy" in ctx, "ordinary item must still inject"
     assert "port 8080 endpoint reachable" not in ctx, "self_test item must NOT inject"

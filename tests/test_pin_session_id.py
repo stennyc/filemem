@@ -44,6 +44,11 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
+from datetime import datetime, timezone, timedelta
+
+
+def _ts(days_ago=1):
+    return (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%S")
 
 import pytest
 
@@ -130,9 +135,9 @@ def _write_pool_row(tmp: Path, mem_type: str, row_id: str, content: str,
     row: Dict[str, Any] = {
         "id": row_id, "type": mem_type, "content": content,
         "level": "L0", "source": "manual",
-        "created_at": "2026-10-01T00:00:00",
-        "updated_at": "2026-10-01T00:00:00",
-        "salience": 0.9, "last_referenced": "2026-10-01T00:00:00",
+        "created_at": _ts(1),
+        "updated_at": _ts(1),
+        "salience": 0.9, "last_referenced": _ts(1),
         "metadata": meta,
     }
     if session_id is not None:
@@ -189,11 +194,18 @@ def test_p2_end_to_end_pin_reorder_top_and_set_unchanged(tmp_path):
                     sp="default", confirmed=True, session_id="s_old")
     _write_pool_row(tmp_path, "fact", "f_other", "other confirmed fact",
                     sp="default", confirmed=True, session_id="s_fresh")
+    # owner 2026-11-08: a named pin (session_id_override) under bring_back
+    # carries FULL authority — it must bypass the no-choice 'fresh' default
+    # (which otherwise folds the whole auto face) and re-order the pinned
+    # session's confirmed rows to the TOP of the auto face, NOT collect new
+    # rows (the set is unchanged from the confirmed-global leg).
     p = _set_pin(tmp_path, "s_cur", "s_old")
     p.session_id = "s_cur"
     ctx = p.prefetch("pinned session fact", session_id="s_cur")
     assert "pinned session fact" in ctx, (
-        f"the pinned session's confirmed row must auto-inject; got: {ctx!r}")
+        f"the pinned session's confirmed row must auto-inject under a named "
+        f"bring_back pin (pin authority bypasses the fresh default); got: "
+        f"{ctx!r}")
     # B2-A sentinel: reorder, not collect — the row SET is unchanged:
     assert "other confirmed fact" in ctx, (
         "pinning must NOT drop the other confirmed global rows")

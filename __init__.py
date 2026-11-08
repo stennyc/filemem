@@ -767,17 +767,25 @@ def _row_source_profile(item: Dict[str, Any]) -> Optional[str]:
 
 
 def _auto_recall_eligible(row_sp: Optional[str], session_sp: Optional[str]) -> bool:
-    """P0-2 hard-isolation predicate (the auto-inject face ONLY). Keep a row
-    iff its effective source_profile (row_sp) EQUALS the session profile
-    (session_sp), OR it is NEUTRAL (row_sp is None — no stamp / empty legacy
-    row). A cross-profile row (row_sp set, != session_sp) is cut. When
-    session_sp is None (host gave no profile identity -> fail-open) EVERY row
-    is kept: no isolation, today's full-recall behavior — a missing identity
-    can never silently drop recall."""
+    """P0-2 hard-isolation predicate (the auto-inject face ONLY).
+
+    owner 2026-11-08 (跨 session / 跨 profile 串入根治):
+      session_sp is None  -> fail-open: EVERY row is kept (host gave no
+                              profile identity; a missing identity can never
+                              silently drop recall — unchanged).
+      row_sp is None      -> cut: a NEUTRAL (no-stamp / empty legacy) row is
+                              NOT auto-injected under a KNOWN session profile
+                              (previously kept — the 22 neutral confirmed
+                              rows were a cross-session / cross-profile leak
+                              vector: a neutral row written by any profile
+                              reached every other profile's auto face).
+      row_sp == session_sp -> keep (same-profile row).
+      row_sp != session_sp -> cut (cross-profile row).
+    """
     if session_sp is None:
         return True
     if row_sp is None:
-        return True
+        return False
     return row_sp == session_sp
 
 
@@ -4270,15 +4278,19 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # (filemem_search / M4) is UNAFFECTED (fresh ≠ unretrievable; owner
         # 2026-10-10). Runs before the confirmed gate; a fresh session has no
         # auto-inject value to keep, so we short-circuit the pool here.
-        _bb_choice = self._get_bringback_choice(getattr(self, "session_id", None))
+        _bb_choice = self._get_bringback_choice(
+            getattr(self, "_turn_active_sid", None)
+            or getattr(self, "session_id", None)
+            or session_id)
         if _bb_choice == "fresh" and results:
             results = []
         if results:
             _c_pre = len(results)
+            _cur_sid_full = getattr(self, "_turn_active_sid", None) \
+                or getattr(self, "session_id", None) or session_id
             results = [
                 r for r in results
-                if _auto_inject_eligible(r, _session_sp,
-                                         getattr(self, "session_id", None))
+                if _auto_inject_eligible(r, _session_sp, _cur_sid_full)
             ]
             _c_folded = _c_pre - len(results)
             # P1 relay-block read-side fold (owner 裁决①, 2026-10-13):
@@ -4307,7 +4319,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             # _cross_session_confirmed_fold（与 relay 腿同构）。
             if _bb_choice == "topic_mismatch":
                 _tm_pre = len(results)
-                _cur_sid = getattr(self, "session_id", None)
+                _cur_sid = getattr(self, "_turn_active_sid", None) \
+                    or getattr(self, "session_id", None) or session_id
                 results = [r for r in results
                            if not _cross_session_confirmed_fold(r, _cur_sid)]
                 _tm_folded = _tm_pre - len(results)
@@ -4354,10 +4367,24 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             # the confirmed-global leg; this only surfaces it ahead of newer /
             # less-confirmed rows. pin=None (not chosen / no stamp) -> stable
             # order (== clean_start). Search face is untouched either way.
-            if _bb_choice == "bring_back" and len(results) > 1 \
+            # owner 2026-11-08: the reorder also fires under the no-choice
+            # 'fresh' DEFAULT when a pin was explicitly recorded for this
+            # session (bring_back + pin_session_id / session_id_override) —
+            # an explicit named pin carries FULL authority and must surface
+            # its target session's confirmed rows even though the bare
+            # default would otherwise fold the auto face to empty.
+            _pin_active = _bb_choice in ("bring_back", "fresh") \
+                and self._get_bringback_pin_sid(
+                    getattr(self, "_turn_active_sid", None)
+                    or getattr(self, "session_id", None)
+                    or session_id) is not None
+            if (_bb_choice == "bring_back" or _pin_active) \
+                    and len(results) > 1 \
                     and not self._is_subagent_session():
                 _pin_sid = self._resolve_bringback_session_id(
-                    getattr(self, "session_id", None))
+                    getattr(self, "_turn_active_sid", None)
+                    or getattr(self, "session_id", None)
+                    or session_id)
                 if _pin_sid is not None:
                     results = sorted(
                         results,
@@ -12034,9 +12061,13 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             pending = self._get_pending_user_pin(sid)
             if pending:
                 pin_requested = pending
-        pin_stored = None
-        if choice == "bring_back" and pin_requested:
-            pin_stored = pin_requested
+        # owner 2026-11-08: a named pin (bring_back + pin_session_id) carries
+        # FULL authority and is honored regardless of the choice value — the
+        # pin target's confirmed rows will reorder to the TOP of the auto
+        # face (the bring_back reorder leg, now also fired under the no-choice
+        # 'fresh' default when a pin was recorded). A bare 'fresh' with no pin
+        # still folds the auto face to empty (no new behavior).
+        pin_stored = pin_requested if choice == "bring_back" else None
         self._set_bringback_choice(sid, choice, pin_session_id=pin_stored)
         # Mark the footer one-shot gate so it does not re-ask this session.
         self._mark_bringback_footer_asked(sid)
@@ -15242,20 +15273,20 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
             return False
 
     def _get_bringback_choice(self, session_id: Optional[str]) -> str:
-        """P4 read: default 'clean_start' (== V2 two-leg behavior) when the file
-        is absent/unreadable, the session is unresolvable, or the file carries
-        an unrecognized value — fail-soft toward the default, never a crash,
-        never 'fresh' (a missing choice must not silently empty the auto face).
-        P1-2 (owner 2026-10-14): the 4-value enum adds 'topic_mismatch'
-        (fold cross-session confirmed rows; global skeleton + current-session
-        rows kept — 裁决 2 = A). Unrecognized values still degrade to the
-        'clean_start' default (零回归)."""
+        """P4 read: default 'fresh' (owner 2026-11-08: cross-session 串入根治)
+        when the file is absent/unreadable, the session is unresolvable, or the
+        file carries an unrecognized value — a NEW session auto-injects only
+        its OWN rows until the user explicitly records a choice (bring_back /
+        clean_start / topic_mismatch) or says 带回. Unrecognized values still
+        degrade to 'fresh' (fail-soft; never 'clean_start' — that was the
+        default that leaked the 313-row cross-session confirmed pool into
+        every new session after the 2026-11-04 manual-trigger rewrite)."""
         p = self._bringback_choice_path(session_id or "")
         if p is None:
-            return "clean_start"
+            return "fresh"
         try:
             if not p.exists():
-                return "clean_start"
+                return "fresh"
             data = json.loads(p.read_text(encoding="utf-8"))
             choice = data.get("choice")
             if choice in ("bring_back", "clean_start", "fresh",
@@ -15263,10 +15294,10 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                 return choice
             # Back-compat: pre-3-value files stored boolean bring_back.
             if isinstance(data.get("bring_back"), bool):
-                return "bring_back" if data["bring_back"] else "clean_start"
-            return "clean_start"
+                return "bring_back" if data["bring_back"] else "fresh"
+            return "fresh"
         except Exception:
-            return "clean_start"
+            return "fresh"
 
     def _has_bringback_choice(self, session_id: str) -> bool:
         """P4: True when ANY choice was recorded for this session (the choice

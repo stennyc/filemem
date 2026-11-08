@@ -155,7 +155,9 @@ def test_cross_profile_rows_absent_from_auto_retrieve():
     auto_ids = {r.get("id") for r in p.search_memories(
         "sharedword", limit=8, min_score=0.0, profile_scope="default")}
     assert "row_default" in auto_ids, f"same-profile row must be present, got {auto_ids}"
-    assert "row_neutral" in auto_ids, f"neutral row must be present, got {auto_ids}"
+    # owner 2026-11-08: neutral rows are CUT from the auto face under a
+    # known session profile (cross-session / cross-profile leak vector).
+    assert "row_neutral" not in auto_ids, f"neutral row must be CUT from auto face, got {auto_ids}"
     assert "row_cron4d" not in auto_ids, f"cross-profile row must be cut, got {auto_ids}"
 
     explicit_ids = {r.get("id") for r in p.search_memories(
@@ -166,10 +168,13 @@ def test_cross_profile_rows_absent_from_auto_retrieve():
 
 # ── ② Neutral unstamped rows are kept by the auto face ─────────────────────
 
-def test_neutral_rows_included_in_auto_retrieve():
-    """A legacy row with NO source_profile key and one with an empty-string
-    value are both NEUTRAL and survive the auto face's isolation, alongside
-    the same-profile row."""
+def test_neutral_rows_folded_out_of_auto_retrieve():
+    """owner 2026-11-08 (cross-profile 串入收紧): a legacy row with NO
+    source_profile key and one with an empty-string value are both NEUTRAL
+    and are now CUT from the auto face under a KNOWN session profile
+    (previously kept — the neutral leg leaked cross-session rows into
+    every other profile). They still survive the EXPLICIT search face
+    (全新 ≠ 失联: the row stays retrievable via filemem_search)."""
     tmp = Path(tempfile.mkdtemp())
     p = _make_provider(tmp, source_profile="default")
     _seed(tmp, [
@@ -179,9 +184,14 @@ def test_neutral_rows_included_in_auto_retrieve():
     ])
     ids = {r.get("id") for r in p.search_memories(
         "sharedword", limit=8, min_score=0.0, profile_scope="default")}
-    assert "row_legacy_no_key" in ids, f"no-key legacy row must be neutral, got {ids}"
-    assert "row_empty_sp" in ids, f"empty-string source_profile = neutral, got {ids}"
+    assert "row_legacy_no_key" not in ids, f"neutral row must be CUT from auto face, got {ids}"
+    assert "row_empty_sp" not in ids, f"empty-string source_profile = neutral, must be CUT, got {ids}"
     assert "row_same" in ids, f"same-profile row must be present, got {ids}"
+    # 全新 ≠ 失联: the neutral rows are still retrievable on the EXPLICIT face.
+    explicit_ids = {r.get("id") for r in p.search_memories(
+        "sharedword", limit=8, min_score=0.0, profile_scope=None)}
+    assert "row_legacy_no_key" in explicit_ids, f"neutral rows survive explicit search, got {explicit_ids}"
+    assert "row_empty_sp" in explicit_ids, f"neutral rows survive explicit search, got {explicit_ids}"
 
 
 def test_cross_profile_rows_visible_in_explicit_search():
@@ -220,6 +230,7 @@ def test_auto_recall_max_caps_results():
     # Isolate the cap logic: stub the read face to return the 6, enable cap=3.
     p._decay["search"]["auto_recall_max"] = 3
     p.search_memories = lambda *a, **k: list(full)
+    p._set_bringback_choice("s-p02-test", "clean_start")
     ctx = p.prefetch("deploynote", session_id="s-cap", confidence=0.5)
     assert p._last_recall.count == 3, \
         f"auto_recall_max=3 should inject 3 rows, got {p._last_recall.count}"
@@ -239,6 +250,7 @@ def test_auto_recall_max_zero_disables_cap():
 
     p._decay["search"]["auto_recall_max"] = 0
     p.search_memories = lambda *a, **k: list(full)
+    p._set_bringback_choice("s-p02-test", "clean_start")
     ctx = p.prefetch("caprow", session_id="s-cap0", confidence=0.5)
     assert p._last_recall.count == 4, \
         f"auto_recall_max=0 should disable the cap, got {p._last_recall.count}"
@@ -368,11 +380,12 @@ def test_row_source_profile_reads_both_locations():
 
 
 def test_auto_recall_eligible_predicate():
-    """session None -> all eligible (fail-open); row None -> neutral eligible;
-    equal -> eligible; cross -> cut."""
+    """session None -> all eligible (fail-open); row None (neutral) -> cut
+    under a known session profile (owner 2026-11-08); equal -> eligible;
+    cross -> cut."""
     assert _auto_recall_eligible(None, None) is True
     assert _auto_recall_eligible("a", None) is True
-    assert _auto_recall_eligible(None, "a") is True
+    assert _auto_recall_eligible(None, "a") is False   # neutral cut under known profile
     assert _auto_recall_eligible("a", "a") is True
     assert _auto_recall_eligible("b", "a") is False
 
@@ -404,6 +417,7 @@ def test_prefetch_passes_profile_scope_to_search():
 
     # The auto face actually cut the cross row from the injected content:
     p2 = _make_provider(tmp, source_profile="default")
+    p2._set_bringback_choice("s-p02-test", "clean_start")
     ctx = p2.prefetch("wired", session_id="s-int2", confidence=0.5)
     assert "wired self profile deploy note" in ctx, \
         f"same-profile row must inject on the auto face, got {ctx!r}"

@@ -268,6 +268,7 @@ def test_prefetch_episodic_current_session_row_kept(tmp_path):
     # A DIFFERENT session's episodic row (not confirmed) — CUT.
     _write_episodic(tmp_path, "other session episodic note", sid="OTHER", sp="default")
 
+    p._set_bringback_choice(sid, "clean_start")
     ctx = p.prefetch("deploy rule note", session_id=sid, confidence=0.5)
     assert "confirmed deploy rule" in ctx, \
         "confirmed memories row must survive the auto face"

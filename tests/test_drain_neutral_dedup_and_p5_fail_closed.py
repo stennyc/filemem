@@ -112,7 +112,7 @@ def _make_provider(tmp: pathlib.Path, store: pathlib.Path, home: pathlib.Path,
     p._turn_active_sid = session_id
     p._drain_seen = {}
     p._drain_memories_dir_fn = lambda: home / "memories"
-    p._drain_host_store_fn = None          # D7 bare-write path
+    p._drain_host_store_fn = lambda: None  # D7 bare-write (zero live-store coupling)
     return p
 
 

@@ -177,6 +177,7 @@ def test_a_explicit_supersede_folds_old_row_out_of_auto_face(tmp_path):
     # "candidate", not yet confirmed) is folded out of the auto face just like
     # the superseded old row. After the EP-2 confirm chain flips it to
     # confirmed=True, the new row enters the auto face.
+    p._set_bringback_choice("s-regress", "clean_start")
     ctx = p.prefetch(DOCKER_QUERY, session_id="s-regress", confidence=0.5)
     assert DOCKER_OLD not in ctx, \
         f"superseded old row must be folded out of the auto face, got: {ctx!r}"

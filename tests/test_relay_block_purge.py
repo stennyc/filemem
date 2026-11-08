@@ -207,6 +207,7 @@ def test_confirmed_poison_row_folded_out_of_prefetch(tmp_path):
                       confirmed=True)
     _write_memory_row(p, RELAY_BLOCK, sp="coder", confirmed=True,
                       failure_type="tool_error")
+    p._set_bringback_choice("s_relay", "clean_start")
     ctx = p.prefetch("deploy rule", session_id="s_relay", confidence=0.5)
     assert "clean confirmed deploy rule" in ctx, \
         "a legitimate confirmed row must survive the auto face"

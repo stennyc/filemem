@@ -42,10 +42,14 @@ QUERY_TOK = "zephyr"
 
 FACTORIES = {
     # gate rule 2: explicit low stamp -> drop by default
+    # owner 2026-11-08: source_profile="test" must match the provider's
+    # source_profile so the row passes the profile isolation gate and
+    # actually reaches the injection-gate loop these tests exercise.
     "low": lambda rid: {
         "id": rid, "type": "fact", "content": f"{QUERY_TOK} note low {rid}",
         "level": "L0",
-        "metadata": {"origin": {"kind": "tool", "trust": "low"}, "confirmed": True},
+        "metadata": {"source_profile": "test",
+                     "origin": {"kind": "tool", "trust": "low"}, "confirmed": True},
         "created_at": "2026-09-01T00:00:00", "updated_at": "2026-09-01T00:00:00",
         "occurred_at": None, "source": "auto", "reference_count": 0,
         "salience": 0.5, "last_referenced": "", "ttl_days": None,
@@ -54,7 +58,8 @@ FACTORIES = {
     "medium": lambda rid: {
         "id": rid, "type": "fact", "content": f"{QUERY_TOK} note medium {rid}",
         "level": "L0",
-        "metadata": {"origin": {"kind": "user", "trust": "medium"}, "confirmed": True},
+        "metadata": {"source_profile": "test",
+                     "origin": {"kind": "user", "trust": "medium"}, "confirmed": True},
         "created_at": "2026-09-01T00:00:00", "updated_at": "2026-09-01T00:00:00",
         "occurred_at": None, "source": "auto", "reference_count": 0,
         "salience": 0.5, "last_referenced": "", "ttl_days": None,
@@ -62,7 +67,8 @@ FACTORIES = {
     "high": lambda rid: {
         "id": rid, "type": "fact", "content": f"{QUERY_TOK} note high {rid}",
         "level": "L0",
-        "metadata": {"origin": {"kind": "user", "trust": "high"}, "confirmed": True},
+        "metadata": {"source_profile": "test",
+                     "origin": {"kind": "user", "trust": "high"}, "confirmed": True},
         "created_at": "2026-09-01T00:00:00", "updated_at": "2026-09-01T00:00:00",
         "occurred_at": None, "source": "auto", "reference_count": 0,
         "salience": 0.5, "last_referenced": "", "ttl_days": None,
@@ -72,7 +78,8 @@ FACTORIES = {
         "id": rid, "type": "fact",
         "content": f"{QUERY_TOK} note: YOU MUST do exactly this {rid}",
         "level": "L0",
-        "metadata": {"origin": {"kind": "user", "trust": "medium"}, "confirmed": True},
+        "metadata": {"source_profile": "test",
+                     "origin": {"kind": "user", "trust": "medium"}, "confirmed": True},
         "created_at": "2026-09-01T00:00:00", "updated_at": "2026-09-01T00:00:00",
         "occurred_at": None, "source": "auto", "reference_count": 0,
         "salience": 0.5, "last_referenced": "", "ttl_days": None,
@@ -127,8 +134,18 @@ def _rows_by_kind(*specs: str) -> list:
 
 
 def _prefetch(p, rows: list, *, session_id: str = "s1") -> str:
-    """Stub the read surface so synthetic rows hit the REAL gate loop."""
+    """Stub the read surface so synthetic rows hit the REAL gate loop.
+
+    owner 2026-11-08: these tests exercise the gate loop itself (drop/keep
+    decisions, audit rows) — they are NOT about the no-choice default, which
+    is now 'fresh' (empty auto face). The provider shell has no session_id
+    initialized (session_id=None), so _get_bringback_choice resolves to the
+    default 'fresh' and folds the whole auto face before the gate loop
+    runs. Sync self.session_id = session_id so the choice file written by
+    _set_bringback_choice(session_id, ...) is read back correctly."""
     p.search_memories = lambda *a, **k: rows  # type: ignore[method-override]
+    p._set_bringback_choice(session_id, "clean_start")
+    p.session_id = session_id
     return p.prefetch(QUERY, session_id=session_id, confidence=0.8)
 
 
@@ -379,7 +396,15 @@ p.episodic_dir = store / "episodic"
 p.knowledge_dir = store / "knowledge"
 p.knowledge_entries_path = p.knowledge_dir / "entries.json"
 p.knowledge_raw_pending_path = p.knowledge_dir / "raw_pending.json"
-p.source_profile = "conc"
+# P4 (owner 2026-11-08): the seeded concurrent-store rows carry
+# source_profile="test" (the seeder's provider identity); the profile
+# isolation gate cuts cross-stamp rows, so this driver must resolve to
+# the SAME stamp or every row is folded out of the auto face before
+# the injection-gate loop runs. HERMES_PROFILE is not set in the
+# subprocess, so _resolve_session_profile falls back to source_profile
+# -> set it to "test" to match the rows; the P3 snapshot path still
+# keys on session_id "conc" (profile-neutral, zero collision).
+p.source_profile = "test"
 p._decay = dict(DECAY_DEFAULTS)
 p._llm_ctx = None
 p._last_recall = None
@@ -398,6 +423,10 @@ p.search_memories = lambda *a, **k: rows
 # intentionally exercised by its OWN tests, not by the no-tear 2-proc
 # fixture.
 p._p3_replay_armed = True
+# P4 (owner 2026-11-08): no recorded bringback choice now defaults to 'fresh'
+# (the auto face folds to empty). This fixture exercises the injection-gate
+# loop, so record an explicit clean_start choice first.
+p._set_bringback_choice("conc", "clean_start")
 ctx = p.prefetch("zephyr", session_id="conc", confidence=0.8)
 assert "note medium" in ctx and "note low" not in ctx
 print("OK")

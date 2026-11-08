@@ -25,7 +25,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from __init__ import FileMemProvider, MEMORY_TYPES  # noqa: E402
@@ -58,11 +58,19 @@ def _make_provider(tmp: Path) -> FileMemProvider:
 
 
 def _item(iid: str, content: str, created_at: str = "2026-09-10T00:00:00",
-          mtype: str = "fact", level: str = "L2") -> Dict[str, Any]:
-    """L2 = no TTL (never expires), so old fixtures stay in the pool."""
+          mtype: str = "fact", level: str = "L2",
+          source_profile: Optional[str] = None) -> Dict[str, Any]:
+    """L2 = no TTL (never expires), so old fixtures stay in the pool.
+    P4 (owner 2026-11-08): source_profile stamp — P4's tightened
+    _auto_recall_eligible cuts neutral (no-stamp) rows out of a KNOWN
+    session's pool; scoped-pool tests must stamp rows with their
+    provider's source_profile to stay in-pool."""
+    meta: Dict[str, Any] = {}
+    if source_profile is not None:
+        meta["source_profile"] = source_profile
     return {
         "id": iid, "type": mtype, "content": content,
-        "level": level, "metadata": {},
+        "level": level, "metadata": meta,
         "created_at": created_at, "updated_at": created_at,
         "occurred_at": None, "source": "test",
         "reference_count": 0, "salience": 0.5,
@@ -208,7 +216,8 @@ def test_invalid_type_raises_value_error():
 def test_invalid_type_lands_as_error_json_not_500():
     tmp = Path(tempfile.mkdtemp())
     p = _make_provider(tmp)
-    _seed_by_type(tmp, [_item("a", "flock alpha", mtype="fact")])
+    _seed_by_type(tmp, [_item("a", "flock alpha", mtype="fact",
+                               source_profile="type-filter-test")])
     out = p.handle_tool_call(
         "filemem_search", {"query": "flock", "type": "bogus"})
     parsed = json.loads(out)

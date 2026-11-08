@@ -635,8 +635,9 @@ def test_reg_prefetch_reinforce_regression(tmp_path):
     # current-session episodic row), so the stubbed hit row carries confirmed.
     row = {"id": "f9", "type": "fact",
            "content": "the api base url is https://api.internal",
-           "metadata": {"confirmed": True}}
+           "metadata": {"source_profile": "s1b-test", "confirmed": True}}
     p.search_memories = lambda *a, **kw: [row]
+    p._set_bringback_choice("s-test", "clean_start")
     ctx = p.prefetch("api base url internal", session_id="s-test")
     assert "the api base url is https://api.internal" in ctx, ctx
     with open(store / "memories" / "fact.json", encoding="utf-8") as f:

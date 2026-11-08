@@ -30,6 +30,11 @@ import pathlib
 import sys
 import threading
 from typing import Optional
+from datetime import datetime, timezone, timedelta
+
+
+def _ts(days_ago=1):
+    return (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%S")
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -106,10 +111,10 @@ def _row(content: str, *, sp=None, confirmed: bool = False,
         "content": content,
         "level": "L0",
         "metadata": meta,
-        "created_at": "2026-10-01T00:00:00",
-        "updated_at": "2026-10-01T00:00:00",
+        "created_at": _ts(1),
+        "updated_at": _ts(1),
         "salience": 0.9,
-        "last_referenced": "2026-10-01T00:00:00",
+        "last_referenced": _ts(1),
     }
     if session_id is not None:
         row["session_id"] = session_id
@@ -262,10 +267,11 @@ def test_t5_topic_mismatch_folds_cross_session_confirmed_only(tmp_path):
 
 
 def test_t6_topic_mismatch_not_chosen_is_zero_regression(tmp_path):
-    """T6: default / any of the other three choices -> the predicate is
-    always False: every confirmed row (incl. cross-session stamped) stays.
-    This test PASSES on the RED (pre-fix) tree: no 4th option existed, and
-    the default behavior already keeps all rows."""
+    """T6: explicit clean_start -> every confirmed row (incl. cross-session
+    stamped) stays (the topic-mismatch fold only fires under that specific
+    choice). owner 2026-11-08: the DEFAULT (no choice recorded) is now
+    'fresh' — a new session auto-injects ONLY its own rows until an explicit
+    choice is recorded; the default is no longer the V2 two-leg behavior."""
     cross, skeleton, cur = _t5_pool(tmp_path)
     p = _make_provider(tmp_path)
     _choice_set(p, CUR_SID, "clean_start")
@@ -273,15 +279,16 @@ def test_t6_topic_mismatch_not_chosen_is_zero_regression(tmp_path):
     for r in (cross, skeleton, cur):
         assert r["content"] in ctx, (
             f"clean_start must keep ALL confirmed rows: {r['content']!r}")
-    # default (no choice file at all)
+    # default (no choice file at all) -> now 'fresh': cross-session confirmed
+    # rows must NOT auto-inject
     p2 = _make_provider(tmp_path, sid="s_def")
     _write_pool_rows(tmp_path, [
         _row("other project confirmed fact", sp="coder", confirmed=True,
              session_id=OTHER_SID),
     ])
     ctx2 = p2.prefetch("confirmed fact", session_id="s_def")
-    assert "other project confirmed fact" in ctx2, \
-        "no recorded choice -> V2 default keeps cross-session confirmed"
+    assert "other project confirmed fact" not in ctx2, \
+        "owner 2026-11-08: no recorded choice -> default 'fresh' -> cross-session confirmed rows NOT auto-injected"
 
 
 # ── T7-T8: topic overlap auto-gate (修复 3, 默认关) ────────────────────
@@ -316,14 +323,15 @@ def _gate_t8_setup(tmp: pathlib.Path):
 
 def test_t7_topic_gate_default_off_changes_nothing(tmp_path):
     """T7: _TOPIC_OVERLAP_GATE_ENABLED=False (shipped default) -> NO cross-
-    session confirmed row is folded by the gate (behavior == 现状). This
-    test PASSES on the RED tree: the gate constant does not exist yet, so
-    nothing is gated."""
+    session confirmed row is folded by the gate (behavior == 现状).
+    owner 2026-11-08: an explicit clean_start choice is required for rows to
+    auto-inject; without a choice the default is 'fresh' (empty auto face)."""
     cross_row, same_row = _gate_t8_setup(tmp_path)
     p = _make_provider(tmp_path)
+    _choice_set(p, CUR_SID, "clean_start")
     ctx = p.prefetch("filemem confirmed 骨架 fact", session_id=CUR_SID)
     assert cross_row["content"] in ctx, \
-        "gate off: cross-class row must stay (现状不变)"
+        "gate off + clean_start: cross-class row must stay (现状不变)"
     assert same_row["content"] in ctx
     # explicit RED/GREEN switch: the constant must exist and be False now.
     assert hasattr(_fm_pkg, "_TOPIC_OVERLAP_GATE_ENABLED"), \
@@ -336,10 +344,13 @@ def test_t8_topic_gate_on_filters_cross_class_row(tmp_path, monkeypatch):
     is folded out of the LIVE auto face, the same-class one stays (BM25
     score filter). The P3 replay round-trip keeps the POST-gate snapshot
     (a cold-start replay cannot resurrect the folded row — proven by the
-    frozen-snapshot bytes carrying no cross-class line)."""
+    frozen-snapshot bytes carrying no cross-class line).
+    owner 2026-11-08: explicit clean_start choice required (default is now
+    'fresh' — empty auto face without an explicit choice)."""
     cross_row, same_row = _gate_t8_setup(tmp_path)
     monkeypatch.setattr(_fm_pkg, "_TOPIC_OVERLAP_GATE_ENABLED", True)
     p = _make_provider(tmp_path)
+    _choice_set(p, CUR_SID, "clean_start")
     ctx = p.prefetch("filemem confirmed 骨架 fact", session_id=CUR_SID)
     # LIVE auto face: cross-class row folded by the BM25 gate, same-class kept.
     assert cross_row["content"] not in ctx, (

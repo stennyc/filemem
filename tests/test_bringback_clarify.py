@@ -56,7 +56,12 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+def _ts(days_ago=1):
+    """Dynamic 'recent enough' ISO timestamp (L0 TTL=30d safe, never expires on any run date)."""
+    return (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%S")
+
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -93,10 +98,10 @@ def _row(content: str, *, sp: Optional[str] = None,
         "content": content,
         "level": "L0",
         "metadata": meta,
-        "created_at": "2026-10-01T00:00:00",
-        "updated_at": "2026-10-01T00:00:00",
+        "created_at": _ts(1),
+        "updated_at": _ts(1),
         "salience": 0.5,
-        "last_referenced": "2026-10-01T00:00:00",
+        "last_referenced": _ts(1),
     }
     if session_id is not None:
         # episodic rows carry session_id at TOP LEVEL (V2 C-b invariant)
@@ -547,8 +552,14 @@ def test_p4_tool_no_target_reports_none(tmp_path):
 
 
 def test_sentinel_v2_two_leg_unchanged_with_no_choice(tmp_path):
-    """With no bring-back choice recorded, the predicate is byte-equivalent to
-    the V2 two-leg form — pin the exact V2 outcomes (regression guard)."""
+    """With no bring-back choice recorded, the DEFAULT is now 'fresh'
+    (owner 2026-11-08): cross-session confirmed rows are NOT auto-injected.
+    The PREDICATE itself is unchanged — the confirmed leg still recognizes a
+    cross-session confirmed row as eligible; the fold happens upstream in
+    prefetch's fresh gate (results = []), not in _auto_inject_eligible.
+    Pin the predicate outcomes that the fresh gate preserves: a neutral row
+    (no confirmed flag) stays cut; the current session's own episodic row
+    stays in (via the confirmed-global leg under an explicit clean_start)."""
     old_row = _row("old mem", sp="default", confirmed=None)
     assert _auto_inject_eligible(old_row, "default", "s_cur") is False
     conf_global = _row("global fact", sp="default", confirmed=True)
@@ -617,10 +628,10 @@ def _write_real_pool_row(tmp: Path, mem_type: str, row_id: str, content: str,
         "content": content,
         "level": "L0",
         "source": "manual",
-        "created_at": "2026-10-01T00:00:00",
-        "updated_at": "2026-10-01T00:00:00",
+        "created_at": _ts(1),
+        "updated_at": _ts(1),
         "salience": 0.9,
-        "last_referenced": "2026-10-01T00:00:00",
+        "last_referenced": _ts(1),
         "metadata": meta,
     }
     if session_id is not None:
@@ -642,17 +653,29 @@ def test_fresh_end_to_end_prefetch_empties_auto_face_keeps_search(tmp_path):
     to EMPTY (the confirmed skeleton is folded out — auto face has nothing),
     YET the same row is still retrievable on the SEARCH face (filemem_search
     / search_memories over the raw pool, which the choice never touches).
-    'fresh' = empty auto-inject, never unretrievable (全新 ≠ 失联)."""
+    'fresh' = empty auto-inject, never unretrievable (全新 ≠ 失联).
+
+    owner 2026-11-08: the DEFAULT (no recorded choice) is now ALSO 'fresh' —
+    a new session auto-injects only its own rows until the user explicitly
+    records clean_start / bring_back / topic_mismatch."""
     _write_real_pool_row(tmp_path, "fact", "f_conf", "confirmed core fact",
                           sp="default", confirmed=True)
 
-    # ── B: no fresh choice (control) -> the confirmed row IS auto-injected ──
+    # ── C: no recorded choice (control) -> DEFAULT 'fresh': auto face empty ──
     p_ctl = _make_provider_with_pool(tmp_path, sid="s_ctl", profile="default")
     p_ctl.session_id = "s_ctl"
     ctx_ctl = p_ctl.prefetch("confirmed core fact", session_id="s_ctl")
-    assert "confirmed core fact" in ctx_ctl, (
-        f"control: confirmed row must auto-inject without a fresh choice; got: "
-        f"{ctx_ctl!r}")
+    assert "confirmed core fact" not in ctx_ctl, (
+        f"control (no choice file): default is now 'fresh' — the confirmed "
+        f"cross-session row must NOT auto-inject; got: {ctx_ctl!r}")
+
+    # ── B: explicit clean_start -> the confirmed row IS auto-injected ──────
+    p_clean = _make_provider_with_pool(tmp_path, sid="s_clean", profile="default")
+    p_clean.session_id = "s_clean"
+    p_clean._set_bringback_choice("s_clean", "clean_start")
+    ctx_clean = p_clean.prefetch("confirmed core fact", session_id="s_clean")
+    assert "confirmed core fact" in ctx_clean, (
+        f"clean_start: confirmed row must auto-inject; got: {ctx_clean!r}")
 
     # ── A: 'fresh' chosen this session -> auto face is EMPTY ───────────────
     p_fresh = _make_provider_with_pool(tmp_path, sid="s_fresh", profile="default")

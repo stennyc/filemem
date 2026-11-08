@@ -129,10 +129,13 @@ def test_p3_replay_strips_cross_profile_and_superseded_rows(tmp_path):
     assert "superseded coder fact" not in replayed # superseded -> cut
 
 
-def test_p3_replay_keeps_neutral_rows(tmp_path):
-    """Neutral (unstamped) confirmed rows survive replay on every profile.
-    An unconfirmed neutral row is cut by the V2 confirmed gate even though
-    the profile leg is fail-open."""
+def test_p3_replay_folds_out_neutral_rows(tmp_path):
+    """owner 2026-11-08 (cross-profile 串入收紧): a neutral (unstamped)
+    confirmed row is now CUT from the P3 replay snapshot under a known
+    session profile — the neutral leg leaked cross-session / cross-profile
+    rows into every other profile's auto face. An unconfirmed neutral row
+    is cut by the V2 confirmed gate as before. The rows remain on the
+    EXPLICIT search face (全新 ≠ 失联)."""
     p = _make_provider(tmp_path, profile="coder")
     _write_row(tmp_path, "fact", "f_neu", "shared neutral fact", confirmed=True)
     _write_row(tmp_path, "fact", "f_neu_unconf", "unconfirmed neutral fact")
@@ -143,7 +146,10 @@ def test_p3_replay_keeps_neutral_rows(tmp_path):
     p._last_recall_query = "facts"
     p._save_injected_snapshot("s_iso", block)
     replayed = p._filter_replayed_snapshot(p._load_injected_snapshot("s_iso", "facts"))
-    assert "shared neutral fact" in replayed
+    # owner 2026-11-08: both neutral rows are CUT from the replay snapshot
+    # (the neutral leg is no longer fail-open under a known session profile):
+    assert "shared neutral fact" not in replayed, \
+        "neutral confirmed row must be CUT from the P3 replay under a known profile"
     assert "unconfirmed neutral fact" not in replayed  # V2 confirmed gate
 
 
@@ -256,16 +262,19 @@ def test_resolve_profile_name_no_profiles_segment_is_neutral():
         Path.home() / ".hermes") is None
 
 
-def test_row_neutral_visible_across_profiles():
-    """A neutral row (no source_profile key) is auto-recall-eligible under
-    ANY session profile — the whole point of Fix 2."""
+def test_row_neutral_now_cut_from_auto_recall():
+    """owner 2026-11-08 (cross-profile 串入收紧): a neutral row (no
+    source_profile key) is NOT auto-recall-eligible under any KNOWN session
+    profile — the neutral leg previously leaked cross-session / cross-profile
+    rows into every other profile. Neutral rows are still fully visible on
+    the EXPLICIT search face (profile_scope=None)."""
     row = {"id": "f1", "type": "fact", "content": "x", "metadata": {}}
     assert _row_source_profile(row) is None
     assert _row_source_profile(row) is None  # neutral
-    # The P0-2 predicate keeps neutral rows for every session profile:
+    # owner 2026-11-08: neutral rows are CUT under a known session profile:
     from __init__ import _auto_recall_eligible
-    assert _auto_recall_eligible(None, "coder")
-    assert _auto_recall_eligible(None, "orchestrator")
+    assert _auto_recall_eligible(None, "coder") is False
+    assert _auto_recall_eligible(None, "orchestrator") is False
 
 
 # ── Fix 4: settled/superseded draft rows leave the pending-draft notice ─────

@@ -139,10 +139,11 @@ def test_prefetch_annotations_cross_session_memories_row():
         "id": "fact_1_1790000000", "type": "fact",
         "content": "filemem 跨 session 待办话术",
         "level": "L1",
-        "metadata": {"confirmed": True, "origin_session": "s_other_77"},
+        "metadata": {"source_profile": "test", "confirmed": True, "origin_session": "s_other_77"},
         "created_at": "2026-10-01T00:00:00",
         "updated_at": "2026-10-01T00:00:00",
     }])
+    p._set_bringback_choice("s_cur", "clean_start")
     ctx = p.prefetch("filemem 待办", session_id="s_cur")
     assert "（来自 session s_other_77）" in ctx, ctx
 
@@ -158,7 +159,7 @@ def test_prefetch_same_session_row_not_annotated():
         "id": "fact_1_1790000000", "type": "fact",
         "content": "本 session 内的新事实",
         "level": "L0",
-        "metadata": {"confirmed": True, "origin_session": "s_cur"},
+        "metadata": {"source_profile": "test", "confirmed": True, "origin_session": "s_cur"},
         "created_at": "2026-10-01T00:00:00",
         "updated_at": "2026-10-01T00:00:00",
     }])
@@ -179,10 +180,11 @@ def test_prefetch_episodic_row_uses_top_level_session_id():
         "content": "旧 session 的 episodic 快照",
         "level": "L2",
         "session_id": "s_hist_11",
-        "metadata": {"confirmed": True},
+        "metadata": {"source_profile": "test", "confirmed": True},
         "created_at": "2026-09-15T00:00:00",
         "updated_at": "2026-09-15T00:00:00",
     }])
+    p._set_bringback_choice("s_cur", "clean_start")
     ctx = p.prefetch("episodic 快照", session_id="s_cur")
     assert "（来自 session s_hist_11）" in ctx, ctx
 
@@ -237,11 +239,12 @@ def test_prefetch_stale_row_gets_lifecycle_hint():
         "id": "task_3_1790000000", "type": "task",
         "content": "一个已确认但可能过时的 task",
         "level": "L1",
-        "metadata": {"confirmed": True, "stale": True,
+        "metadata": {"source_profile": "test", "confirmed": True, "stale": True,
                      "stale_reason": "该 task 已完成，被更新行替代"},
         "created_at": "2026-09-01T00:00:00",
         "updated_at": "2026-09-01T00:00:00",
     }])
+    p._set_bringback_choice("s_cur", "clean_start")
     ctx = p.prefetch("过时 task", session_id="s_cur")
     assert "生命周期提示" in ctx, ctx
     assert "stale" in ctx

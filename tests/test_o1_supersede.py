@@ -373,6 +373,7 @@ def test_prefetch_fold_superseded_row(tmp_path=None):
     # The candidate new row is NOT yet confirmed (supersede_state=candidate,
     # metadata.confirmed absent) -> the V2 confirmed gate folds it out of the
     # auto face along with the superseded old row.
+    p._set_bringback_choice("s-o1", "clean_start")
     ctx = p.prefetch(query, session_id="s-o1", confidence=0.5)
     assert old_content not in ctx, \
         f"superseded old row must be folded out of the auto face, got: {ctx!r}"
@@ -411,6 +412,7 @@ def test_prefetch_fold_lapsed_row(tmp_path=None):
              extra_meta={"validity_scope": "day", "valid_until": lapsed}),
         _row("fact_legacy", "legacy deploy note sharedtoken"),  # no validity keys
     ])
+    p._set_bringback_choice("s-o1", "clean_start")
     ctx = p.prefetch("sharedtoken deploy note", session_id="s-o1", confidence=0.5)
     assert "persistent deploy note sharedtoken" in ctx   # permanent stays
     assert "day-scope deploy note sharedtoken" in ctx     # future valid_until stays

@@ -75,7 +75,7 @@ def _row(rid, content, mem_type="fact", **extra):
     # V2 confirmed gate: auto-face fixtures carry confirmed=True so pre-V2
     # egress/isolation tests keep their rows on the auto face. Pass
     # confirmed=False in extra to test the fold-out path.
-    meta = {"confirmed": True}
+    meta = {"source_profile": "s2-test", "confirmed": True}
     d.update(extra)
     if "metadata" not in d:
         d["metadata"] = meta
@@ -100,12 +100,23 @@ def _make_provider(tmp: pathlib.Path, decay: dict) -> FileMemProvider:
     p = FileMemProvider.__new__(FileMemProvider)
     import threading
     p._lock = threading.Lock()
+    p.storage_dir = tmp   # _set_bringback_choice / audit paths need this
     p.memories_dir = tmp / "memories"
     p.memories_dir.mkdir(parents=True, exist_ok=True)
+    p.sessions_dir = tmp / "sessions"
+    p.sessions_dir.mkdir(parents=True, exist_ok=True)
     p.pending_queue_path = tmp / "consolidated" / "pending_upgrades.jsonl"
     p.pending_queue_path.parent.mkdir(parents=True, exist_ok=True)
     p.source_profile = "s2-test"
+    p.session_id = "s2"   # owner 2026-11-08: no-choice default is now 'fresh'
     p._session_drafts = {}
+    p._pending_confirm = {}
+    p._pending_memories = []
+    p._pending_failure_meta = {}
+    p._session_save_count = 0
+    p._session_save_count_max = 5
+    p._main_runtime = None
+    p._llm_ctx = None
     p._last_recall = None
     p._pending_drafts_notified = {"s2": True}
     p.min_search_score = 0.3
@@ -199,6 +210,7 @@ def test_prefetch_egress_rejects_task1_dump_row_fixture(tmp_path):
     # replaces search_memories, so it absorbs the P0-2 kwarg (any kwargs) and
     # ignores it — the test is about egress, not isolation.
     p.search_memories = lambda *a, **k: results
+    p._set_bringback_choice("s2", "clean_start")
     ctx = p.prefetch("nginx", session_id="s2")
     assert "Fetch finished" not in ctx
     assert clean in ctx, ctx
@@ -216,6 +228,7 @@ def test_prefetch_egress_rejects_echo_rows(tmp_path):
         _row("fact_echo_synth", echo),
         _row("fact_keep", "redis 密码存放在 vault 的 kv0 路径"),
     ]
+    p._set_bringback_choice("s2", "clean_start")
     ctx = p.prefetch("redis", session_id="s2")
     assert "File unchanged" not in ctx
     assert "redis 密码" in ctx
