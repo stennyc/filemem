@@ -16380,6 +16380,30 @@ def _ensure_memory_toolset() -> None:
         logger.warning("FileMem: memory-toolset self-heal failed (left config untouched): %s", e)
 
 
+# Process-global idempotency guard for the tool-routing system-prompt section
+# (owner 2026-11-09, option B): the host's memory-provider loader re-runs
+# register(ctx) on EVERY agent init / doctor / dashboard load of the same
+# provider (plugins/plugin_host_child.py op_load_instance: "the module body
+# runs once per host and only the instance is new" — but the register() CALL
+# re-fires each time). The host's section registry
+# (hermes_cli/plugins.py PluginManager._system_prompt_sections) is a single
+# process-global table with RAISE-on-duplicate semantics, and the host's
+# memory-provider forwarder (plugins/memory/__init__.py __getattr__) swallows
+# the resulting ValueError into a per-occurrence WARNING — a filemem-side
+# try/except can NEVER see it (the exception is raised inside the host's
+# forwarding layer, outside our call frame). So the guard lives HERE, at
+# module scope, keyed by process identity: the first register() in this
+# process wins, every subsequent re-register is a no-op before the host
+# call is even made. First registration is authoritative (the section text
+# is a fixed literal, _FILEMEM_TOOL_ROUTING_TEXT — re-registering would add
+# nothing even if allowed). The register_system_prompt_section call itself
+# still keeps its own try/except for the genuine host-side error classes
+# (id / content validation); the module sentinel only de-dupes the
+# duplicate-ID collision, not other failures.
+_SECTION_REGISTERED = False
+_SECTION_REGISTER_LOCK = threading.Lock()
+
+
 def register(ctx) -> None:
     """Register filemem as a memory provider with hooks."""
     global _HOST_LLM_CTX, _HOST_MAIN_RUNTIME, _HOST_LLM_CTX_BY_HOME, _HOST_MAIN_RUNTIME_BY_HOME
@@ -16491,35 +16515,47 @@ def register(ctx) -> None:
 
     # Tool routing guard (owner ruling 2026-11-06): freeze the filemem tool-routing
     # text into every session's system prompt (symmetric with code_map_root_policy).
-    # 2026-11-08 idempotency fix: register(ctx) can be invoked TWICE for the same
-    # profile home in a multiplexed gateway / plugin force-reload cycle (the host
-    # re-runs discover_and_load), but the host's section registry
-    # (hermes_cli/plugins.py PluginManager._system_prompt_sections) is a single
-    # PROCESS-GLOBAL table keyed by section id — a second register of the same id
-    # RAISES "already registered by plugin 'filemem'", which the host's memory-
-    # provider registration path swallows into a per-occurrence WARNING
-    # ("Memory provider 'filemem' failed to register_system_prompt_section").
-    # Catch that specific collision as a NO-OP (first registration is
-    # authoritative; the section is already frozen into the prompt) instead of
-    # letting it log a scary-looking WARNING on every reload. Any OTHER
-    # register error still propagates (fail-loud: a genuinely broken section
-    # id / content / position must surface, never be masked by the idempotency
-    # guard swallowing it).
-    try:
-        ctx.register_system_prompt_section(
-            "filemem_tool_routing", _FILEMEM_TOOL_ROUTING_TEXT)
-        logger.info("Registered system prompt section (filemem_tool_routing)")
-    except ValueError as exc:
-        # The ONLY ValueError the host's register_system_prompt_section raises
-        # for an already-registered id (plugins.py:984-986). The id validation
-        # error ("must be 1-128 lowercase ...") is a DIFFERENT ValueError,
-        # caught here too — but it only fires if _FILEMEM_TOOL_ROUTING_TEXT's
-        # companion id constant is malformed, which it is not (fixed literal),
-        # so in practice only the collision path reaches this handler. Treat
-        # both as "already present / not mine to fix" and stay silent.
-        logger.debug(
-            "filemem_tool_routing section already registered (idempotent no-op): %s",
-            exc)
+    # 2026-11-09 option-B idempotency fix (module-scope sentinel): the host's
+    # memory-provider loader RE-RUNS register(ctx) on every agent init / doctor
+    # / dashboard load of the same provider (plugin_host_child.py
+    # op_load_instance: "the module body runs once per host and only the
+    # instance is new" — the register() CALL re-fires each time), while the
+    # host's section registry is a process-global RAISE-on-duplicate table.
+    # The 2026-11-08 in-frame try/except was dead code: the host's forwarder
+    # (plugins/memory/__init__.py __getattr__) swallows the ValueError in its
+    # OWN frame and logs the per-occurrence WARNING there — our except never
+    # sees it. The sentinel below moves the de-dupe to module scope, where it
+    # actually precedes the host call: first register() in this process
+    # wins, every re-register is a no-op BEFORE the host call is made.
+    # Fail-loud is preserved: only a genuine host-side error (id / content /
+    # position validation, or the host registry actually rejecting us) marks
+    # the sentinel unset on failure, so a broken section id still surfaces
+    # on the next register instead of being masked as "already registered".
+    global _SECTION_REGISTERED
+    with _SECTION_REGISTER_LOCK:
+        if _SECTION_REGISTERED:
+            logger.debug(
+                "filemem_tool_routing section already registered this process "
+                "(module-scope idempotent no-op; host re-register suppressed)")
+        else:
+            try:
+                ctx.register_system_prompt_section(
+                    "filemem_tool_routing", _FILEMEM_TOOL_ROUTING_TEXT)
+                _SECTION_REGISTERED = True
+                logger.info("Registered system prompt section (filemem_tool_routing)")
+            except ValueError as exc:
+                # A ValueError here means the host rejected the call. Two
+                # cases share the type: (a) "already registered by plugin
+                # 'filemem'" — the section is ALREADY in the host table, so
+                # our goal is met; (b) id/content/position validation — a
+                # genuine bug that keeps firing. Both are logged; the
+                # sentinel is left UNSET so the next register() re-tries the
+                # host call (case a will log once more then stay quiet at
+                # DEBUG, case b keeps WARNINGing until fixed — fail-loud
+                # for a real breakage, no silent permanent masking).
+                logger.warning(
+                    "filemem_tool_routing section registration failed: %s "
+                    "(retry on next register)", exc)
 
 
     # No auxiliary task slot: the host main-model face (agent/auxiliary_client.
