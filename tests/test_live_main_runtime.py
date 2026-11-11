@@ -13,10 +13,34 @@ import sys
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import __init__ as fmm
 from __init__ import FileMemProvider
+
+
+@pytest.fixture(autouse=True)
+def _isolate_module_main_runtime():
+    """The real (a)-path of _live_main_runtime() PERSISTS a live snapshot
+    into the module-level _HOST_MAIN_RUNTIME global (by design: a binder
+    success benefits every other instance in this process). That write
+    must never leak OUT of this test file into later test files — every
+    "no runtime / standalone" assumption in test_multilingual_detect_type,
+    test_recurring_dedupe, test_s1b_tick_wiring is predicated on that
+    global being None between modules. Snapshot + restore it (and the
+    per-home dict) around every test in this file, so collection order
+    can never turn these tests into a global-state source for the rest
+    of the suite. (The mock.patch.object(..., create=True) usages below
+    already restore the SCALAR their with-block entered; what they cannot
+    protect is a write made BY THE CODE UNDER TEST, which is what this
+    fixture covers.)"""
+    saved_scalar = fmm._HOST_MAIN_RUNTIME
+    saved_by_home = fmm._HOST_MAIN_RUNTIME_BY_HOME
+    yield
+    fmm._HOST_MAIN_RUNTIME = saved_scalar
+    fmm._HOST_MAIN_RUNTIME_BY_HOME = saved_by_home
 
 
 def _mk():
