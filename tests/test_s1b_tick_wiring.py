@@ -622,6 +622,49 @@ def test_reg_tick_body_fail_soft_all_green(tmp_path, monkeypatch):
     assert (store / "knowledge" / "archive").exists()
 
 
+def test_reg_graph_skip_when_storage_dir_uninitialized(tmp_path, monkeypatch):
+    """SA2-4 fail-soft guard: a provider built WITHOUT storage_dir
+    (FileMemProvider.__new__, no initialize()) must NOT fall back to
+    build_graph.default_storage_root() — the graph auto-rebuild segment
+    should warn + skip, and every OTHER tick segment still runs clean
+    (fail-soft, not fail-open, on a wrong-store guess)."""
+    store = _make_store(
+        tmp_path,
+        {},
+        raw_pending_rows=[{"topic": "t", "content": "raw",
+                           "created_ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")}],
+    )
+    decay = _decay_copy(interval_min=0)
+    p = _make_provider(tmp_path, store, decay, llm_ctx=None, session_id="s-graph-skip")
+    # Strip the one attribute that routes the graph rebuild to the right store:
+    # simulate a provider that never ran initialize().
+    del p.storage_dir
+
+    # Seam: record every ensure_fresh call the tick body makes, so we can
+    # assert it was NEVER called with a None/guessed root (the pre-fix
+    # fail-open behavior was ensure_fresh(None) -> default_storage_root()).
+    import graph_autorebuild
+    calls = []
+    def _rec(sr=None, **kw):
+        calls.append((sr, kw))
+        return False
+    monkeypatch.setattr(graph_autorebuild, "ensure_fresh", _rec)
+
+    created = _recorded_sct(monkeypatch)
+    p._maybe_spawn_consolidation_tick()
+    assert len(created) == 1
+    th = created[0]
+    th.join(timeout=10.0)
+    assert not th.is_alive(), "tick must run to completion despite the missing storage_dir"
+
+    # The C face (zero-LLM) still did its work -> fail-soft, not a hard fail:
+    assert (store / "knowledge" / "archive").exists()
+    # The graph segment must NOT have guessed a default root: ensure_fresh
+    # was never invoked at all (no None, no str(guessed root)).
+    assert calls == [], f"ensure_fresh must not be called when storage_dir is missing, got: {calls}"
+    assert not (store / "graph.json").exists()
+
+
 def test_reg_prefetch_reinforce_regression(tmp_path):
     """Regression: prefetch still returns context (recall unchanged) even
     with the new F5 audit wiring active; a hit recall reinforces the real

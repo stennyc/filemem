@@ -14758,7 +14758,21 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
             try:
                 from graph_autorebuild import ensure_fresh as _graph_ensure_fresh
                 _graph_root = getattr(self, "storage_dir", None)
-                _graph_ensure_fresh(str(_graph_root) if _graph_root else None)
+                if not _graph_root:
+                    # Fail-soft, not fail-open: a provider that never ran
+                    # initialize() (e.g. a test fixture built via
+                    # FileMemProvider.__new__) has no live store of its own.
+                    # Silently falling back to build_graph.default_storage_root()
+                    # would rebuild the graph for SOME OTHER store (an
+                    # env-resolved guess), not the store this provider serves.
+                    # Warn and skip instead: the search face keeps running
+                    # two-axis exactly as it does when graph.json is absent.
+                    logger.warning(
+                        "FileMem: graph auto-rebuild skipped — this provider "
+                        "has no initialized storage_dir (e.g. constructed "
+                        "without initialize()); not guessing a default root.")
+                else:
+                    _graph_ensure_fresh(str(_graph_root))
             except Exception as e:
                 logger.warning(f"FileMem: graph auto-rebuild spawn failed (existing graph.json intact): {e}")
             # S3: semantic-merge face (cross-shard same-fact fold, LLM #5 in
