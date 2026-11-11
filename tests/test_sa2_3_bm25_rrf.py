@@ -59,15 +59,47 @@ def _fixture_queries():
     return data["queries"]
 
 
+def _currently_eligible(p, ids):
+    """2026-11-11 (fixture-hygiene, owner direction: test-level predicate, no
+    data/factory-code change): return the subset of `ids` still recallable
+    *today* — i.e. present in the live store AND not TTL-expired
+    (`MemoryItem.is_expired()`, the EXACT predicate `search_memories` uses to
+    physically filter the pool at L9085). A fixture baseline id that WAS
+    recallable at capture time but has since (a) been swept out of the live
+    store (2026-10-13 purge / 2026-10-15 P4 sweep class) or (b) simply
+    outlived its ttl_days and lapsed (TTL drift, NOT a retrieval regression)
+    no longer has any bearing on whether the RRF/substring qualification
+    gate still works; asserting it stays eligible would false-fail on a
+    data-plane event the test is not meant to police. This helper is pure
+    read-side (zero writes, zero LLM) and deliberately duplicates the
+    on-disk lookup the test itself already does so the gate stays self
+    contained (no provider-internal API surface added for the test)."""
+    from __init__ import MemoryItem
+    still_live = set()
+    pids = []
+    for f in p.memories_dir.glob("*.json"):
+        try:
+            pids.extend(json.loads(f.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    for r in pids:
+        if not isinstance(r, dict) or r.get("id") not in set(ids):
+            continue
+        item = MemoryItem.from_dict(r)
+        if not item.is_expired():
+            still_live.add(r.get("id"))
+    return still_live
+
+
 # ── Acceptance 1+2 (corrected gate): RETRIEVABILITY, not top5-set-invariance ─
 def test_retrievability_gate_en_zh():
-    """Every TRUE pre-SA2-3 legacy top-5 id that STILL EXISTS in the live store
-    must be ELIGIBLE in the post-RRF pool (min_score=0.0 over the full pool).
-    The legacy substring qualification gate is preserved verbatim by SA2-3, so
-    nothing previously recallable may be lost. RRF/idf re-ranking WITHIN the
-    eligible pool is by design and is NOT gated here (spec SA2-3 Acceptance 1
-    also demands ranking improvement — gated separately by
-    test_bm25_idf_rare_term_outranks_common).
+    """Every TRUE pre-SA2-3 legacy top-5 id that STILL EXISTS in the live
+    store must be ELIGIBLE in the post-RRF pool (min_score=0.0 over the
+    full pool). The legacy substring qualification gate is preserved verbatim
+    by SA2-3, so nothing previously recallable may be lost. RRF/idf
+    re-ranking WITHIN the eligible pool is by design and is NOT gated here
+    (spec SA2-3 Acceptance 1 also demands ranking improvement — gated
+    separately by test_bm25_idf_rare_term_outranks_common).
 
     NOTE (2026-10-13 host relay-block purge): the C-leg data-plane cleanup
     removed 22 rows from the live store. Of those, exactly 4 ids —
@@ -88,6 +120,21 @@ def test_retrievability_gate_en_zh():
     preference_201_1791627642, preference_119_1791677567 — all
     [Group chat …] room-skeleton rows. The other 179 swept rows were
     never part of any baseline_top5.
+
+    NOTE (2026-11-11 TTL drift, owner ruling: fix at the test level, no
+    fixture-data or provider-code change): L0/preference/decision rows in
+    this fixture's baseline_top5 carry `ttl_days=30` and simply lap out of
+    the live pool's `is_expired()` filter ~30 days after their `updated_at`
+    (wall-clock, NOT anchored by `time_anchor` — that param only pins the
+    decay/graph axes, not pool assembly). When a baseline id lapses — or is
+    swept out entirely (the two NOTEs above, or any future data-plane
+    cleanup) — it is excluded from this gate's assertion via
+    `_currently_eligible()`, not dropped from the fixture data: the
+    fixture stays a stable, append-only record of "what was recallable at
+    capture time"; the TEST is the thing that tracks live-store drift.
+    This preserves the gate's actual invariant — "the RRF/substring
+    qualification logic did not regress" — without re-corrupting the
+    fixture every 30 days or pretending lapsed/swept data is still valid.
     """
     p = _make_live_provider()
     checked = 0
@@ -99,11 +146,12 @@ def test_retrievability_gate_en_zh():
                 continue
             eligible = set(r.get("id") for r in
                            p.search_memories(q, limit=1000, min_score=0.0))
-            missing = [i for i in base if i not in eligible]
+            still_live = _currently_eligible(p, base)
+            missing = [i for i in base if i in still_live and i not in eligible]
             assert not missing, (
-                f"{lang} query {q!r}: {missing} were recallable pre-SA2-3 "
-                f"but are no longer eligible post-RRF — legacy substring "
-                f"qualification gate regressed")
+                f"{lang} query {q!r}: {missing} are still live (on-disk, not "
+                f"TTL-lapsed) but no longer eligible post-RRF — legacy "
+                f"substring qualification gate regressed")
             checked += 1
     assert checked >= 10, f"expected >=10 golden queries to check, got {checked}"
 
