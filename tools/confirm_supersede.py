@@ -133,6 +133,31 @@ def cmd_list(p: "fm.FileMemProvider") -> int:
     return 0
 
 
+def _verify_flip(p: "fm.FileMemProvider", shard: Path, new_id: str, target_state: str) -> bool:
+    """Lose-writer guard (write-after-verify): re-read the shard UNDER THE
+    SHARD LOCK (the SAME provider `p` the flip was written under, so the
+    lock path matches the writer's) and confirm `new_id`'s
+    supersede_state is actually `target_state` on disk. A concurrent
+    unlocked RMW from a sibling process (consolidation / save-door) may
+    have overwritten our write with an older snapshot between our
+    read-snapshot and our json.dump — the classic lost-update window that
+    `_shard_lock` alone does NOT close (it serializes one RMW, it does not
+    CAS against a later writer's stale read). `False` = the flip did not
+    survive; the caller re-enters the lock, re-reads fresh, and re-flips
+    (bounded retry, never infinite). Fail-soft: any read/lock hiccup
+    returns False (the caller treats it as a non-durable flip and retries;
+    never raises into the host turn)."""
+    try:
+        with p._shard_lock(shard):
+            items = _load_shard(shard)
+    except Exception:
+        return False
+    for r in items:
+        if isinstance(r, dict) and str(r.get("id")) == new_id:
+            return (r.get("metadata") or {}).get("supersede_state") == target_state
+    return False
+
+
 def _verdict(p: "fm.FileMemProvider", new_id: str, verdict: str) -> int:
     """Deterministic state flip under the cross-process shard lock.
 
@@ -144,65 +169,101 @@ def _verdict(p: "fm.FileMemProvider", new_id: str, verdict: str) -> int:
         refuse, rc 1 (a dismissed candidate is not re-openable by this tool)
     The state re-check happens INSIDE the lock over a fresh read so two
     concurrent workers on the same row serialize cleanly (first writer
-    wins, the second is the idempotent no-op)."""
-    shard, _row = _find_new_row(p, new_id)
-    if shard is None:
-        print(f"ERROR: row {new_id} not found in {p.memories_dir} (memories/*.json)")
-        return 1
+    wins, the second is the idempotent no-op).
+
+    Write-after-verify (L8): after the flip is written and the lock is
+    released, re-read the shard (again under the lock) to confirm the flip
+    survived on disk. A concurrent unlocked RMW from a sibling process
+    (consolidation / save-door) can clobber our write with an older
+    snapshot (lost update — the lock serializes a single RMW, it does not
+    CAS against a later writer's stale read). If the flip did not survive,
+    re-enter the lock, re-read fresh, and re-flip — up to 3 total attempts,
+    then report the persistent failure (rc 1) instead of silently
+    returning 0. `audit` is appended exactly once, only on a confirmed
+    durable flip; a retried flip that succeeds appends a single audit line
+    (the retry path does not double-stack audit)."""
     target_state = "confirmed" if verdict == "confirm" else "rejected"
     ts = _now_iso()
-    with p._shard_lock(shard):  # cross-process RMW (same gate as the save door)
-        items = _load_shard(shard)
-        row = next((r for r in items if isinstance(r, dict) and str(r.get("id")) == new_id), None)
-        if row is None:
-            print(f"ERROR: row {new_id} vanished from {shard.name} under the lock (concurrent move?)")
+    max_attempts = 3
+    last_err = "not attempted"
+    for attempt in range(1, max_attempts + 1):
+        shard, _row = _find_new_row(p, new_id)
+        if shard is None:
+            print(f"ERROR: row {new_id} not found in {p.memories_dir} (memories/*.json)")
             return 1
-        meta = row.get("metadata")
-        if not isinstance(meta, dict):
-            print(f"ERROR: row {new_id} has no metadata block; not an EP-1 stamped candidate")
-            return 1
-        state = meta.get("supersede_state")
-        if state != "candidate":
-            if state == target_state:
-                print(f"OK (idempotent no-op): {new_id} supersede_state already "
-                      f"'{target_state}' — no write, no double audit")
-                return 0
-            print(f"ERROR: row {new_id} supersede_state={state!r} is not 'candidate' "
-                  f"(already decided); refusing to re-flip in the other direction")
-            return 1
-        old_ids = [str(x) for x in (meta.get("supersedes") or [])]
-        changed = False
-        for r in items:
-            if not isinstance(r, dict):
-                continue
-            rid = str(r.get("id"))
-            rm = r.get("metadata")
-            if not isinstance(rm, dict):
-                rm = {}
-                r["metadata"] = rm
-            if rid == new_id:
-                rm["supersede_state"] = target_state
-                r["updated_at"] = ts
-                changed = True
-            elif target_state == "confirmed" and rid in old_ids:
-                rm["superseded_confirmed"] = True
-                r["updated_at"] = ts
-                changed = True
-        if changed:
-            with open(shard, "w", encoding="utf-8") as fh:
-                json.dump(items, fh, ensure_ascii=False, indent=2)
-    audit_row = {
-        "action": "supersede_confirm_human",
-        "new_id": new_id,
-        "target_ids": old_ids,
-        "verdict": target_state,
-        "ts": ts,
-    }
-    _append_audit(p, audit_row)
-    print(f"{verdict.upper()}: {new_id} supersede_state -> '{target_state}'"
-          + (f"; superseded_confirmed=True on {old_ids}" if target_state == "confirmed" else "")
-          + " (audit appended to consolidation_log.jsonl)")
-    return 0
+        old_ids: list = []
+        in_lock_changed = False
+        with p._shard_lock(shard):  # cross-process RMW (same gate as the save door)
+            items = _load_shard(shard)
+            row = next((r for r in items if isinstance(r, dict) and str(r.get("id")) == new_id), None)
+            if row is None:
+                print(f"ERROR: row {new_id} vanished from {shard.name} under the lock (concurrent move?)")
+                return 1
+            meta = row.get("metadata")
+            if not isinstance(meta, dict):
+                print(f"ERROR: row {new_id} has no metadata block; not an EP-1 stamped candidate")
+                return 1
+            state = meta.get("supersede_state")
+            if state != "candidate":
+                if state == target_state:
+                    print(f"OK (idempotent no-op): {new_id} supersede_state already "
+                          f"'{target_state}' — no write, no double audit")
+                    return 0
+                print(f"ERROR: row {new_id} supersede_state={state!r} is not 'candidate' "
+                      f"(already decided); refusing to re-flip in the other direction")
+                return 1
+            old_ids = [str(x) for x in (meta.get("supersedes") or [])]
+            changed = False
+            for r in items:
+                if not isinstance(r, dict):
+                    continue
+                rid = str(r.get("id"))
+                rm = r.get("metadata")
+                if not isinstance(rm, dict):
+                    rm = {}
+                    r["metadata"] = rm
+                if rid == new_id:
+                    rm["supersede_state"] = target_state
+                    r["updated_at"] = ts
+                    changed = True
+                elif target_state == "confirmed" and rid in old_ids:
+                    rm["superseded_confirmed"] = True
+                    r["updated_at"] = ts
+                    changed = True
+            if changed:
+                with open(shard, "w", encoding="utf-8") as fh:
+                    json.dump(items, fh, ensure_ascii=False, indent=2)
+                in_lock_changed = True
+        if not in_lock_changed:
+            continue  # idempotent no-op path already returned 0 above
+        # Write-after-verify: the lock is released; confirm the flip
+        # survived on disk (a concurrent unlocked RMW from a sibling
+        # process may have clobbered it between our snapshot and our
+        # json.dump — the lost-update window the lock alone does not
+        # close).
+        if _verify_flip(p, shard, new_id, target_state):
+            audit_row = {
+                "action": "supersede_confirm_human",
+                "new_id": new_id,
+                "target_ids": old_ids,
+                "verdict": target_state,
+                "ts": ts,
+                "write_verified": True,
+            }
+            _append_audit(p, audit_row)
+            print(f"{verdict.upper()}: {new_id} supersede_state -> '{target_state}'"
+                  + (f"; superseded_confirmed=True on {old_ids}" if target_state == "confirmed" else "")
+                  + " (write-verified under lock; audit appended to consolidation_log.jsonl)")
+            return 0
+        # Flip was clobbered between our write and our verify: retry with a
+        # fresh read under the lock.
+        last_err = f"flip clobbered by concurrent writer (attempt {attempt}/{max_attempts})"
+        if attempt < max_attempts:
+            time.sleep(0.1 * attempt)  # bounded backoff before re-read
+    print(f"ERROR: {new_id} supersede_state flip did not persist: {last_err} "
+          f"(row may be contended by a concurrent writer; re-run after the "
+          f"writer settles, or use --store to target a quiescent snapshot)")
+    return 1
 
 
 def main() -> int:

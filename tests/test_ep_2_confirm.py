@@ -494,3 +494,113 @@ def test_supersede_state_round_trip(state):
     # lineage_of 读侧视图（EP-1 契约，legacy 行无键 = None 不炸）
     lv = fm.lineage_of(d)
     assert lv["supersede_state"] == state
+
+
+# ── L8 (2026-11-11): write-after-verify guard (tools/confirm_supersede.py) ─
+#
+# Root cause this locks down: _verdict's RMW (read under lock -> json.dump
+# whole shard) can LOSE its write when a sibling unlocked RMW (consolidation
+# / save-door in another process) clobbers the shard with an older snapshot
+# between our read-snapshot and our write. The lock serializes one RMW; it
+# does not CAS against a later writer's stale read. The guard re-reads the
+# shard (same provider, same lock path) after the write and retries a
+# bounded number of times instead of returning 0 for a flip that did not
+# survive on disk.
+
+import importlib.util as _ilu
+_CS_CLI = PLUGIN_DIR / "tools" / "confirm_supersede.py"
+_spec = _ilu.spec_from_file_location("confirm_supersede_under_test", str(_CS_CLI))
+cs_cli = _ilu.module_from_spec(_spec)
+# tools/confirm_supersede.py does `import __init__ as fm` with its own
+# sys.path insert; load the module object directly so the test can reach
+# _build_provider / _verdict / _verify_flip without depending on the test
+# runner's sys.path configuration.
+import sys as _sys
+_sys.modules.setdefault("confirm_supersede_under_test", cs_cli)
+_spec.loader.exec_module(cs_cli)
+
+
+def _cli_load_state(store: pathlib.Path, row_id: str) -> str:
+    rows = json.loads((store / "memories" / "fact.json").read_text(encoding="utf-8"))
+    return {r["id"]: r for r in rows}[row_id]["metadata"]["supersede_state"]
+
+
+def _cli_audit_count(store: pathlib.Path) -> int:
+    f = store / "consolidation_log.jsonl"
+    if not f.exists():
+        return 0
+    return len([l for l in f.read_text(encoding="utf-8").splitlines() if l.strip()])
+
+
+def test_l8_cli_confirm_happy_path_persists_and_audits_once(tmp_path):
+    store = _cli_fixture(tmp_path)
+    p = cs_cli._build_provider(store)
+    rc = cs_cli._verdict(p, "fact_1", "confirm")
+    assert rc == 0
+    assert _cli_load_state(store, "fact_1") == "confirmed"
+    assert _cli_audit_count(store) == 1
+    aud = [json.loads(l) for l in (store / "consolidation_log.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert aud[0]["write_verified"] is True
+    assert aud[0]["new_id"] == "fact_1" and aud[0]["verdict"] == "confirmed"
+
+
+def test_l8_cli_confirm_clobbered_once_retries_and_persists(tmp_path, monkeypatch):
+    store = _cli_fixture(tmp_path)
+    p = cs_cli._build_provider(store)
+    calls = {"n": 0}
+    original = cs_cli._verify_flip
+    shard_path = store / "memories" / "fact.json"
+
+    def flaky_verify(p_arg, shard, new_id, target_state):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Simulate the lost-update: a concurrent RMW clobbered our write,
+            # so the on-disk state is back to 'candidate'. Return False AND
+            # roll the row back so the next attempt genuinely re-flips it.
+            rows = json.loads(shard_path.read_text(encoding="utf-8"))
+            for r in rows:
+                if r.get("id") == new_id:
+                    r["metadata"]["supersede_state"] = "candidate"
+            shard_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2))
+            return False
+        return original(p_arg, shard, new_id, target_state)
+
+    monkeypatch.setattr(cs_cli, "_verify_flip", flaky_verify)
+    rc = cs_cli._verdict(p, "fact_1", "confirm")
+    assert rc == 0
+    assert calls["n"] == 2  # first verify clobbered, second survived
+    assert _cli_load_state(store, "fact_1") == "confirmed"
+    assert _cli_audit_count(store) == 1  # no double-stack from the retry
+
+
+def test_l8_cli_confirm_never_persists_fails_without_audit(tmp_path, monkeypatch):
+    store = _cli_fixture(tmp_path)
+    p = cs_cli._build_provider(store)
+    shard_path = store / "memories" / "fact.json"
+
+    def never_persists(p_arg, shard, new_id, target_state):
+        # Every verify reports a clobber and rolls the row back to candidate,
+        # so no attempt ever sees a durable flip.
+        rows = json.loads(shard_path.read_text(encoding="utf-8"))
+        for r in rows:
+            if r.get("id") == new_id:
+                r["metadata"]["supersede_state"] = "candidate"
+        shard_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2))
+        return False
+
+    monkeypatch.setattr(cs_cli, "_verify_flip", never_persists)
+    rc = cs_cli._verdict(p, "fact_1", "confirm")
+    assert rc == 1
+    assert _cli_load_state(store, "fact_1") == "candidate"  # rolled back, never durable
+    assert _cli_audit_count(store) == 0  # a non-durable flip is NOT audited
+
+
+def test_l8_cli_reject_happy_path_persists_and_audits_once(tmp_path):
+    store = _cli_fixture(tmp_path)
+    p = cs_cli._build_provider(store)
+    rc = cs_cli._verdict(p, "fact_4", "reject")
+    assert rc == 0
+    assert _cli_load_state(store, "fact_4") == "rejected"
+    assert _cli_audit_count(store) == 1
+    aud = [json.loads(l) for l in (store / "consolidation_log.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert aud[0]["verdict"] == "rejected" and aud[0]["write_verified"] is True
