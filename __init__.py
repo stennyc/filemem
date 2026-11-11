@@ -14735,6 +14735,32 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                 self._observe_consolidate()
             except Exception as e:
                 logger.warning(f"FileMem: observe spawn failed (existing observations intact): {e}")
+            # SA2-4: deterministic graph auto-rebuild rides the same async
+            # consolidation thread (rescore -> confirm -> mine -> observe ->
+            # GRAPH REBUILD -> semantic-merge -> ...). Zero LLM, zero new
+            # lock/concurrency — graph_autorebuild.ensure_fresh is a pure
+            # "is the fingerprint stale, rebuild if so" check over the
+            # existing idempotent build_and_write (its own .bak/zero-write
+            # semantics already guard the write), with two guards that keep
+            # it inside this tick thread's join budget: a min-corpus gate
+            # (tiny stores — e.g. test fixtures — skip graphing entirely)
+            # and a soft wall-time deadline (a cold full-store pass defers
+            # to the next tick instead of starving the other LLM faces).
+            # Pass the provider's OWN live store (self.storage_dir, the root
+            # build_graph's collect_corpus reads from) rather than defaulting
+            # to build_graph.default_storage_root(): the hook must rebuild
+            # the graph for EXACTLY the store this provider is serving, not
+            # some environment-resolved guess.
+            # Fail-soft: any exception leaves the on-disk graph.json
+            # exactly as-is (search stays two-axis, unchanged behavior);
+            # host turn stays zero-blocking (daemon thread, same as every
+            # other face here).
+            try:
+                from graph_autorebuild import ensure_fresh as _graph_ensure_fresh
+                _graph_root = getattr(self, "storage_dir", None)
+                _graph_ensure_fresh(str(_graph_root) if _graph_root else None)
+            except Exception as e:
+                logger.warning(f"FileMem: graph auto-rebuild spawn failed (existing graph.json intact): {e}")
             # S3: semantic-merge face (cross-shard same-fact fold, LLM #5 in
             # the 7-segment body). Rides the same async consolidation thread
             # (rescore -> confirm -> mine -> observe -> S3 merge/contradiction/
