@@ -7309,11 +7309,13 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         return False
 
     def _reject_structural_noise(self, content: str) -> bool:
-        """M1 ingress gate with observability: calls _is_structural_noise and logs
-        an INFO line when it rejects, so a new reject-class can't become a silent
-        no-op drop (the same observability line the team added to the auto-save path)."""
+        """M1 ingress gate: calls _is_structural_noise and drops silently.
+        Observability for this class lives on the P0-1 ingress gate (the
+        shared-store write face logs one line per reject-class + quarantines),
+        so the M1 room-ingress path no longer spams one INFO line per batch
+        item (a single auto-save pass can reject ~80 items)."""
         if self._is_structural_noise(content):
-            logger.info(f"FileMem: structural-noise rejected: {content.strip()[:30]!r}")
+            logger.debug(f"FileMem: structural-noise rejected: {content.strip()[:30]!r}")
             return True
         return False
 
@@ -7389,8 +7391,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         except Exception as e:
             logger.warning(f"FileMem: ingress-reject audit write failed: {e}")
         logger.info(
-            f"FileMem: P0-1 ingress reject ({reject_class}) "
-            f"quarantined {content_s.strip()[:30]!r} (not written to pool)")
+            f"FileMem: P0-1 ingress reject ({reject_class}) quarantined "
+            f"{len(content_s)} chars (not written to pool)")
         return reject_class
 
     def _egress_cut(self, item: Dict[str, Any]) -> bool:
