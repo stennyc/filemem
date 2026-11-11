@@ -9104,6 +9104,39 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # EMPTY backfill and byte-identical main-pool behavior (regression
         # gate, spec EP-1 acceptance #3). Fail-soft: the predicate only
         # reads metadata, never raises on row shape.
+        #
+        # EP-1.x (2026-11-11): the backfill source is narrowed to CONFIRMED
+        # lineage only. A superseded row still in the candidate supersede
+        # queue (metadata.supersede_state == "candidate" or "rejected") has
+        # NO live, confirmed replacement yet — surfacing it in a search
+        # backfill would show the user an unconfirmed old version as if it
+        # had been superseded. Only rows whose supersession is confirmed
+        # (supersede_state == "confirmed" on the superseding row, or the
+        # deterministic superseded_confirmed=True mark) are eligible to
+        # re-enter as 谱系展开. All other superseded rows stay split OUT of
+        # both the main pool and the backfill — they remain on disk (audit
+        # chain intact, I1 no-DELETE) but are no longer offered to the
+        # retrieval face. Legacy corpora (superseded rows without any
+        # supersede_state / superseded_confirmed key) keep the pre-EP-1.x
+        # backfill behavior: a bare `superseded=True` with no state stamp is
+        # treated as confirmed by the save-door lineage, so this change is a
+        # no-op for legacy data (regression gate preserved).
+        def _supersession_confirmed(row: Dict[str, Any]) -> bool:
+            m = row.get("metadata") or {}
+            state = m.get("supersede_state")
+            if state == "confirmed":
+                return True
+            if state in ("candidate", "rejected"):
+                return False
+            # No supersede_state stamp: the bare `superseded=True` save-door
+            # mark. Confirmed by the deterministic superseded_confirmed
+            # marker, or (legacy) no state key at all = pre-EP-1.x behavior.
+            if m.get("superseded_confirmed"):
+                return True
+            if "supersede_state" not in m:
+                return True  # legacy: bare save-door superseded, keep
+            return False
+
         _lineage_superseded = [
             it for it in all_memories
             if isinstance(it, dict) and (it.get("metadata") or {}).get("superseded")
@@ -9112,6 +9145,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             all_memories = [
                 it for it in all_memories
                 if not (isinstance(it, dict) and (it.get("metadata") or {}).get("superseded"))
+            ]
+            _lineage_superseded = [
+                it for it in _lineage_superseded
+                if _supersession_confirmed(it)
             ]
 
         # M4: cross-session recall — the episodic layer must be in the pool.
