@@ -34,6 +34,16 @@ import logging
 import sys
 import threading
 from pathlib import Path
+
+# Splice the shared dev-venv site-packages dir onto sys.path BEFORE psycopg2
+# is ever actually needed (it is lazily imported inside _PgConn.__init__,
+# but the import surface for it must exist by then). Makes the splice a
+# guaranteed side effect of importing shared_memory itself, regardless of
+# which face (host in-process via __init__.py, a bare test import, a future
+# caller) imports it. No-op when the host already resolves psycopg2.
+import dep_bootstrap
+
+dep_bootstrap.ensure_pg_dep_paths()
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -51,9 +61,10 @@ def _load_shared_memory_config() -> Optional[Dict[str, Any]]:
     配置缺失 = 字节级不变 (owner 验收硬指标)。
 
     (a) 直读 config.yaml 文件, 不借 hermes_cli.config / ruamel (owner 定稿
-    2026-10-23): host tools-python 缺 ruamel/psycopg2/pyyaml, hermes 有专门
-    给工具用的 venv (/root/.hermes/plugin-venv), 依赖路径自动检测:
-      1. ruamel.yaml 可用 (host host venv) -> 用它解析 (支持 anchor/alias)
+    2026-10-23): host tools-python 缺 ruamel/psycopg2/pyyaml, 依赖路径靠
+    dep_bootstrap 自动检测 (当前解释器自己的 site-packages, 不写死任何具体
+    venv 路径), 配置解析优先级:
+      1. ruamel.yaml 可用 -> 用它解析 (支持 anchor/alias)
       2. pyyaml 可用 -> 用它 (支持 anchor/alias)
       3. 都没有 (host tools python) -> 纯文本最小解析
     配置段结构固定 (agent_id + enabled + pg{host,port,db,user,password} +
@@ -216,21 +227,14 @@ def _parse_shared_memory_minimal(raw: str) -> Dict[str, Any]:
 
 
 def _ensure_pg_dep_paths() -> None:
-    """Make psycopg2 importable from the running interpreter (mirror kb's
-    _ensure_kb_dep_paths). psycopg2 lives in the shared plugin-venv, NOT the
-    host tools-python. No-op when the host already sees it; never blocks.
-    Rollback-safe: deleting this + the call restores prior host-only behaviour.
-    """
-    import importlib.util
-    import os
-    if importlib.util.find_spec("psycopg2"):
-        return
-    site = os.environ.get(
-        "FM_PG_SITE",
-        "/root/.hermes/plugin-venv/lib/python3.14/site-packages",
-    )
-    if os.path.isdir(site) and site not in sys.path:
-        sys.path.append(site)
+    """Make psycopg2 importable from the running interpreter.
+
+    Superseded by dep_bootstrap.ensure_pg_dep_paths (shared single source of
+    truth, 2026-11-11) — kept as a thin re-export wrapper so any existing
+    caller/referencer of this exact name still resolves; the actual splice
+    logic now lives in dep_bootstrap."""
+    import dep_bootstrap
+    dep_bootstrap.ensure_pg_dep_paths()
 
 
 _ensure_pg_dep_paths()

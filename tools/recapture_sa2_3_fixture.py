@@ -12,7 +12,7 @@ queries against the CURRENT live store in one command.
 RUN (one command, reviewer round-2 runbook):
 
   cd /root/.hermes/plugins/filemem
-  PYTHONPATH=/usr/local/lib/hermes-agent /root/.hermes/plugin-venv/bin/python tools/recapture_sa2_3_fixture.py
+  PYTHONPATH=/usr/local/lib/hermes-agent python3 tools/recapture_sa2_3_fixture.py
 
 Behavior:
   * READ-ONLY over the live store (~/.hermes/filemem): builds the provider
@@ -121,7 +121,7 @@ def main() -> int:
         encoding="utf-8")
     print(f"\nwritten: {FIXTURE}")
     print("next: PYTHONPATH=/usr/local/lib/hermes-agent "
-          "/root/.hermes/plugin-venv/bin/python -m pytest -q "
+          "python3 -m pytest -q "
           "tests/test_sa2_3_bm25_rrf.py")
     return 0
 
