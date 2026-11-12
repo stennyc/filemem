@@ -111,7 +111,9 @@ def test_regex_is_zero_llm_and_table_driven():
     "every non-default type carries a pattern row", not a hardcoded key set
     (a hardcoded set broke the day plan landed — this assertion now derives
     from MEMORY_TYPES so adding a type can't silently regress the gate)."""
-    expected_keys = set(MEMORY_TYPES) - {"fact"}
+    # "fact" (the default, no row) and "scheduled" (write-side-only, its read
+    # face is code-side due_at compare not type-detect) are exempt.
+    expected_keys = set(MEMORY_TYPES) - {"fact", "scheduled"}
     assert set(_MEMORY_TYPE_REGEX) == expected_keys, \
         f"_MEMORY_TYPE_REGEX keys {set(_MEMORY_TYPE_REGEX)} != {expected_keys}"
     for t in expected_keys:

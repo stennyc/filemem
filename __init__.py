@@ -131,10 +131,25 @@ _HOST_MAIN_RUNTIME = None
 _HOST_MAIN_RUNTIME_BY_HOME: Dict[str, Any] = {}
 
 # Memory types
-MEMORY_TYPES = ["preference", "fact", "decision", "task", "plan"]
+MEMORY_TYPES = ["preference", "fact", "decision", "task", "plan", "scheduled"]
 
 # Memory levels
 MEMORY_LEVELS = ["L0", "L1", "L2"]
+
+# ── scheduled 门 read-side wake prompt (owner 2026-11-12) ────────────────────
+# The due-wake face (Step 3, pre_llm_call injection) compares due_at purely by
+# CODE (zero LLM on the due/detection side). When a due row is surfaced to the
+# user, THIS prompt governs what the LLM says: for action_kind="auto" it runs
+# on_due_do and verifies against expects, then reports the outcome for the user
+# to adjudicate; for "remind" it only reminds, never auto-executes. The user's
+# verdict (done/dismissed/postpone) lands via filemem_scheduled(action="resolve").
+_SCHEDULED_WAKE_PROMPT = (
+    "以下是 N 条已到期的 scheduled（到期点均已过，纯代码比 due_at 得出，零 LLM 判定）：\n"
+    "{each: content / 到期动作 on_due_do / 验收 expects / 类型 action_kind}。"
+    "对 auto 型：先执行 on_due_do，按 expects 判成败，把执行结果回报给用户拍「成/败/重做」。"
+    "对 remind 型：只提醒用户该处理，不代做。"
+    "是否处理/推迟/取消，由用户通过 filemem_scheduled(action='resolve') 拍板。"
+)
 
 # ── Tool routing guard (owner ruling 2026-11-06) ─────────────────────────────
 # filemem 数据面（中央存储 /root/.hermes/filemem/，所有 profile 共享同一份）的统一
@@ -481,6 +496,37 @@ def _relay_pollution_fold(row: Any) -> bool:
     except Exception:  # pragma: no cover - fail-open
         return False
 
+
+def _kanban_pollution_fold(row: Any) -> bool:
+    """KANBAN read-side fold-out predicate (auto-inject face ONLY, zero I/O).
+
+    owner 红线（2026-11-12）：任何和 kanban 相关的整卡**不进自动注入面**。
+    555e 实证：自动注入面被 kanban `[task]` 卡片全文霸占（`# Kanban task t_`
+    卡片头 + `## Body` + `## Recent work` 串），15 条重复行 12935 字节 →
+    provider 前缀缓存从 user 尾部逐轮失效、read 锁死 8192。
+
+    单源检测器 `_is_kanban_task_prompt`（双特征硬门：卡片头 + `## Body`，
+    写入口 P0-1(e) 同源，读腿复用——写/读永不漂移，P0-3 先例）：content 命中
+    → 整条 item 折出 auto-inject 面。提及 t_xxx 的干净经验行（无卡片结构
+    双特征）不命中 → 保留（零误杀，P1 posture）。行留在 store + 显式 search
+    面，只砍自动注入面。
+
+    调用面（与 _relay_pollution_fold 两个共用入口同构）：
+      (1) prefetch 过滤链（_relay_pollution_fold 之后）
+      (2) P3 cold-start replay 的 _filter_replayed_snapshot
+    fail-open：非 dict 行 / content 非 str → False（绝不因谓词 bug 丢召回）。
+    """
+    try:
+        if not isinstance(row, dict):
+            return False
+        content = row.get("content")
+        if not isinstance(content, str):
+            return False
+        return _is_kanban_task_prompt(content)
+    except Exception:  # pragma: no cover - fail-open
+        return False
+
+
 # ── settled 机制（"已定案"独立状态位，与 superseded/stale 语义分离）───────
 # 语义三分（owner 钉）：
 #   superseded = 这条错了/过时，被新结论顶替（有 superseded_by 接替行）
@@ -766,6 +812,24 @@ def _row_source_profile(item: Dict[str, Any]) -> Optional[str]:
     return str(sp)
 
 
+def _scheduled_pending_fold_out(row: Dict[str, Any]) -> bool:
+    """scheduled 门 (owner 2026-11-12): a PENDING scheduled row is folded out
+    of the auto-inject face — it surfaces ONLY via the due-wake face (Step 3).
+
+    A scheduled row is a "future item with a due point": before due_at it is
+    WAITING, not live context, so injecting it pre-due would clog the recall
+    hot-zone with not-yet-due noise (the exact "越用越脏" failure this gate
+    exists to prevent). Once resolved (status done/dismissed) the row is no
+    longer pending and is no longer folded — it may auto-inject like any
+    settled memory. Pure predicate, zero I/O, zero LLM (code-side only, per
+    the owner's '读侧代码侧更准' ruling)."""
+    if not isinstance(row, dict):
+        return False
+    meta = row.get("metadata") or {}
+    return (row.get("type") == "scheduled"
+            and meta.get("status") == "pending")
+
+
 def _auto_recall_eligible(row_sp: Optional[str], session_sp: Optional[str]) -> bool:
     """P0-2 hard-isolation predicate (the auto-inject face ONLY).
 
@@ -803,12 +867,16 @@ def _auto_recall_filter(pool: List[Dict[str, Any]], session_sp: Optional[str]) -
     """
     if session_sp is None:
         # fail-open for profile isolation, but the plan-type fold (PRD §10)
-        # is NOT session-scoped — a plan row never auto-injects even in the
-        # fail-open path. Fold plan rows out unconditionally; keep the rest.
+        # and the scheduled 门 fold (owner 2026-11-12) are NOT session-scoped:
+        # a plan row and a PENDING scheduled row never auto-inject even in the
+        # fail-open path (a scheduled row surfaces ONLY via the due-wake face,
+        # Step 3 — pre-due it is "waiting", not live context). Fold both out
+        # unconditionally; keep the rest.
         return [r for r in pool
                 if not (isinstance(r, dict)
                         and (r.get("type") == "plan"
-                             or (r.get("metadata") or {}).get("plan_id")))]
+                             or (r.get("metadata") or {}).get("plan_id")
+                             or _scheduled_pending_fold_out(r)))]
     try:
         return [
             r for r in pool
@@ -816,6 +884,9 @@ def _auto_recall_filter(pool: List[Dict[str, Any]], session_sp: Optional[str]) -
             # (0) plan-type fold (PLAN-type PRD §10): plan rows NEVER auto-inject
             and not (r.get("type") == "plan"
                      or (r.get("metadata") or {}).get("plan_id"))
+            # (scheduled 门, owner 2026-11-12): PENDING scheduled rows never
+            # auto-inject — they surface only via the due-wake face (Step 3).
+            and not _scheduled_pending_fold_out(r)
             and _auto_recall_eligible(_row_source_profile(r), session_sp)
             and not ((r.get("metadata") or {}).get("superseded"))
             and not ((r.get("metadata") or {}).get("settled"))
@@ -4334,6 +4405,21 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     f"FileMem: P1 relay-block cut {_relay_folded} item(s) "
                     f"(host relay-block rows folded out of the auto-inject "
                     f"face; store + search face unaffected)")
+            # KANBAN read-side fold (owner 红线 2026-11-12：任何和 kanban
+            # 相关的整卡不进自动注入面，555e 实证 12935 字节 100% 卡片污染)。
+            # 与 P1 relay-fold 同构：单源谓词 _kanban_pollution_fold（复用写
+            # 入口检测器 _is_kanban_task_prompt，双特征硬门，提及 t_xxx 的
+            # 干净经验行零误杀）；行留在 store + 显式 search 面，只砍自动注入
+            # 面；零 I/O、零新参数。DELIVER 一行 audit log（与 relay fold 同
+            # 姿势，可观测）。
+            _kanban_pre = len(results)
+            results = [r for r in results if not _kanban_pollution_fold(r)]
+            _kanban_folded = _kanban_pre - len(results)
+            if _kanban_folded:
+                logger.info(
+                    f"FileMem: kanban-card cut {_kanban_folded} item(s) "
+                    f"(whole kanban task cards folded out of the auto-inject "
+                    f"face; store + search face unaffected)")
             # P1-2 修复 2：topic_mismatch 选项（owner 裁决 2 = A）— 只折"带
             # session 戳的跨 session confirmed 行"，保留无 session 戳全局
             # 骨架 + 当前 session 自己的 confirmed 行（精确治串、零误伤）。
@@ -4981,9 +5067,16 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 # source _relay_pollution_fold) — otherwise a poison-row
                 # frozen BEFORE the A leg landed would keep re-injecting
                 # on every cold-start replay of this session.
+                # KANBAN replay fold (owner 红线 2026-11-12): whole kanban
+                # task cards are dropped from the frozen snapshot exactly
+                # like the live prefetch face (single source
+                # _kanban_pollution_fold) — otherwise a kanban card frozen
+                # before the leg landed keeps re-injecting on every
+                # cold-start replay of this session.
                 if _auto_inject_eligible(row, session_sp,
                                           getattr(self, "session_id", None)) \
-                        and not _relay_pollution_fold(row):
+                        and not _relay_pollution_fold(row) \
+                        and not _kanban_pollution_fold(row):
                     any_row_kept = True
                     break
             if any_row_kept:
@@ -5058,6 +5151,16 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # session_end — the engine drops post_llm_call/on_session_end
         # returns, so this session's next pre_llm_call is the visible face).
         turn_line = self._turn_report_line(cur_sid)
+        # scheduled 门 due-wake (owner 2026-11-12, Step 3): a DUE pending
+        # scheduled row is surfaced on THIS pre_llm_call face regardless of
+        # whether there are pending drafts — so it is folded into turn_line
+        # (which every return path below carries: gated session, empty
+        # pending, exception leg, and the normal notice). Code-side only:
+        # _scheduled_due_block compares due_at <= now, zero LLM. Fail-soft:
+        # the scanner returns "" when nothing is due or the shard is unreadable.
+        _sched_block = self._scheduled_due_block(session_id=cur_sid)
+        if _sched_block:
+            turn_line = (turn_line + "\n" + _sched_block).strip()
         if notice_state.get(cur_sid, False):
             return self._join_context(recall_context, turn_line)
         storage_dir = getattr(self, "storage_dir", None)
@@ -5576,10 +5679,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             kind = it.get("kind", "l0")
             # t_plan_slice4: plan-probe panel entries (kind="plan_probe") show
             # their synthetic id so the consumption call can address them.
-            if kind == "plan_probe":
+            if kind in ("plan_probe", "scheduled"):
                 lines.append(
                     f"  {i}. [{level}] {content}  "
-                    f"(probe id: {it.get('id')})")
+                    f"({kind.replace('_probe', '_probe') if kind == 'plan_probe' else 'sched id'}: {it.get('id')})")
             else:
                 lines.append(f"  {i}. [{level}] {content}")
         # t_plan_slice4: a mixed batch with plan-probe entries needs a second
@@ -5587,12 +5690,17 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # draft rows still use action="confirm"/"discard". Branch on presence
         # rather than on a single uniform footer.
         _has_probe = any(it.get("kind") == "plan_probe" for it in pending)
+        _has_sched = any(it.get("kind") == "scheduled" for it in pending)
         _disposal = "请调用 clarify（确认保存/丢弃/取消），确认后调 " \
                     'filemem_review_drafts(action="confirm"/"discard") 批量处置。'
         if _has_probe:
             _disposal += (" 检测到多步计划（plan_probe 条目）：确认存为持久 plan 用 "
                           'filemem_review_drafts(action="plan_probe", verdict="save", '
                           'memory_id=<probe id>)；不存用 verdict="dismiss"（两者都消耗面板条目）。')
+        if _has_sched:
+            _disposal += (" 检测到到期事项（scheduled 条目）：确认存为到期提醒用 "
+                          'filemem_review_drafts(action="scheduled", verdict="confirm", '
+                          'memory_id=<sched id>[, due_at=ISO时间戳])；不存用 verdict="dismiss"（两者都消耗面板条目）。')
         return (
             "\n\n[记忆报告] 以下记忆将保存/已自动生成，可批量处置：\n"
             + "\n".join(lines)
@@ -9710,7 +9818,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     "properties": {
                         "type": {
                             "type": "string",
-                            "enum": ["preference", "fact", "decision", "task", "plan"],
+                            "enum": ["preference", "fact", "decision", "task", "plan", "scheduled"],
                             "description": "Type of memory. READ/SEARCH-compatible shard selector (filemem_search / filemem_read / filemem_supersede key on it). On the WRITE face (filemem_write) this is a HINT, not a directive: the row's actual shard is decided by content-based type detection, so passing type='plan' does NOT land a row in plan.json (the plan shard is written ONLY via the probe+clarify confirm chain / filemem_plan, slice-4 owner ruling 2026-10-17)."
                         },
                         "content": {
@@ -9768,7 +9876,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         },
                         "type": {
                             "type": "string",
-                            "enum": ["all", "preference", "fact", "decision", "task", "plan"],
+                            "enum": ["all", "preference", "fact", "decision", "task", "plan", "scheduled"],
                             "description": "Optional memory-type filter: recall only items of this type (a shard slice of the memory pool; 'all' or omitted = full pool including episodic + knowledge extensions)."
                         },
                         "window": {
@@ -9823,7 +9931,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         },
                         "type": {
                             "type": "string",
-                            "enum": ["preference", "fact", "decision", "task", "plan"],
+                            "enum": ["preference", "fact", "decision", "task", "plan", "scheduled"],
                             "description": "Optional: the shard/type the new correcting row should land in. Defaults to the type of the old row."
                         },
                         "level": {
@@ -10167,6 +10275,60 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     },
                     "required": ["id"]
                 }
+            },
+            {
+                "name": "filemem_scheduled",
+                "description": "Manage the 'scheduled' memory type — due-at wake-ups a user explicitly wants revisited at a set time. action='suggest' is the WRITE face (LLM proposes; lands a PENDING panel entry, NOT the pool — the user confirms via filemem_review_drafts(action='scheduled', verdict='confirm') before it lands into scheduled.json). action='list' recalls scheduled rows (default status='pending'). action='resolve' is the user's verdict on a due row: verdict='done'|'dismissed'|'postpone' (postpone requires new_due_at). Semantics: due_at is a strict ISO timestamp compared purely by CODE at wake time (zero LLM on the due face); on_due_do records WHAT to do at due time; expects records what result counts as success (REQUIRED when action_kind='auto'); action_kind='remind' means only remind the user, never auto-execute (human TODOs are always 'remind')." + _FILEMEM_ROUTING_POINTER,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["suggest", "list", "resolve"],
+                            "description": "suggest = LLM proposes a scheduled row (lands a pending panel entry); list = recall scheduled rows; resolve = user verdict on a due row"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "suggest: a human description of the future item"
+                        },
+                        "due_at": {
+                            "type": "string",
+                            "description": "suggest: strict ISO timestamp (may be left blank to fill at confirm time, ruling (b)); resolve(postpone): uses new_due_at"
+                        },
+                        "action_kind": {
+                            "type": "string",
+                            "enum": ["auto", "remind"],
+                            "description": "suggest: 'auto' = at due time auto-run on_due_do and verify against expects; 'remind' = only remind the user, never auto-execute"
+                        },
+                        "on_due_do": {
+                            "type": "string",
+                            "description": "suggest: the concrete instruction to act on at due time (required; keep it directly executable)"
+                        },
+                        "expects": {
+                            "type": "string",
+                            "description": "suggest: what result counts as success (required when action_kind='auto'; may be omitted for 'remind')"
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "done", "dismissed", "all"],
+                            "description": "list only: which status to recall (default 'pending')"
+                        },
+                        "sched_id": {
+                            "type": "string",
+                            "description": "resolve only: the scheduled row id to act on"
+                        },
+                        "verdict": {
+                            "type": "string",
+                            "enum": ["done", "dismissed", "postpone"],
+                            "description": "resolve only: the user's verdict on the due row"
+                        },
+                        "new_due_at": {
+                            "type": "string",
+                            "description": "resolve(postpone) only: the new strict ISO due timestamp"
+                        }
+                    },
+                    "required": ["action"]
+                }
             }
         ]
 
@@ -10218,6 +10380,281 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         with self._shard_lock(f):
             with open(f, "w", encoding="utf-8") as fh:
                 json.dump(rows, fh, ensure_ascii=False, indent=2)
+
+    # ── scheduled 门 (owner 2026-11-12): due-at wake-up, code-side time compare ──
+    # A distinct 6th MEMORY_TYPE. Rows carry due_at (ISO timestamp, compared
+    # purely by code at wake time — ZERO LLM on the read/due face), on_due_do
+    # (what to do at due time) + expects (what result counts as success;
+    # REQUIRED when action_kind="auto"). Write is LLM-suggest -> pending-confirm
+    # panel (kind="scheduled") -> user nod -> lands here. Read side: NOT
+    # auto-injected; recalled only via filemem_search(type="scheduled") or the
+    # due-wake face (Step 3).
+
+    def _scheduled_shard_path(self) -> "Path":
+        return self.memories_dir / "scheduled.json"
+
+    def _scheduled_load_rows(self) -> List[Dict[str, Any]]:
+        f = self._scheduled_shard_path()
+        if not f.exists():
+            return []
+        try:
+            with self._shard_lock(f):
+                with open(f, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _scheduled_write_rows(self, rows: List[Dict[str, Any]]) -> None:
+        f = self._scheduled_shard_path()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        with self._shard_lock(f):
+            with open(f, "w", encoding="utf-8") as fh:
+                json.dump(rows, fh, ensure_ascii=False, indent=2)
+
+    def _scheduled_suggest(self, args: Dict) -> Dict[str, Any]:
+        """Write-face: LLM proposes a scheduled row -> lands a PENDING panel
+        entry (kind="scheduled"), NOT the confirmed pool. User confirms via
+        filemem_review_drafts(action="scheduled", verdict="confirm") to land
+        it into scheduled.json. (b) ruling: due_at is filled at confirm time;
+        (a) ruling: due_at is a strict ISO timestamp."""
+        content = (args.get("content") or "").strip()
+        due_at = (args.get("due_at") or "").strip()
+        kind = args.get("action_kind") or "remind"
+        on_due = (args.get("on_due_do") or "").strip()
+        expects = (args.get("expects") or "").strip()
+        if not content:
+            return {"success": False, "error": "content is required"}
+        if kind not in ("auto", "remind"):
+            return {"success": False,
+                    "error": "action_kind must be 'auto' or 'remind'"}
+        if not on_due:
+            return {"success": False,
+                    "error": "on_due_do is required (what to do at due time)"}
+        if kind == "auto" and not expects:
+            return {"success": False,
+                    "error": "action_kind='auto' requires 'expects' "
+                             "(what result counts as success)"}
+        # (a): due_at is a strict ISO timestamp IF provided. It MAY be left
+        # blank here and filled at confirm time ((b) ruling); if provided it
+        # must parse.
+        if due_at:
+            try:
+                datetime.fromisoformat(due_at)
+            except Exception:
+                return {"success": False,
+                        "error": f"due_at must be an ISO timestamp, got {due_at!r}"}
+        marker = {
+            "kind": "scheduled",
+            "content": content,
+            "due_at": due_at,
+            "action_kind": kind,
+            "on_due_do": on_due,
+            "expects": expects,
+            "ts": _utcnow().isoformat(),
+        }
+        self._scheduled_probe_push(marker)
+        return {"success": True,
+                "note": "建议已落待确认面板（kind=scheduled），"
+                        "需你 confirm 才写入 scheduled.json"}
+
+    def _scheduled_probe_push(self, marker: Dict[str, Any]) -> None:
+        """Push a PENDING scheduled marker through the clarify panel, exactly
+        mirroring _plan_probe_push: a synthetic panel id + a side-stamped
+        marker table, consumed by filemem_review_drafts(action="scheduled")."""
+        import hashlib as _hl
+        sid = getattr(self, "_turn_active_sid", None) or self.session_id or "default"
+        probe_id = "scheduled_probe_" + _hl.md5(
+            ((marker.get("content", "") + "\n" + marker.get("on_due_do", "")).encode("utf-8"))
+        ).hexdigest()[:12]
+        panel_content = "\n".join([
+            f"[scheduled:{marker.get('action_kind')}] {marker.get('content')}",
+            f"  due-at: {marker.get('due_at') or '(confirm 时补)'}",
+            f"  on-due-do: {marker.get('on_due_do')}",
+            f"  expects: {marker.get('expects') or '(remind，无自动验收)'}",
+        ])
+        tbl = getattr(self, "_scheduled_probe_markers", None)
+        if not isinstance(tbl, dict):
+            tbl = {}
+            self._scheduled_probe_markers = tbl
+        tbl.setdefault(sid, {})[probe_id] = marker
+        cap = getattr(self, "_pending_confirm_cap", 50)
+        st = tbl[sid]
+        for stale in list(st.keys())[:max(0, len(st) - cap)]:
+            st.pop(stale, None)
+        self._push_pending_confirm(sid, probe_id, "L2", panel_content,
+                                   kind="scheduled")
+
+    def _scheduled_confirm(self, marker: Dict[str, Any]) -> Dict[str, Any]:
+        """Lands a confirmed scheduled row into scheduled.json."""
+        content = (marker.get("content") or "").strip()
+        due_at = (marker.get("due_at") or "").strip()
+        kind = marker.get("action_kind") or "remind"
+        on_due = (marker.get("on_due_do") or "").strip()
+        expects = (marker.get("expects") or "").strip()
+        if not due_at:
+            # confirm 时补的 due_at（(b)）必填——唤醒要有一个可比的到期点。
+            return {"success": False,
+                    "error": "due_at is required at confirm time"}
+        try:
+            datetime.fromisoformat(due_at)
+        except Exception:
+            return {"success": False,
+                    "error": f"due_at must be an ISO timestamp, got {due_at!r}"}
+        now = _utcnow().isoformat()
+        sched_id = f"sched_{now.replace(':', '')}_{uuid.uuid4().hex[:8]}"
+        row = {
+            "id": sched_id,
+            "type": "scheduled",
+            "content": content,
+            "level": "L2",
+            "source": "confirmed_draft",
+            "created_at": now,
+            "updated_at": now,
+            "metadata": {
+                "due_at": due_at,
+                "action_kind": kind,
+                "on_due_do": on_due,
+                "expects": expects,
+                "status": "pending",
+                "source_profile": getattr(self, "source_profile", None),
+            },
+        }
+        rows = self._scheduled_load_rows()
+        rows.append(row)
+        self._scheduled_write_rows(rows)
+        self._sm_notify([sched_id])
+        return {"success": True, "sched_id": sched_id, "status": "pending"}
+
+    def _scheduled_due_rows(self, now_iso: Optional[str] = None,
+                            status: str = "pending") -> List[Dict[str, Any]]:
+        """Step 3 due-wake scanner (DETERMINISTIC, zero LLM): return the
+        scheduled rows that are DUE by pure code-side time comparison.
+
+        A row is due iff its metadata.due_at is a parseable ISO timestamp
+        <= `now` (default: the provider's current UTC clock) AND its status
+        is `pending` (default; a done/dismissed row is not re-surfaced).
+        This is the owner's '读侧代码侧更准' ruling made concrete: the due
+        verdict is a timestamp compare, never an LLM guess — the read face
+        only ever asks 'is this due?', and the LLM's job (via
+        _SCHEDULED_WAKE_PROMPT) is limited to 'what to do / report' AFTER
+        the code has established the row is due.
+
+        Fail-soft: an unreadable / missing shard returns [] (the wake face
+        is advisory, it must never block the pre_llm_call turn)."""
+        rows = self._scheduled_load_rows()
+        now = (now_iso or _utcnow().isoformat())
+        try:
+            now_ts = datetime.fromisoformat(now).timestamp()
+        except Exception:
+            return []
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            if status != "all" and (r.get("metadata") or {}).get("status") != status:
+                continue
+            due = (r.get("metadata") or {}).get("due_at") or ""
+            if not due:
+                continue
+            try:
+                due_ts = datetime.fromisoformat(due).timestamp()
+            except Exception:
+                continue  # unparseable due_at: never treat as due (conservative)
+            if due_ts <= now_ts:
+                out.append(r)
+        out.sort(key=lambda r: ((r.get("metadata") or {}).get("due_at") or "",
+                                 str(r.get("id") or "")))
+        return out
+
+    def _scheduled_due_block(self, session_id: Optional[str] = None) -> str:
+        """The user-visible due-wake notice block for the pre_llm_call face.
+
+        Surfaces ONLY due+pending scheduled rows (code-side, zero LLM on the
+        detection). If none are due -> empty string (silent, same posture as
+        _turn_report_line's empty-pending). The block lists each due row's
+        fields (content / due-at / 到期动作 / 验收 / action_kind / sched_id)
+        and hands the wake-up instruction to the model via
+        _SCHEDULED_WAKE_PROMPT: for auto rows run on_due_do + verify against
+        expects + report; for remind rows only remind. The user's verdict
+        (done / dismissed / postpone) then lands through
+        filemem_scheduled(action="resolve"). Folded into turn_line at the top
+        of _pending_draft_notice so it survives every return path — a session
+        with no drafts but a due row still gets the reminder."""
+        due = self._scheduled_due_rows(status="pending")
+        if not due:
+            return ""
+        lines = [f"[到期事项] 以下 {len(due)} 条 scheduled 已到点"
+                 f"（纯代码比 due_at 得出，零 LLM 判定）："]
+        for i, r in enumerate(due, 1):
+            m = r.get("metadata") or {}
+            lines.append(
+                f"  {i}. [{m.get('action_kind') or 'remind'}] {r.get('content')}"
+                f"\n     due-at: {m.get('due_at')}"
+                f"\n     到期动作: {m.get('on_due_do')}"
+                f"\n     验收: {m.get('expects') or '(remind，无自动验收)'}"
+                f"\n     sched_id: {r.get('id')}")
+        lines.append(_SCHEDULED_WAKE_PROMPT)
+        lines.append("拍板（处理/推迟/取消）：filemem_scheduled(action='resolve', "
+                     "sched_id=..., verdict='done'|'dismissed'|'postpone')。")
+        return "\n".join(lines)
+
+    def _scheduled_list(self, args: Dict) -> Dict[str, Any]:
+        status = args.get("status") or "pending"
+        rows = self._scheduled_load_rows()
+        out = []
+        for r in rows:
+            if status != "all" and (r.get("metadata") or {}).get("status") != status:
+                continue
+            out.append(r)
+        return {"success": True, "count": len(out), "rows": out}
+
+    def _scheduled_resolve(self, args: Dict) -> Dict[str, Any]:
+        """User's verdict on a due/scheduled row: done / dismissed / postpone."""
+        sched_id = args.get("sched_id")
+        verdict = args.get("verdict")  # done | dismissed | postpone
+        new_due = (args.get("new_due_at") or "").strip()
+        if not sched_id or verdict not in ("done", "dismissed", "postpone"):
+            return {"success": False,
+                    "error": "sched_id + verdict(done|dismissed|postpone) required"}
+        if verdict == "postpone" and not new_due:
+            return {"success": False,
+                    "error": "postpone requires new_due_at (ISO timestamp)"}
+        if verdict == "postpone":
+            try:
+                datetime.fromisoformat(new_due)
+            except Exception:
+                return {"success": False,
+                        "error": f"new_due_at must be an ISO timestamp, got {new_due!r}"}
+        rows = self._scheduled_load_rows()
+        target = next((r for r in rows if r.get("id") == sched_id), None)
+        if target is None:
+            return {"success": False, "error": f"no scheduled row with id {sched_id!r}"}
+        meta = target.setdefault("metadata", {})
+        if verdict == "postpone":
+            meta["due_at"] = new_due
+            meta["status"] = "pending"
+        else:
+            meta["status"] = verdict
+        target["updated_at"] = _utcnow().isoformat()
+        self._scheduled_write_rows(rows)
+        # Audit via the shared append-only channel (EP-1/EP-2 posture): one row
+        # per resolve into consolidation_log.jsonl. Fail-soft: an audit hiccup
+        # must never break the resolve.
+        try:
+            _log_path = self.storage_dir / "consolidation_log.jsonl"
+            _entry = {
+                "ts": _utcnow().isoformat(),
+                "kind": "scheduled_resolve",
+                "sched_id": sched_id,
+                "verdict": verdict,
+                "new_due_at": new_due or None,
+            }
+            with open(_log_path, "a", encoding="utf-8") as _fh:
+                _fh.write(json.dumps(_entry, ensure_ascii=False) + "\n")
+        except Exception as _e:
+            logger.warning(f"FileMem: scheduled resolve audit failed: {_e}")
+        return {"success": True, "sched_id": sched_id, "status": meta.get("status")}
 
     def _reconcile_default_verifiers(self) -> Dict[str, Any]:
         """PLAN-type PRD §8: production-default on-disk verifier surface.
@@ -10458,6 +10895,27 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             })
         except Exception as e:
             return json.dumps({"error": f"gate5_worldview_upsert failed: {e}", "ok": False})
+
+    def _tool_scheduled(self, args: Dict) -> str:
+        """filemem_scheduled tool — suggest / list / resolve.
+
+        Returns a JSON string (the host's tool-result contract). Fail-soft:
+        any unexpected error is caught and returned as {"error": ...}.
+        """
+        action = args.get("action")
+        try:
+            if action == "suggest":
+                return json.dumps(self._scheduled_suggest(args), ensure_ascii=False)
+            elif action == "list":
+                return json.dumps(self._scheduled_list(args), ensure_ascii=False)
+            elif action == "resolve":
+                return json.dumps(self._scheduled_resolve(args), ensure_ascii=False)
+            else:
+                return json.dumps({"error": f"unknown action {action!r}; "
+                                            f"expected suggest/list/resolve"})
+        except Exception as e:
+            logger.error(f"FileMem: filemem_scheduled action={action!r} failed: {e}")
+            return json.dumps({"error": str(e)})
 
     def _tool_plan(self, args: Dict) -> str:
         """PLAN-type PRD §6: filemem_plan tool — list / create / advance.
@@ -10946,6 +11404,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 return self._tool_handoff_extract(args)
             elif tool_name == "filemem_plan":
                 return self._tool_plan(args)
+            elif tool_name == "filemem_scheduled":
+                return self._tool_scheduled(args)
             elif tool_name == "gate5_worldview_upsert":
                 return self._tool_gate5_worldview_upsert(args)
             else:
@@ -12020,6 +12480,102 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     "action": "plan_probe",
                     "verdict": "dismiss",
                     "memory_id": str(memory_id),
+                })
+
+        # ── scheduled 门 consumption path (owner 2026-11-12) ───────────────
+        # Mirror of the plan_probe path: a PENDING scheduled marker
+        # (kind="scheduled", side-stamped in _scheduled_probe_markers) is
+        # the user's nod surface. verdict="confirm" lands the row into
+        # scheduled.json via _scheduled_confirm (the ONLY writer of the
+        # scheduled shard); verdict="dismiss" consumes the panel and
+        # writes nothing. due_at is REQUIRED at confirm time ((b) ruling).
+        if action == "scheduled":
+            verdict = args.get("verdict")
+            if not memory_id:
+                return json.dumps({
+                    "success": False,
+                    "error": "scheduled requires memory_id (the probe panel "
+                              "id from the [记忆报告] panel, "
+                              "'scheduled_probe_<hash>')",
+                })
+            if verdict not in ("confirm", "dismiss"):
+                return json.dumps({
+                    "success": False,
+                    "error": f"scheduled verdict must be 'confirm' or "
+                              f"'dismiss', got {verdict!r}",
+                })
+            # due_at filled at confirm time ((b)): the user supplies it here
+            # when they confirm; carried on the marker if the LLM pre-filled.
+            confirm_due_at = (args.get("due_at") or "").strip()
+            sid = self.session_id or "default"
+            sp = getattr(self, "source_profile", None)
+            new_iso = _utcnow().isoformat()
+            markers = getattr(self, "_scheduled_probe_markers", None) or {}
+            marker = (markers.get(sid) or {}).get(str(memory_id))
+            if marker is None:
+                # In-memory table lost (gateway restart / cross-profile):
+                # reject the confirm (cannot safely land), consume the panel.
+                self._consume_pending_confirm(sid, ids=[str(memory_id)],
+                                               kind="scheduled")
+                if verdict == "confirm":
+                    return json.dumps({
+                        "success": False,
+                        "error": f"scheduled marker {memory_id!r} not found "
+                                  f"(in-memory table lost); nothing written, "
+                                  f"panel consumed",
+                    })
+                return json.dumps({
+                    "success": True, "action": "scheduled",
+                    "verdict": "dismiss", "memory_id": str(memory_id),
+                    "note": "marker already gone; panel consumed",
+                })
+            if verdict == "confirm":
+                marker = dict(marker)
+                if confirm_due_at:
+                    marker["due_at"] = confirm_due_at
+                confirm_res = self._scheduled_confirm(marker)
+                if not confirm_res.get("success"):
+                    # Confirm failed (e.g. missing due_at) -> do NOT consume
+                    # the panel; re-report next turn, retryable.
+                    return json.dumps({
+                        "success": False,
+                        "error": f"scheduled confirm failed: "
+                                 f"{confirm_res.get('error')}",
+                    })
+                self._append_consolidation_event({
+                    "ts": new_iso,
+                    "action": "scheduled_confirmed",
+                    "probe_id": str(memory_id),
+                    "sched_id": confirm_res.get("sched_id"),
+                    "content": marker.get("content"),
+                    "due_at": marker.get("due_at"),
+                    "action_kind": marker.get("action_kind"),
+                    "source_profile": sp,
+                })
+                self._consume_pending_confirm(sid, ids=[str(memory_id)],
+                                               kind="scheduled")
+                return json.dumps({
+                    "success": True,
+                    "action": "scheduled",
+                    "verdict": "confirm",
+                    "memory_id": str(memory_id),
+                    "sched_id": confirm_res.get("sched_id"),
+                    "due_at": marker.get("due_at"),
+                    "action_kind": marker.get("action_kind"),
+                })
+            else:  # dismiss
+                self._append_consolidation_event({
+                    "ts": new_iso,
+                    "action": "scheduled_dismissed",
+                    "probe_id": str(memory_id),
+                    "content": marker.get("content"),
+                    "source_profile": sp,
+                })
+                self._consume_pending_confirm(sid, ids=[str(memory_id)],
+                                               kind="scheduled")
+                return json.dumps({
+                    "success": True, "action": "scheduled",
+                    "verdict": "dismiss", "memory_id": str(memory_id),
                 })
 
         # ── Historical-draft target path ───────────────────────────────────
