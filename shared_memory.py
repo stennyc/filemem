@@ -241,10 +241,27 @@ _ensure_pg_dep_paths()
 
 
 class _PgConn:
-    """最小 PG 连接封装 (psycopg2 惰性 import, 缺失 -> no-op)。"""
+    """最小 PG 连接封装 (psycopg2 惰性 import, 缺失 -> no-op)。
+
+    缺 driver 时 (做法 3, owner 2026-11-12): 不再静默让 ModuleNotFoundError
+    向上冒到调用方 fail-soft (那样只打 'No module named psycopg2', 用户不知
+    要装什么)。这里单独 catch ImportError, 打一条【可执行修复指令】
+    (<sys.executable> -m pip install psycopg2-binary), 再 raise 保留原
+    fail-soft 语义 (调用方 except 接住 -> status=skipped, 本地面零影响)。
+    """
 
     def __init__(self, pg: Dict[str, Any]):
-        import psycopg2  # 惰性: 未装则整条路径 no-op, 不炸 filemem
+        try:
+            import psycopg2  # 惰性: 未装则走下面的 ImportError 引导面
+        except ImportError as _imp_err:
+            # 缺 driver = 中央池门关着。给一条人/运维能直接复制跑的修复指令,
+            # 而非裸 ModuleNotFoundError (owner 做法 3: 声明 + 友好引导)。
+            logger.warning(
+                "shared_memory: psycopg2 driver missing (central pool gated "
+                "off, local file face unaffected) — fix: %s -m pip install "
+                "psycopg2-binary (see requirements.txt); central pool stays "
+                "fail-soft until then", sys.executable)
+            raise
         self._pg = pg
         self._conn = psycopg2.connect(
             host=pg["host"], port=int(pg["port"]), dbname=pg["db"],

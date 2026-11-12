@@ -1,0 +1,17 @@
+# filemem 第三方依赖（仅"跨设备中央共享池"门需要；本地文件面零依赖）
+#
+# filemem 本体是零外部依赖（纯 JSON/Markdown on disk，graceful degradation）。
+# 下面这两个包只服务 S2-v3 的"中央 PostgreSQL 共享池"（跨设备参考记忆）：
+#   - psycopg2-binary: host 侧连 PG 的 driver。缺它 = 中央池门 fail-soft 静默
+#     关闭（本地数据面不受影响），但每次 initialize 会打一条 WARNING。
+#   - PyYAML: 解析 config.yaml 的 shared_memory 段（宿主已有则 no-op）。
+#
+# 宿主加载 plugin 时【不会】自动装依赖（Hermes 设计立场：缺 driver 时优雅
+# 降级，不强装）。所以新环境首次启用中央池门时，请显式跑一次：
+#   <当前解释器> -m pip install -r requirements.txt
+# 例如本机 host tools-python:
+#   /root/.hermes/tools/python-3.14.9+20261021-linux-x64/bin/python3 \
+#     -m pip install -r requirements.txt
+
+psycopg2-binary
+PyYAML
