@@ -4195,8 +4195,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     # face, never re-enters a cold-start replay. Idempotent via
                     # the session-keyed one-shot gate (already-asked / answered
                     # / no-target all yield ''), so a later ordinary prefetch
-                    # for the same session does NOT re-fire. Without this,
-                    # the footer was only appended on the ordinary-prefetch tail
+                    # for the same session does NOT re-fire. Without this, the
+                    # footer was only appended on the ordinary-prefetch tail
                     # (L3537), and a session that cold-starts through the P3
                     # replay branch would NEVER surface the bring-back question.
                     return self._pending_draft_notice(
@@ -4212,42 +4212,6 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 logger.info(
                     f"FileMem: P3 cold-start block fully cut by P0-2 isolation "
                     f"for session={session_id}; re-prefetching live")
-                try:
-                    p = self._injected_snapshot_path(session_id)
-                    if p is not None and p.exists():
-                        p.unlink()
-                    _tok = p.with_suffix(".tokens") if p is not None else None
-                    if _tok is not None and _tok.exists():
-                        _tok.unlink()
-                except Exception:
-                    pass
-        # P3-continuation（2026-11-11 owner「修 filemem」指令，555e 实证缺口）：
-        # cold-start replay 只盖进程首轮回放；同一 session 内后续普通轮
-        # （_p3_replay_armed 已消费）每轮重跑 search+渲染 → 注入块字节逐轮漂
-        # （555e：67→11→109→168 行）→ provider 前缀缓存从 user 尾部起逐轮失效
-        # （read 锁死 8192）。本面：本轮 query 与快照 query Jaccard ≥ 0.85
-        # （复用 _load_injected_snapshot 现成门控，与 cold-start 同源同阈值，
-        # 零新参数）→ 直接回放冻结块（跳 search / 跳渲染 / 跳 reinforce 写面，
-        # 字节与快照逐字节一致）；换任务（Jaccard < 0.85）→ 落回下方 live
-        # search + 尾部重冻结快照（现状零变化）。脚注/handoff 尾与 cold-start
-        # 路径同构：只叠 return 面、不进快照（不 re-fire）。fail-soft：快照读
-        # 失败（缺 .tokens / 损坏）→ _load_injected_snapshot 返回 None → 本面
-        # 不触发，现状路径零变化。
-        elif session_id:
-            _cont_snap = self._load_injected_snapshot(session_id, query)
-            if _cont_snap:
-                _cont_snap = self._filter_replayed_snapshot(_cont_snap)
-                if _cont_snap:
-                    logger.info(
-                        f"FileMem: P3-continuation replay for session={session_id} "
-                        f"({len(_cont_snap)} chars frozen block; live search skipped, "
-                        f"tail bytes stable for provider prefix cache)")
-                    return self._pending_draft_notice(
-                        _cont_snap + self._bringback_clarify_footer(
-                            session_id, user_query=query),
-                        session_id=session_id)
-                # 隔离面全切 → 与 cold-start 同款处理：丢弃陈旧冻结块，
-                # 落回 live 重算（重冻结正确块），不留陈旧块给下轮。
                 try:
                     p = self._injected_snapshot_path(session_id)
                     if p is not None and p.exists():
