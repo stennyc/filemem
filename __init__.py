@@ -10635,7 +10635,12 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 f"\n     到期动作: {m.get('on_due_do')}"
                 f"\n     验收: {m.get('expects') or '(remind，无自动验收)'}"
                 f"\n     sched_id: {r.get('id')}")
-        lines.append(_SCHEDULED_WAKE_PROMPT)
+        # User-visible instruction lines ONLY (internal LLM-facing
+        # _SCHEDULED_WAKE_PROMPT placeholder text is NOT spliced here —
+        # reviewer 2026-11-12 nit + smoke: the notice face must not leak
+        # the internal template / {each:...} placeholder to the user).
+        lines.append("处置规则：auto 型先执行「到期动作」并按「验收」判成败，把结果回报"
+                     "用户拍「成/败/重做」；remind 型只提醒，不代做。")
         lines.append("拍板（处理/推迟/取消）：filemem_scheduled(action='resolve', "
                      "sched_id=..., verdict='done'|'dismissed'|'postpone')。")
         return "\n".join(lines)

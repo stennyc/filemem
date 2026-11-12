@@ -209,10 +209,30 @@ def test_due_block_lists_only_due_pending_rows(p):
     block = p._scheduled_due_block()
     assert "due-now" in block
     assert "not-due" not in block
-    # the wake prompt + the resolve verdict path are both in the block
-    assert "auto" in block or "remind" in block
+    # user-visible instruction + the resolve verdict path are both in the block
+    assert "处置规则" in block
     assert "resolve" in block
-    assert "on_due_do" not in block or True  # field is rendered as 到期动作
+    # the LLM-facing field names are rendered as user-facing Chinese labels
+    assert "到期动作" in block
+    assert "on_due_do" not in block
+
+
+def test_due_block_does_not_leak_internal_prompt(p):
+    """reviewer 2026-11-12 nit + smoke: the pre_llm_call notice face must
+    NOT splice the internal _SCHEDULED_WAKE_PROMPT template (with its
+    '以下是 N 条' header + {each:...} placeholder) into the user-visible
+    [到期事项] block. The block carries ONLY the per-row fields + a short
+    user-facing instruction + the resolve verdict line."""
+    _land_scheduled(p, content="due-now", due_at="2026-01-01T00:00:00")
+    block = p._scheduled_due_block()
+    assert block  # non-empty for a due row
+    assert "以下是 N 条" not in block            # internal template header
+    assert "{each:" not in block                # internal placeholder
+    # the internal LLM prompt constant still EXISTS and is untouched (used by
+    # a future LLM face), it just is not what this notice face renders.
+    from __init__ import _SCHEDULED_WAKE_PROMPT
+    assert _SCHEDULED_WAKE_PROMPT and "以下是 N 条" in _SCHEDULED_WAKE_PROMPT
+    assert _SCHEDULED_WAKE_PROMPT not in block
 
 
 def test_due_block_empty_when_nothing_due(p):
