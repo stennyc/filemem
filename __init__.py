@@ -301,6 +301,22 @@ _PLAN_LAND_SIGNALS = (
     "spec landed", "PRD landed", "spec file",
 )
 
+# scheduled 门 (owner 2026-11-12): WIDE due-signal markers — layer A (strong) of
+# _scheduled_probe's two-layer pre-screen. These are concrete "future due-point"
+# markers in the content the user/agent just said. Deliberately WIDE (owner
+# ruling: over-feed the LLM, the LLM+confirm double gate is the backstop —
+# an over-trigger costs one budget-gated LLM call, an under-feed means the
+# scheduled 门 never fires and the whole feature sleeps):
+_SCHEDULED_DUE_SIGNALS = (
+    # CJK due-point / conditional-trigger markers:
+    "重启完", "跑完", "build 完", "等它", "等 build", "等部署完",
+    "下周", "明天", "3 天后", "3天后", "X 天后", "一周后", "再验", "复查",
+    "到时", "届时", "提醒我", "通知我", "等我", "之后", "等会儿", "回头",
+    # English mirrors (same width):
+    "after the", "once the", "when the", "remind me", "notify me",
+    "next week", "tomorrow", "in a day", "in three days",
+)
+
 # M1/M3 single source of truth: structural markers of a *room/group transcript*
 # (or system scaffolding) that must never be stored as a durable fact/preference.
 # A's ingress predicate (current-turn aperture) and M1's batch-extract gate both
@@ -6362,6 +6378,27 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         logger.info(
                             f"FileMem: plan-probe marker pushed from sync_turn "
                             f"assistant report (title={_marker.get('title')!r})")
+                # scheduled 门 live probe (owner 2026-11-12, Step 4): mirror of
+                # the plan-probe text fallback above — _scheduled_probe's two-
+                # layer WIDE pre-screen (due-signal word OR scheduled-regex) is
+                # the cost gate; a miss is a silent no-op, a hit pushes a
+                # PENDING panel via the existing Step-1 _scheduled_probe_push
+                # (the clarify confirm chain lands it into scheduled.json).
+                if assistant_content:
+                    try:
+                        _smarker = self._scheduled_probe(assistant_content)
+                        if _smarker is not None:
+                            self._scheduled_probe_push(_smarker)
+                            logger.info(
+                                f"FileMem: scheduled-probe marker pushed from "
+                                f"sync_turn assistant report "
+                                f"(content={_smarker.get('content')!r})")
+                    except Exception as _se:
+                        # Fail-soft: a probe failure must never block the turn
+                        # (mirrors the plan-probe mount's except posture).
+                        logger.warning(
+                            f"FileMem: scheduled-probe sync_turn mount failed "
+                            f"({_se}); skipped")
             except Exception as _e:
                 logger.debug(f"FileMem: sync_turn plan-probe skipped: {_e}")
 
@@ -8066,6 +8103,97 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         if source_tag == "raw":
             return (raw, trigger, "raw")
         return (refined, trigger, source_tag)
+
+    def _scheduled_probe(self, content: str) -> Optional[Dict[str, Any]]:
+        """scheduled 门 (owner 2026-11-12): budget-gated host-LLM DUE-TODO PROBE.
+
+        Mirrors _plan_probe exactly (owner ruling "搬活体自动探测，照 plan_probe
+        模板"): the accuracy layer behind a deterministic two-layer pre-screen
+        (wide due-signal regex, "宁可多探 + LLM/confirm 双门兜底" — owner
+        2026-11-12). The LLM face (consolidation.llm_caller.probe_scheduled)
+        decides whether content the USER/AGENT just said is a FUTURE due-at
+        commitment ("重启完让我跑一轮 X 验证" / "下周再验 Y" / "等 build 完通知我").
+        A hit emits a PENDING marker (kind="scheduled") the caller pushes through
+        _scheduled_probe_push -> _push_pending_confirm(kind="scheduled") ->
+        the existing Step-1 clarify confirm chain (filemem_review_drafts
+        action="scheduled"). It NEVER writes a row; only a confirmed user nod
+        lands a scheduled.json row.
+
+        Budget gate (avoid per-item LLM cost explosion): per-session cap
+        _scheduled_probe_limit (default 3, tunable via decay.json
+        scheduled_probe.llm_per_session; 0/missing/invalid = feature off).
+        Over-cap returns None WITHOUT issuing a call. decay scheduled_probe.enable
+        flag = clean rollback switch.
+
+        Fail-soft (never blocks the save / turn): no main_runtime / over-cap /
+        both prescreen layers miss / any host failure -> None. The probe call
+        runs OUTSIDE any write lock (mirrors _plan_probe / _reclassify_type_llm
+        posture) so a slow host call never sits inside a held flock.
+        """
+        # Decay rollback switch: malformed/absent block defaults enabled.
+        st_cfg = (getattr(self, "_decay", None) or {}).get("scheduled_probe") or {}
+        if not st_cfg.get("enable", True):
+            return None
+        limit = getattr(self, "_scheduled_probe_limit", 3)
+        if not isinstance(limit, int) or limit <= 0:
+            return None
+        main_runtime = self._live_main_runtime()
+        if not main_runtime:
+            return None  # standalone / non-host: zero call
+        sid = getattr(self, "_turn_active_sid", None) or self.session_id or "default"
+        budget = getattr(self, "_scheduled_probe_budget", None)
+        if not isinstance(budget, dict):
+            budget = {}
+            self._scheduled_probe_budget = budget
+        if budget.get(sid, 0) >= limit:
+            logger.info(f"FileMem: scheduled-probe budget hit ({sid} >= {limit}), "
+                        f"skipping probe")
+            return None
+        # TWO-LAYER pre-screen is now single-layer (owner 2026-11-12): the wide
+        # _SCHEDULED_DUE_SIGNALS table is the ONLY cost gate — the LLM probe
+        # face has the final say, and scheduled is write-side-only (exempt from
+        # the auto-land regex table, test_regex_is_zero_llm_and_table_driven's
+        # scheduled exemption), so there is no second regex layer to fall
+        # through to. A miss is a silent no-op (the wide table over-triggers
+        # feeding; the LLM+confirm double gate is the backstop, so over-feed
+        # is cheap, under-feed is not — owner 2026-11-12).
+        content_lower = (content or "").lower()
+        due_hit = any(s.lower() in content_lower for s in _SCHEDULED_DUE_SIGNALS)
+        _sched_last_decision = (
+            "prescreen_pass" if due_hit else "prescreen_skip"
+        )
+        try:
+            self._scheduled_probe_last_decision = _sched_last_decision
+            self._scheduled_probe_last_seen = (
+                content if due_hit else None)
+        except Exception:
+            pass  # partial instance (__new__ in tests without the attrs)
+        if not due_hit:
+            return None
+        try:
+            llm = _load_llm_caller()
+            res = llm.probe_scheduled(main_runtime, content)  # fail-soft inside
+            self._append_llm_call_telemetry(llm, "probe_scheduled")
+        except Exception as e:
+            # Charge the ATTEMPT (mirrors _plan_probe "charge the attempt, not
+            # the success") so a persistent host-down cannot retry every signal.
+            budget[sid] = budget.get(sid, 0) + 1
+            logger.warning(f"FileMem: scheduled-probe loader failed ({e}); skipping")
+            return None
+        budget[sid] = budget.get(sid, 0) + 1
+        if not res.get("probe"):
+            return None
+        marker = {
+            "kind": "scheduled",
+            "content": res.get("content") or (content or "").strip()[:80],
+            "due_at": res.get("due_at_hint") or "",
+            "action_kind": res.get("action_kind") or "remind",
+            "on_due_do": res.get("on_due_do") or "",
+            "expects": res.get("expects") or "",
+            "source_content": (content or "").strip()[:400],
+            "ts": _utcnow().isoformat(),
+        }
+        return marker
 
     def _plan_probe(self, content: str) -> Optional[Dict[str, Any]]:
         """t_plan_slice4: budget-gated host-LLM plan-PROBE face.

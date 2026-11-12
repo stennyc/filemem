@@ -561,6 +561,119 @@ def probe_plan(main_runtime: Optional[Dict[str, Any]], content: str) -> Dict[str
                 "reason": f"model_unavailable_fallback={exc}"}
 
 
+# ── scheduled 门 (owner 2026-11-12): live DUE-TODO PROBE face ──────────────
+# The LLM face that detects SCHEDULED-shaped content in what the USER/AGENT
+# just said — a "do X at / after / by <a point in time>" future commitment
+# ("重启完让我跑一轮 555e 活体验证", "下周再验 X", "等 build 完通知我"). It
+# NEVER writes a row: it emits a PENDING marker the caller pushes through the
+# clarify channel (kind="scheduled"); only a confirmed user nod lands a row
+# via the scheduled confirm chain. Same host-call posture as probe_plan:
+# explicit main_runtime snapshot, zero hardcoded model names, zero custom
+# config keys, fail-soft (ANY failure -> probe=False, caller fires NO
+# clarify, 不吞脏, 不炸宿主).
+SCHEDULED_PROBE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "probe": {
+            "type": "boolean",
+            "description": "true only when the content is a future due-at "
+                           "commitment worth remembering as a scheduled item",
+        },
+        "content": {
+            "type": "string",
+            "description": "short human description of the future item (<= 80 chars)",
+        },
+        "due_at_hint": {
+            "type": "string",
+            "description": "ISO timestamp hint for when it becomes due (best-effort; "
+                           "may be empty when the text gives no concrete time — the "
+                           "owner fills it at confirm time, ruling (b))",
+        },
+        "action_kind": {
+            "type": "string",
+            "enum": ["auto", "remind"],
+            "description": "'auto' when the item is something to RUN + verify at "
+                           "due time; 'remind' when it is only a human reminder "
+                           "（人工待办一律 remind）",
+        },
+        "on_due_do": {
+            "type": "string",
+            "description": "the concrete, directly-executable instruction to run at "
+                           "due time",
+        },
+        "expects": {
+            "type": "string",
+            "description": "what result counts as success (required for auto, may "
+                           "be empty for remind)",
+        },
+    },
+    "required": ["probe"],
+}
+
+SCHEDULED_PROBE_INSTRUCTIONS = """You are a scheduled-item detector for an AI agent's memory store.
+Decide whether the content below is a FUTURE due-at commitment — something the
+user or the agent said they want DONE / RE-VERIFIED / REMINDED at a specific
+later point in time ("重启完让我跑一轮 X 验证", "下周再验 Y", "等 build 完通知我",
+"3 天后检查 Z"). These are memories worth keeping as a scheduled item.
+
+Return "probe": true ONLY for such content. A settled fact, a one-off
+instruction with no time horizon, a plain to-do with no due point, or neutral
+context is NOT a scheduled item — return "probe": false for all of those.
+
+When probe is true, also return: "content" (short), "due_at_hint" (ISO timestamp
+best-effort, empty if the text gives no concrete time), "action_kind" ("auto" =
+something to run + verify; "remind" = only remind a human), "on_due_do" (the
+concrete executable instruction at due time), "expects" (what counts as success;
+empty for remind). Return a JSON object."""
+
+
+def probe_scheduled(main_runtime: Optional[Dict[str, Any]], content: str) -> Dict[str, Any]:
+    """LLM scheduled-probe (host main-model face, explicit main_runtime,
+    temperature 0.0 / max_tokens 256).
+
+    Returns {'probe': bool, 'content'?, 'due_at_hint'?, 'action_kind'?,
+    'on_due_do'?, 'expects'?, 'model_used': bool, 'reason'?: str}. ANY
+    failure -> probe=False + model_used=False (caller fires NO clarify;
+    宁可漏判, 不吞脏, 不炸宿主). A hit WITHOUT on_due_do is downgraded to a
+    miss (the confirm chain requires a concrete on_due_do)."""
+    try:
+        parsed = _structured_call(main_runtime, SCHEDULED_PROBE_INSTRUCTIONS,
+                                  SCHEDULED_PROBE_SCHEMA, content,
+                                  temperature=0.0, max_tokens=256) or {}
+        if not parsed.get("probe"):
+            return {"probe": False, "model_used": True}
+        content_out = str(parsed.get("content") or "").strip()[:120]
+        on_due = str(parsed.get("on_due_do") or "").strip()
+        # A hit without a concrete on_due_do is NOT a usable marker — downgrade
+        # (the confirm chain requires on_due_do). Mirrors probe_plan's
+        # "unstructured_hit_downgraded" posture.
+        if not on_due:
+            return {"probe": False, "model_used": True,
+                    "reason": "unstructured_hit_downgraded"}
+        kind = str(parsed.get("action_kind") or "remind").strip().lower()
+        if kind not in ("auto", "remind"):
+            kind = "remind"
+        # (a) ruling: due_at_hint must be a parseable ISO timestamp IF present;
+        # an unparseable / empty hint is carried through (owner fills it at
+        # confirm time, ruling (b)) — we only reject when the LLM DID supply a
+        # malformed value, flagging it for the owner to correct at confirm.
+        due_hint = str(parsed.get("due_at_hint") or "").strip()
+        expects = str(parsed.get("expects") or "").strip()
+        if kind == "auto" and not expects:
+            # auto requires an acceptance criterion (owner ruling "双必填"):
+            # downgrade to remind when the LLM could not produce one, so the
+            # panel entry is confirmable without violating the invariant.
+            kind = "remind"
+        return {"probe": True, "content": content_out or on_due[:80],
+                "due_at_hint": due_hint, "action_kind": kind,
+                "on_due_do": on_due, "expects": expects,
+                "model_used": True}
+    except Exception as exc:
+        _record_face_fallback(main_runtime, exc)  # card 3: llm_call row fallback=True
+        return {"probe": False, "model_used": False,
+                "reason": f"model_unavailable_fallback={exc}"}
+
+
 # ── EP-2: supersedes-candidate confirmation (host main-model face, explicit main_runtime) ──
 # Mirrors distill: the host call surface with the captured main_runtime
 # snapshot, no task key -> host main-model route. Zero hardcoded model

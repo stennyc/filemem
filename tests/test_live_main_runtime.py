@@ -108,16 +108,17 @@ def test_11_gate_sites_are_wired():
     """All LLM-face gate sites read through _live_main_runtime (not the
     raw getattr), so the live-read guarantee covers every face. Static
     check against the source (no execution of the faces themselves). The
-    expected count tracks the registered face count (15 as of draft-refine
-    face, 2026-11-08: the original 11 + handoff_extract gate + pin->tail
-    summary gate + plan-probe LLM gate + draft-refine gate) — bump it in
-    lock-step when a new LLM face lands."""
+    expected count tracks the registered face count (16 as of the scheduled
+    live-probe face, 2026-11-12: the original 11 + handoff_extract gate +
+    pin->tail summary gate + plan-probe LLM gate + draft-refine gate +
+    scheduled-probe LLM gate) — bump it in lock-step when a new LLM face
+    lands."""
     src = (Path(__file__).resolve().parents[1] / "__init__.py").read_text()
-    # 15 call sites (incl. handoff face 1 + pin-tail face 3 + plan-probe +
-    # draft-refine face 1, 2026-11-08) + 1 method definition = 16 occurrences
-    # (bump in lock-step when a new LLM face lands)
-    assert src.count("self._live_main_runtime()") == 15, \
-        f"expected 15 gate call sites, found {src.count('self._live_main_runtime()')}"
+    # 16 call sites (incl. handoff face 1 + pin-tail face 3 + plan-probe +
+    # draft-refine face 1 + scheduled-probe face 1, 2026-11-12) + 1 method
+    # definition = 17 occurrences (bump in lock-step when a new LLM face lands)
+    assert src.count("self._live_main_runtime()") == 16, \
+        f"expected 16 gate call sites, found {src.count('self._live_main_runtime()')}"
     assert src.count("def _live_main_runtime(") == 1
     # No bare main_runtime gate may remain on the LLM-face path
     assert 'if not getattr(self, "_main_runtime", None):' not in src, \
