@@ -2624,6 +2624,19 @@ class FileMemProvider(MemoryProvider):
         self._type_classify_limit: int = 5
         self._type_classify_budget: Dict[str, int] = {}
 
+        # 2026-11-12 (owner 收口): plan_probe / scheduled_probe live-body LLM
+        # probe faces — per-session budget dicts, seeded here at construct
+        # time so they persist ACROSS calls on the real provider path (the
+        # lazy-init inside _plan_probe / _scheduled_probe stays as a safety
+        # net for partial-__new__ test instances only). Limits stay code-
+        # default 3 here; initialize() overrides them from decay.json
+        # plan_probe/scheduled_probe.llm_per_session (the wiring that was
+        # previously a dead docstring promise — see the initialize() block).
+        self._plan_probe_limit: int = 3
+        self._plan_probe_budget: Dict[str, int] = {}
+        self._scheduled_probe_limit: int = 3
+        self._scheduled_probe_budget: Dict[str, int] = {}
+
         self._llm_ctx = None
         # LLM 显式化◎ (t_32980f71): the host main_runtime snapshot (dict
         # {model, provider, base_url, api_key, api_mode} captured at
@@ -2901,6 +2914,25 @@ class FileMemProvider(MemoryProvider):
                 self._draft_refine_limit = _mrd_lps
         else:
             self._draft_refine_limit = 0
+
+        # 2026-11-12 (owner 收口: probe budget 接线): apply the decay
+        # plan_probe / scheduled_probe blocks to the two live-body LLM probe
+        # faces. Before this these two knobs were documented in each face's
+        # docstring as "tunable via decay.json X.llm_per_session" but were
+        # NEVER wired — the faces only ever read the code-side getattr
+        # default of 3, so the docstring promise was dead. enable=False is
+        # the clean rollback switch (limit -> 0 = face off), same one-way
+        # data flow as the memory_draft_refine block above (read decay,
+        # write self attr, never write back into self._decay).
+        for _pblock in ("plan_probe", "scheduled_probe"):
+            _pcfg = self._decay.get(_pblock) or {}
+            _plim_attr = f"_{_pblock}_limit"
+            if not _pcfg.get("enable", True):
+                setattr(self, _plim_attr, 0)
+            else:
+                _plps = _pcfg.get("llm_per_session")
+                if isinstance(_plps, int) and _plps >= 0:
+                    setattr(self, _plim_attr, _plps)
 
         # Ensure base files exist
         self._ensure_base_files()

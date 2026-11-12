@@ -415,4 +415,18 @@ DECAY_DEFAULTS = {
         "enable": True,
         "llm_per_session": 5,
     },
+    # 2026-11-12 (owner 收口: probe budget 接线): the two live-body LLM probe
+    # faces (plan-probe live detection + scheduled due-todo live detection)
+    # are wired to decay.json plan_probe/scheduled_probe blocks in
+    # FileMemProvider.initialize() — kept in lockstep with decay.json per
+    # the S2 egress parity test (the ONLY tolerated top-level drift between
+    # the two files is `search`, as before).
+    "plan_probe": {
+        "enable": True,
+        "llm_per_session": 3,
+    },
+    "scheduled_probe": {
+        "enable": True,
+        "llm_per_session": 3,
+    },
 }

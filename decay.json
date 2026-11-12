@@ -150,5 +150,13 @@
   "memory_type": {
     "enable": true,
     "llm_per_session": 5
+  },
+  "plan_probe": {
+    "enable": true,
+    "llm_per_session": 3
+  },
+  "scheduled_probe": {
+    "enable": true,
+    "llm_per_session": 3
   }
 }
