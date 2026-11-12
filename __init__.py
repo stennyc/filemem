@@ -17446,6 +17446,47 @@ def register(ctx) -> None:
     ctx.register_memory_provider(provider)
     logger.info("FileMem: registered memory provider")
 
+    # Plugin tool-surface (owner 2026-11-12, 对齐 kb 的 register_tool 链路):
+    # filemem 此前只有 memory provider 面（宿主 inject_memory_provider_tools 追加 14
+    # 个 schema 到 agent.tools，但 tools.registry 里没有这些名字 → tool_search 的
+    # deferred catalog 查不到 → 模型不可见/不可调）。补上 plugin 面：对 14 个工具逐个
+    # ctx.register_tool 进 tools.registry（toolset="filemem"），让宿主 tool_search
+    # 的 _classify_source/_registry_toolset 能查到它们（对齐 knowledge-base-search 的做法）。
+    #
+    # 设计（零重复 schema 源，单一真源）:
+    #  - schema: 直接取 provider.get_tool_schemas() 的 dict（与 LLM 直连面同源，不手抄）
+    #  - handler: 复用 provider.handle_tool_call 的既有 dispatch（包成 free handler，
+    #    保留 provider 实例的方法绑定；与 register() 里 _get_cached_provider(home:default)
+    #    拿到的 provider 是同一实例，写侧路由无分叉）
+    #  - 宿主侧 ctx.register_tool 自带 fail-soft：override 未授权/同名冲突 → 只 warning，
+    #    不会让整个 register() 崩（#23194 invariant）
+    _schemas = provider.get_tool_schemas()
+    _registered = 0
+    for _schema in _schemas:
+        _tname = _schema.get("name") if isinstance(_schema, dict) else None
+        if not _tname:
+            continue
+        # handler(args: dict, **kw) -> str；闭包捕获 _tname + provider 实例
+        def _mk_handler(tname=_tname, prov=provider):
+            def _handler(args, **kw):
+                return prov.handle_tool_call(tname, args, **kw)
+            _handler.__name__ = f"filemem_{tname}"
+            return _handler
+        try:
+            ctx.register_tool(
+                name=_tname,
+                toolset="filemem",
+                schema=_schema,
+                handler=_mk_handler(),
+                emoji="🧠",
+                description=_schema.get("description", ""),
+            )
+            _registered += 1
+        except Exception as _e:
+            # fail-soft: 单个工具注册失败（如 override 被门禁拒）不阻断其余 13 个
+            logger.warning(f"FileMem: register_tool({_tname}) failed: {_e}")
+    logger.info(f"FileMem: registered plugin tool surface ({_registered}/{len(_schemas)} tools, toolset='filemem')")
+
     # Memory-toolset self-heal (2026-10-11): the host gates external-provider
     # tool injection on the BUILT-IN 'memory' toolset being present in the
     # platform's saved platform_toolsets list. Append it idempotently so a
