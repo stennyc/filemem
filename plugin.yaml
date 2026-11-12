@@ -16,3 +16,10 @@ provides_tools:
 - shared_memory_search
 - shared_memory_handoff
 - shared_memory_take
+# 补列：__init__.py 已实现但 plugin.yaml 漏声明的 6 个（对齐宿主工具面注册）
+- filemem_supersede
+- filemem_plan
+- gate5_worldview_upsert
+- filemem_set_bringback
+- filemem_handoff_extract
+- filemem_scheduled
