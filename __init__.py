@@ -4236,6 +4236,22 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         return "# Filemem\nYou have access to file-based memory with keyword-overlap search.\nUse the filemem tools to read and write memories.\n\nMemory Tiers:\n- L0: Environment facts (auto-saved)\n- L1: Operational经验 (confirmed at session end)\n- L2: Architecture decisions (requires explicit confirmation)"
 
     def prefetch(self, query: str, *, session_id: str = "", confidence: float = 0.5) -> str:
+        # C1 OBSERVABILITY (owner 2026-11-12, 临时打点, 零行为改动): 包装所有
+        # return 路径单点计时。_c1_entry → _c1_exit = filemem 本体耗时。对照宿主
+        # memory_manager 那条 "prefetch timed out after 8.0s" 的 join 起点 (宿主日志
+        # 里同一 turn 的 "prefetch timed out" WARNING 时间戳), 量出 8s 窗口里
+        # filemem 本体占多少:  (a) exit-entry 接近 8s -> 真凶在 filemem 内 (search/
+        #  BM25 重建);  (b) exit-entry << 8s 但宿主仍 8s join -> 真凶在 filemem 外
+        #  (同进程 tick 线程排队 / host spill_if_oversized / 3.14 import 冷启动摊入)。
+        # 验完即删 (回退: 恢复原 def prefetch(...)->str 体, 去掉 _c1 两行 + 改名)。
+        _c1_entry = time.perf_counter()
+        _c1_out = self._prefetch_body(query, session_id=session_id, confidence=confidence)
+        _c1_exit = time.perf_counter()
+        logger.info(f"C1-PREFETCH-EXIT sid={session_id!r} dur_ms={( _c1_exit - _c1_entry ) * 1000:.0f} "
+                    f"out_len={len(_c1_out or '')}")
+        return _c1_out
+
+    def _prefetch_body(self, query: str, *, session_id: str = "", confidence: float = 0.5) -> str:
         """Return formatted recall context for the upcoming turn.
 
         Args:
