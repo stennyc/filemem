@@ -2838,6 +2838,20 @@ class FileMemProvider(MemoryProvider):
         # a base home with no profiles/ segment is the default profile.
         self.source_profile = self._resolve_profile_name(self.hermetis_home)
 
+        # D1 (2026-11-12): per-provider corpus pool cache. The search face
+        # (prefetch -> search_memories) used to re-scan the WHOLE corpus
+        # (memories shards + episodic rglob + knowledge) on EVERY call — at
+        # this store's size that single call was what blew the host's 8.0s
+        # prefetch join budget (4x "prefetch timed out after 8.0s" in the
+        # 2026-11-11/12 coder-profile logs). The pool is now cached at the
+        # provider level and invalidated ONLY when a shard/episodic/knowledge
+        # source file actually changes on disk (mtime+size signature, a
+        # <1ms stat probe). A hot session with a steady corpus pays ONE scan
+        # then O(1) dict reuse on every later turn; any write-face RMW bumps
+        # a source file's signature -> next search re-scans (no staleness).
+        self._corpus_pool_cache: Optional[List[Dict]] = None
+        self._corpus_pool_sig: Optional[tuple] = None
+
         # M6 Plan A skill isolation: procedural entries land in the GLOBAL
         # local_semantic layer (never auto-written into a per-profile skill).
         self.local_semantic_dir = self.storage_dir / "local_semantic"
@@ -9274,6 +9288,76 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             return query
         return query + " " + " ".join(extra)
 
+    def _corpus_signature(self) -> tuple:
+        """mtime+size signature over the three corpus sources that feed the
+        search pool (the D1 cache key). O(dir stat), zero content read — a
+        sub-millisecond probe. Any change to any source file -> a new tuple
+        -> cache miss -> one rebuild. fail-soft: any stat hiccup returns a
+        cache-busting tuple (forces a re-scan), never a crash of the read
+        face. The signature is taken over the UN-SLICED corpus: a mem_type
+        slice still runs the targeted single-shard read (the cache would be
+        the whole corpus, pricier than one shard open)."""
+        parts: List[tuple] = []
+        try:
+            for st in MEMORY_TYPES:
+                p = self.memories_dir / f"{st}.json"
+                if p.exists():
+                    s = p.stat()
+                    parts.append((str(p), s.st_mtime_ns, s.st_size))
+            if self.episodic_dir is not None and self.episodic_dir.exists():
+                for sh in sorted(self.episodic_dir.rglob("*.jsonl")):
+                    s = sh.stat()
+                    parts.append((str(sh), s.st_mtime_ns, s.st_size))
+            kp = getattr(self, "knowledge_entries_path", None)
+            if kp is not None and kp.exists():
+                s = kp.stat()
+                parts.append((str(kp), s.st_mtime_ns, s.st_size))
+        except OSError:
+            return ("corpus-scan-failed", time.time_ns())  # bust the cache
+        return tuple(parts)
+
+    def _cached_all_memories(self) -> List[Dict]:
+        """Return the full, UN-filtered search pool (memories + episodic +
+        knowledge), reusing the provider-level D1 cache keyed on
+        _corpus_signature(). The cache holds the RAW corpus; every existing
+        filter/slice/window/lineage predicate in search_memories still runs
+        on the FRESH COPY returned here — byte-identical results, only the
+        repeated disk re-scan is elided on a steady corpus. include_fixture
+        is always False here: the hot face (prefetch) never sets it, and the
+        M4 test face (include_fixture=True) deliberately bypasses this
+        method (it reads fixture seeds that a False-built cache lacks)."""
+        sig = self._corpus_signature()
+        # getattr-guard: the cache fields are set in initialize() (and in
+        # __init__'s defaults); a __new__-built test fixture skips both and
+        # has no cache attrs. A missing cache = "cold" -> rebuild below
+        # (fail-soft, never crash the read face). On the fixture the
+        # assignment below still lands the attrs for the call's duration.
+        cached = getattr(self, "_corpus_pool_cache", None)
+        if cached is not None and getattr(self, "_corpus_pool_sig", None) == sig:
+            return list(cached)  # shallow copy: caller filters freely
+        # -- rebuild (cold / invalidated) ----------------------------------
+        pool: List[Dict] = []
+        for shard_type in MEMORY_TYPES:
+            mem_file = self.memories_dir / f"{shard_type}.json"
+            if not mem_file.exists():
+                continue
+            # S4-T2 (S4-③): keep the corrupt-check UNDER the shard lock
+            # (identical to the pre-D1 inline scan).
+            with self._shard_lock(mem_file):
+                items = self._read_memories_file(mem_file)
+            pool.extend(
+                item for item in items
+                if isinstance(item, dict) and not MemoryItem.from_dict(item).is_expired())
+        # M4 cross-session recall: the episodic layer is in the pool.
+        pool.extend(self._load_episodic_pool(include_fixture=False))
+        # Gold knowledge layer: active entries, tier-boosted.
+        for k in self._load_knowledge_pool():
+            k["knowledge_tier_boost"] = True
+            pool.append(k)
+        self._corpus_pool_cache = pool
+        self._corpus_pool_sig = sig
+        return list(pool)
+
     def search_memories(self, query: str, limit: int = 5, min_score: float = 0.3,
                         ranking: str = "decay", include_fixture: bool = False,
                         window: Optional[Dict[str, Any]] = None,
@@ -9371,27 +9455,58 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 f"invalid mem_type {mem_type!r}: expected None/'all' or one "
                 f"of {MEMORY_TYPES}")
         _type_sliced = mem_type in MEMORY_TYPES
-        all_memories = []
-        for shard_type in MEMORY_TYPES:
-            # mem_type slice: a concrete category reads ONLY its own shard
-            # (the other 3 are never even opened); None / "all" reads all
-            # 4 — the byte-identical full pool.
-            if _type_sliced and shard_type != mem_type:
-                continue
-            mem_file = self.memories_dir / f"{shard_type}.json"
-            if not mem_file.exists():
-                continue
-            # S4-T2 (S4-③): the corrupt check runs UNDER the shard lock (the
-            # write-face RMW already locks; the read choke locks here) so a
-            # corrupt-file heal (rename + empty rebuild + audit row) can't
-            # race a concurrent writer. _read_memories_file is the single
-            # source: a bad active file self-heals instead of silently killing
-            # the recall face.
-            with self._shard_lock(mem_file):
-                items = self._read_memories_file(mem_file)
-            all_memories.extend(
-                item for item in items
-                if isinstance(item, dict) and not MemoryItem.from_dict(item).is_expired())
+        # D1: pull the raw corpus from the provider-level cache instead of a
+        # per-call full re-scan. Two paths:
+        #   * _type_sliced  -> a concrete-category slice opens ONLY its own
+        #     shard (the cache would be the whole corpus, pricier). Read that
+        #     one shard directly (targeted, pre-D1 behavior preserved).
+        #   * NOT sliced     -> the hot face (prefetch) and the M4 face:
+        #       - include_fixture=False (prefetch): the cache, keyed on the
+        #         corpus signature, elides the repeated disk re-scan on a
+        #         steady corpus. Every filter below still runs on the fresh
+        #         copy, so results are byte-identical.
+        #       - include_fixture=True (M4 test harness): bypass the cache
+        #         (it is built with include_fixture=False and would miss the
+        #         fixture seeds) and rebuild inline.
+        if _type_sliced:
+            all_memories: List[Dict] = []
+            mem_file = self.memories_dir / f"{mem_type}.json"
+            if mem_file.exists():
+                with self._shard_lock(mem_file):
+                    items = self._read_memories_file(mem_file)
+                all_memories.extend(
+                    item for item in items
+                    if isinstance(item, dict) and not MemoryItem.from_dict(item).is_expired())
+            # a concrete-category slice EXCLUDES the episodic + knowledge
+            # extension rows (type="episodic" / no type field) — the filter
+            # cuts the pool at assembly time, before any axis construction.
+        elif include_fixture:
+            # M4 test face: fixture seeds only exist with the flag on; the
+            # D1 cache is built at include_fixture=False, so it cannot serve
+            # this path. Rebuild inline (low-frequency test face only).
+            all_memories = []
+            for shard_type in MEMORY_TYPES:
+                mem_file = self.memories_dir / f"{shard_type}.json"
+                if not mem_file.exists():
+                    continue
+                with self._shard_lock(mem_file):
+                    items = self._read_memories_file(mem_file)
+                all_memories.extend(
+                    item for item in items
+                    if isinstance(item, dict) and not MemoryItem.from_dict(item).is_expired())
+            _episodic = self._load_episodic_pool(include_fixture=include_fixture)
+            if profile_scope is not None:
+                _episodic = _auto_recall_filter(_episodic, profile_scope)
+            all_memories.extend(_episodic)
+            for k in self._load_knowledge_pool():
+                k["knowledge_tier_boost"] = True
+                all_memories.append(k)
+        else:
+            # prefetch hot path: one scan per corpus change, O(1) dict reuse
+            # afterwards. The cache holds the UN-filtered corpus
+            # (memories + episodic + knowledge); the P0-2 / lineage / window
+            # predicates below run on the fresh copy, unchanged.
+            all_memories = self._cached_all_memories()
 
         # P0-2: read-side hard isolation — the auto face restricts the pool to
         # the session's own source_profile + neutral unstamped rows; the
@@ -9460,31 +9575,15 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 if _supersession_confirmed(it)
             ]
 
-        # M4: cross-session recall — the episodic layer must be in the pool.
-        # P0-2: when the auto face is isolated, the episodic extension is ALSO
-        # filtered by the same row predicate (episodic rows carry the row-level
-        # source_profile stamp; a cross-profile shard row is cut, neutral rows
-        # are kept). The explicit face (profile_scope None) keeps the full
-        # episodic pool — an M4 user who explicitly searched stays uncut.
-        # mem_type: a concrete-category slice EXCLUDES the episodic extension
-        # (episodic rows carry type="episodic", not a MEMORY_TYPES member) —
-        # same pre-axis pool cut as the window predicate.
-        if not _type_sliced:
-            _episodic = self._load_episodic_pool(include_fixture=include_fixture)
-            if profile_scope is not None:
-                _episodic = _auto_recall_filter(_episodic, profile_scope)
-            all_memories.extend(_episodic)
-
-        # Gold 知识层：active 知识条目进检索面，带 tier boost（knowledge 置顶语义，
-        # @data-engineer 检索面第 6 条：复用现有 keyword 打分 + 零新索引/零新依赖，
-        # 只加一条来源标记 + 置顶系数；第二轴 topic 分桶/TF-IDF 维持 Won't）。
-        # mem_type: a concrete-category slice EXCLUDES knowledge rows too
-        # (they carry no type field — they are a separate extension layer,
-        # not one of the 4 memory types).
-        if not _type_sliced:
-            for k in self._load_knowledge_pool():
-                k["knowledge_tier_boost"] = True
-                all_memories.append(k)
+        # D1: the episodic + knowledge extension rows now ride the D1 cache
+        # (prefetch / non-sliced path) or the include_fixture inline rebuild
+        # above — the old separate `if not _type_sliced:` extension blocks
+        # were removed so those rows are not added TWICE. The P0-2
+        # profile_scope predicate still filters the cached/inline corpus at
+        # the single choke point below (byte-identical: it used to filter
+        # each extension layer separately, but the predicate is
+        # row-level, so filtering the merged pool == the union of
+        # per-layer filters).
 
         # SA2-2: time-window predicate — executes AFTER pool assembly,
         # BEFORE any axis/rank construction: RRF + legacy scoring see the
