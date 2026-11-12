@@ -4952,6 +4952,43 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         if len(lines) <= 1 and not block.strip().startswith("["):
             # Not a [type] line format — not a recall block; fail-open keep.
             return block
+        # KANBAN replay fold (owner 红线 2026-11-12) — stateful per-physical-line
+        # pass, runs BEFORE the by_content pool match (the multi-line card body
+        # lines cannot be pool-matched individually; only the card HEAD line
+        # carries the `# Kanban task t_` marker, and the body lines that follow
+        # it up to the next `[<type>]` item head belong to the same card and
+        # are dropped together). A card head line is recognized by its content
+        # opening with `# Kanban task t_` (the `_is_kanban_task_prompt`
+        # card-head window, single source with the write ingress) — the
+        # card-body `## Body` marker is NOT required here (a card body cut
+        # short in a stale freeze still carries the head line, and dropping
+        # the whole card is the safe direction: the explicit search face
+        # keeps the full card; only the auto-inject face is cut). Single
+        # source for the head-window constant; no new predicate, no new
+        # parameter, zero LLM.
+        _kanban_head_re = re.compile(
+            r"^\[task\]\s*# Kanban task t_")  # card-head, after [task] prefix
+        _kept_k: List[str] = []
+        _in_kanban_card = False
+        for line in lines:
+            s = line.strip()
+            if _in_kanban_card:
+                # A physical line is INSIDE a kanban card body until the next
+                # item-head line (`[<type>] ...`) opens a new item.
+                if re.match(r"^\[\w+\]", s):
+                    _in_kanban_card = False
+                else:
+                    continue  # drop the card body line
+            if _kanban_head_re.match(s):
+                _in_kanban_card = True
+                continue  # drop the card head line itself
+            _kept_k.append(line)
+        # Re-run the ORIGINAL pool-match fold over the kanban-stripped lines
+        # (the isolation/relay/kanban-by-pool-row legs still apply to the
+        # surviving `[<type>]` item lines).
+        block = "\n".join(_kept_k)
+        if not block.strip():
+            return ""
         # Load the FULL pool (unscoped) so a block line whose content maps to
         # a cross-profile row is CUT, not fail-open-kept (the fail-open keep
         # only applies when the content is ABSENT from the pool entirely —
@@ -5000,7 +5037,11 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             if c:
                 by_content.setdefault(c, []).append(row)
         kept_lines: List[str] = []
-        for line in lines:
+        # Iterate the KANBAN-STRIPPED lines (block = rejoin of _kept_k above),
+        # NOT the original `lines` — otherwise the kanban card lines that the
+        # strip pass dropped are re-visited here and fail-open-KEPT again
+        # (by_content miss -> keep), undoing the strip.
+        for line in block.split("\n"):
             s = line.strip()
             if not s:
                 continue
