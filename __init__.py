@@ -1642,6 +1642,18 @@ def _stamp_lineage_candidates(new_row: Dict[str, Any],
                 continue
             if new_id and str(row.get("id")) == new_id:
                 continue  # never self-supersede
+            # 复盘⑦ owner ruling: a row stamped with metadata.failure_type
+            # (the _flush failure-lesson row) is a mechanical warning, NOT a
+            # fact a newer row can "correct". If it were eligible as a
+            # supersede target, a new fact row with >=0.5 Jaccard overlap
+            # would mark it superseded=True, and the O1 auto-face fold
+            # (superseded/settled/lapsed) would drop it from the auto-inject +
+            # search pool — silently killing every prior fix that puts the
+            # failure row in the model's face. Exempt it: a stale failure
+            # lesson lapses via its L0 TTL sweep instead, or is corrected by
+            # a SEPARATE newer row (it is never the target of one).
+            if isinstance(row.get("metadata"), dict) and row["metadata"].get("failure_type"):
+                continue
             ts_raw = str(row.get("created_at") or row.get("updated_at") or "")
             # strictly older: an old row born in the same second as the new
             # one is NOT a candidate; empty old ts = oldest = candidate
@@ -1846,6 +1858,11 @@ def _c3_stamp_negation_candidates(new_row: Dict[str, Any],
                 continue
             if new_id and str(row.get("id")) == new_id:
                 continue  # never self-supersede
+            # 复盘⑦ owner ruling: same failure_type exemption as the 0.5
+            # channel — a failure-lesson row is never a negation-correction
+            # target (the O1 auto-face would fold it out on superseded=True).
+            if isinstance(row.get("metadata"), dict) and row["metadata"].get("failure_type"):
+                continue
             ts_raw = str(row.get("created_at") or row.get("updated_at") or "")
             # strictly older (same rule as the 0.5 channel): an old row born in
             # the same second is NOT a candidate; empty old ts = oldest.

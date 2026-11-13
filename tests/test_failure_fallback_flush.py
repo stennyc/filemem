@@ -412,3 +412,73 @@ def test_distill_still_washes_confirmed_on_normal_row(monkeypatch):
         after = _row_meta(td, "fact", target)
         assert after.get("confirmed") is False, \
             f"normal row should be washed to confirmed=False by LLM default; got {after.get('confirmed')!r}"
+
+
+def _make_existing_rows():
+    """Build an in-shard existing-rows list: one failure-lesson row + one
+    plain fact row, both strictly older than the new row under test."""
+    failure_row = {
+        "id": "fail_1",
+        "content": "terminal command failed with retry loop error timeout",
+        "created_at": "2026-01-01T00:00:00",
+        "metadata": {"failure_type": "retry_loop", "confirmed": True},
+    }
+    plain_row = {
+        "id": "plain_1",
+        "content": "terminal command failed with retry loop error timeout",  # same text -> high overlap
+        "created_at": "2026-01-01T00:00:00",
+        "metadata": {},
+    }
+    return [failure_row, plain_row]
+
+
+def test_stamp_lineage_does_not_supersede_failure_row():
+    # 复盘⑦: _stamp_lineage_candidates must NOT pick a metadata.failure_type
+    # row as a supersede target — otherwise a new fact row (>=0.5 overlap)
+    # marks it superseded=True and the O1 auto-face fold drops it out of the
+    # auto-inject / search pool. Pre-fix both the failure row and the plain
+    # row are eligible; post-fix only the plain row is.
+    from __init__ import _stamp_lineage_candidates
+    new_row = {
+        "id": "new_1",
+        "content": "terminal command failed with retry loop error timeout again",
+        "created_at": "2026-06-01T00:00:00",
+        "metadata": {},
+    }
+    existing = _make_existing_rows()
+    stamped = _stamp_lineage_candidates(new_row, existing, {"supersede_min_overlap": 0.5})
+    stamped_ids = {str(r.get("id")) for r in stamped}
+    assert "fail_1" not in stamped_ids, \
+        f"failure row must not be a supersede target; got stamped={stamped_ids}"
+    assert "plain_1" in stamped_ids, \
+        f"plain fact row with >=0.5 overlap must still be a target; got stamped={stamped_ids}"
+    # The new row's supersedes link points only at the plain row.
+    assert "fail_1" not in new_row["metadata"]["supersedes"]
+    assert "plain_1" in new_row["metadata"]["supersedes"]
+    # The failure row was NOT marked superseded.
+    assert existing[0].get("metadata", {}).get("superseded") in (None, False), \
+        "failure row must not be flipped superseded=True"
+    # The plain row WAS marked superseded (the exemption is scoped).
+    assert existing[1].get("metadata", {}).get("superseded") is True
+
+
+def test_c3_negation_channel_does_not_supersede_failure_row():
+    # 复盘⑦ C3 channel: the parallel negation channel must apply the SAME
+    # failure_type exemption — a negation correction must never target a
+    # failure-lesson row either.
+    from __init__ import _c3_stamp_negation_candidates
+    new_row = {
+        "id": "new_1",
+        "content": "terminal no longer times out, retry loop is fixed",
+        "created_at": "2026-06-01T00:00:00",
+        "metadata": {},
+    }
+    existing = _make_existing_rows()
+    # C3 reads the negation gate from the search cfg; the failure exemption is
+    # structural (metadata.failure_type), independent of the negation match.
+    stamped = _c3_stamp_negation_candidates(new_row, existing, {"supersede_min_overlap": 0.5})
+    stamped_ids = {str(r.get("id")) for r in stamped}
+    assert "fail_1" not in stamped_ids, \
+        f"C3 channel must also exempt failure rows; got stamped={stamped_ids}"
+    assert existing[0].get("metadata", {}).get("superseded") in (None, False), \
+        "C3 channel must not flip the failure row superseded"
