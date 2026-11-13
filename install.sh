@@ -69,10 +69,11 @@ MODE="dir"
 case "${1:-}" in
   --pip)          MODE="pip"; shift ;;
   --central)      MODE="central"; shift ;;
+  --all-profiles) MODE="all_profiles"; shift ;;
   dir|--)         MODE="dir"; shift ;;
   -h|--help)    sed -n '2,30p' "$0"; exit 0 ;;
   "")           MODE="dir" ;;
-  *) echo "unknown mode: $1 (use dir / --pip / --central)"; exit 2 ;;
+  *) echo "unknown mode: $1 (use dir / --pip / --central / --all-profiles)"; exit 2 ;;
 esac
 
 # ── target interpreter for --pip: the one running the LIVE gateway ───────────────
@@ -436,8 +437,171 @@ install_central() {
   echo "    NOTE: run this with the gateway STOPPED (stop->copy->verify->start transaction, @devops)"
 }
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# MODE: --all-profiles — enable filemem in every profile's config.yaml (idempotent
+# merge, no clobber), plus a top-level multiplex_profiles=true check.
+#
+# What it writes per profile:
+#   memory:
+#     provider: filemem
+#     filemem: {}            # (or an existing non-empty value — never overwrote)
+#   plugins:
+#     entries:
+#       filemem:             # (merged under the existing entries, no clobber)
+#         allow_tool_override: false
+#
+# What it does NOT do: it does NOT write the top-level $HERMES_HOME/config.yaml
+# (that is the default profile's config, already handled by `install_dir`); it
+# targets ONLY profiles/*/config.yaml, so a host with no profiles/ sub-dir gets
+# a "0 profiles — nothing to do" (not an error — a single-profile install has
+# no multiplexed gateway to worry about).
+#
+# multiplex_profiles check: if $HERMES_HOME/config.yaml exists and lacks
+# `multiplex_profiles: true`, print a WARNING (do NOT auto-set it — that key
+# belongs to the host's gateway topology, not to the memory provider; the
+# installer must not silently change gateway routing).
+# ═══════════════════════════════════════════════════════════════════════════════
+install_all_profiles() {
+  local PROFILES_DIR="$HERMES_HOME/profiles"
+  [ -d "$PROFILES_DIR" ] || {
+    echo "==> [all-profiles] no $PROFILES_DIR — single-profile install (nothing to do)"
+    return 0
+  }
+
+  # ── exclude list: comma-separated profile names to SKIP (owner constraint:
+  #    never touch profiles that are not meant to have filemem).  Default is
+  #    empty; the agent prompt passes FM_EXCLUDE=4d,amoi,culinary,default when
+  #    the host owner wants those kept as-is.  FM_INCLUDE (comma list, optional)
+  #    restricts to ONLY those names when set; when both are set, INCLUDE wins
+  #    and EXCLUDE is ignored (explicit allowlist overrides blocklist).
+  local INCLUDE="${FM_INCLUDE:-}" EXCLUDE="${FM_EXCLUDE:-}"
+  # comma -> space for the case guards below (case patterns need " name " tokens)
+  local _inc=" $(echo "$INCLUDE" | tr ',' ' ')" _exc=" $(echo "$EXCLUDE" | tr ',' ' ')"
+
+  # ── multiplex check (loud, never auto-set) ──────────────────────────────────
+  local TOP="$HERMES_HOME/config.yaml"
+  if [ -f "$TOP" ] && ! grep -qE '^\s*multiplex_profiles:\s*true' "$TOP"; then
+    echo "WARN: $TOP does not set multiplex_profiles: true — this host's gateway"
+    echo "     may not be in multiplex mode. The installer will NOT auto-set that"
+    echo "     key (it is host-topology, not provider config). If you intend to run"
+    echo "     a multiplexed gateway, add it manually to $TOP before the gateway"
+    echo "     restart."
+  fi
+
+  # ── per-profile enable ──────────────────────────────────────────────────────
+  local pcfg pname enabled=0 skipped=0
+  local _inc=" $INCLUDE " _exc=" $EXCLUDE "
+  for pcfg in "$PROFILES_DIR"/*/config.yaml; do
+    [ -f "$pcfg" ] || continue
+    pname="$(basename "$(dirname "$pcfg")")"
+    # INCLUDE wins: if set, only those profiles are touched
+    if [ -n "$INCLUDE" ]; then
+      case "$_inc" in *" $pname "*) : ;; *) echo "    [all-profiles] $pname: not in FM_INCLUDE — skip"; continue ;; esac
+    fi
+    # EXCLUDE: skip those profiles
+    case "$_exc" in *" $pname "*) echo "    [all-profiles] $pname: in FM_EXCLUDE — skip"; skipped=$((skipped+1)); continue ;; esac
+    echo "==> [all-profiles] $pcfg (profile: $pname)"
+
+    # 1. memory.provider: filemem — idempotent: skip if already set
+    if grep -qE '^\s*memory:' "$pcfg" && grep -qE '^\s*provider:\s*filemem' "$pcfg"; then
+      echo "    memory.provider: filemem (already set — skip)"
+    else
+      if grep -qE '^\s*memory:' "$pcfg"; then
+        # has memory: but provider not filemem — add the line under it (append if absent)
+        if ! grep -qE '^\s*provider:' "$pcfg"; then
+          "$PY" - "$pcfg" <<'PYEOF'
+import sys, re, pathlib
+p = pathlib.Path(sys.argv[1])
+txt = p.read_text()
+# find the memory: block and insert provider: filemem right after the first indent
+# that is at least 2 spaces (under memory:)
+m = re.search(r'^(\s*)memory:\s*$', txt, flags=re.M)
+if m:
+    indent = m.group(1) + "  "
+    # skip past existing keys until we find one that's not deeper-indented
+    lines = txt.split('\n')
+    mem_idx = txt[:m.end()].count('\n')
+    insert_at = mem_idx + 1
+    while insert_at < len(lines):
+        if not lines[insert_at].strip() or lines[insert_at].startswith(indent):
+            insert_at += 1
+            continue
+        break
+    lines.insert(insert_at, f"{indent}provider: filemem")
+    txt = '\n'.join(lines)
+    p.write_text(txt)
+    print(f"    appended memory.provider: filemem under existing memory: section")
+PYEOF
+        fi
+      else
+        { echo "memory:"; echo "  provider: filemem"; } >> "$pcfg"
+        echo "    appended memory.provider: filemem (new section)"
+      fi
+    fi
+
+    # 2. plugins.entries.filemem — idempotent: skip if already present
+    if grep -qE '^\s*filemem:' "$pcfg"; then
+      echo "    plugins.entries.filemem: present (skip — never clobber)"
+    else
+      # FM_EXCLUDE guard: do NOT add the plugins.entries.filemem block for
+      # excluded profiles (owner constraint: those profiles must stay untouched).
+      case "$_exc" in *" $pname "*)
+        echo "    plugins.entries.filemem: profile in FM_EXCLUDE — skip (no clobber)"
+        ;;
+        *)
+        echo "    plugins.entries.filemem: appending"
+        "$PY" - "$pcfg" <<'PYEOF'
+import sys, re, pathlib
+p = pathlib.Path(sys.argv[1])
+txt = p.read_text()
+inserted = False
+if re.search(r'^\s*plugins:\s*$', txt, flags=re.M):
+    lines = txt.split('\n')
+    out = []
+    i = 0
+    while i < len(lines):
+        out.append(lines[i])
+        if re.match(r'^\s*plugins:\s*$', lines[i]) and not inserted:
+            j = i + 1
+            found_entries = False
+            while j < len(lines):
+                if not lines[j].strip():
+                    j += 1; continue
+                if re.match(r'^\s*entries:\s*$', lines[j]):
+                    found_entries = True
+                    out.append("      filemem:")
+                    out.append("        allow_tool_override: false")
+                    inserted = True
+                    break
+                cur_indent = len(lines[j]) - len(lines[j].lstrip())
+                if cur_indent <= 2:
+                    break
+                j += 1
+            if not found_entries:
+                out.append("  entries:")
+                out.append("    filemem:")
+                out.append("      allow_tool_override: false")
+                inserted = True
+        i += 1
+    txt = '\n'.join(out)
+if not inserted:
+    txt += "\nplugins:\n  entries:\n    filemem:\n      allow_tool_override: false\n"
+p.write_text(txt)
+print("    appended plugins.entries.filemem (allow_tool_override: false)")
+PYEOF
+        ;;
+      esac
+    fi
+
+    enabled=$((enabled+1))
+  done
+
+  echo "==> [all-profiles] $enabled profile(s) enabled, $skipped skipped. Restart each profile's gateway (or the multiplexed host gateway once) for the change to take effect."
+}
+
 case "$MODE" in
   dir)     install_dir ;;
   pip)     install_pip ;;
   central) install_central ;;
+  all_profiles) install_all_profiles ;;
 esac
