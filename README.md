@@ -2,7 +2,7 @@
 
 > ## 功能介绍（中文）
 >
-> **filemem 是 Hermes Agent 的文件化记忆插件**：零外部依赖（无 Ollama / Qdrant / 向量库），本地优先，全部记忆以 JSON + Markdown 落盘在 `~/.hermes/plugins/filemem/storage/`，可手改、可 diff。
+> **filemem 是 Hermes Agent 的文件化记忆插件**：零外部依赖（无 Ollama / Qdrant / 向量库），本地优先，全部记忆以 JSON + Markdown 落盘在**中立共享根 `<base>/filemem`**（`<base>` = HERMES_HOME 剥掉尾部 `profiles/<name>` 段，如 `/root/.hermes/filemem`；**不用 per-profile 存储**——所有 profile 共享同一棵树），可手改、可 diff。
 >
 > **核心能力：**
 > - **L0–L2 分层记忆**：L0 环境事实（自动存）→ L1 操作经验（会话结束确认）→ L2 架构决策（显式确认才升级）
@@ -48,15 +48,28 @@ Zero external dependencies (no Ollama, no Qdrant, no vector DB). Everything is p
 | **Offline consolidation** | A host main-model LLM path (via `ctx.llm`, no auxiliary task — aligned with the built-in compressor) performs salience scoring and episodic summarization; decay config (`decay.json`) controls TTL per tier. |
 | **Draft review loop** | New memories land as drafts instead of auto-committing. At the start of a NEW session, auto-retrieve injects a `[未决草稿]` notice listing unconfirmed draft files from earlier sessions; the LLM then disposes of them via `filemem_review_drafts` — `target="<drafts_xxx.json>"` for historical files, or plain confirm/discard for the current session. (The session-end confirmation prompt itself is discarded by the engine, so the next session's opening turn is the actual user-visible surface.) |
 | **Provider caching** | Per-session provider instances are cached (`threading.Lock`), so repeated hooks never re-instantiate the storage layer. |
+| **Neutral shared storage (T5b)** | filemem **never uses per-profile storage**. Every profile converges on ONE neutral root — `<base>/filemem` where `base` is `HERMES_HOME` (or `~/.hermes`) with a trailing `profiles/<name>` segment stripped — so all profiles share a single central tree. The per-profile path (`<hermes_home>/plugins/filemem/storage`) is only a legacy fallback the host relocates away from at startup (`storage root relocated` log). |
+| **Cross-device shared pool** | An optional central PostgreSQL pool (`shared_memory`) lets rows sync across devices/agents: `shared_memory_search` (read-only consensus), `shared_memory_handoff` (push a row to central), `shared_memory_take` (pull a central row into the local shard). Failure rows are device-specific and are NOT pushed to the shared pool. |
+| **Failure-row semantics** | Failed tool-call / error turns are detected and tagged `failure_type`; such rows are exempt from supersede/consolidation LLM re-judgement, never pushed to the shared pool, and are excluded from the auto-confirm panel, so a bad turn can't poison durable memory. |
 
-### Tools exposed
+### Tools exposed (14)
 
-- `filemem_read(type, limit)` — read memories by type or all
-- `filemem_write(type, content, category, level)` — write a new memory
-- `filemem_search(query, min_score)` — search with similarity threshold
-- `filemem_delete(id)` — delete a memory
-- `filemem_review_drafts(action, memory_id?, target?)` — confirm/discard session drafts; `target` disposes of a historical session's draft file (e.g. `target="drafts_abc123.json"`)
-- `filemem_check_promotion` — tier promotion checks (L0→L1→L2)
+| Tool | What it does |
+|---|---|
+| `filemem_read(type, limit)` | Read memories by type or all |
+| `filemem_write(type, content, category, level)` | Write a new memory (genuinely NEW facts only) |
+| `filemem_search(query, min_score)` | Multi-axis RRF retrieval: BM25 keyword (latin + CJK n-grams, idf-weighted) × decay/recency × graph 1-hop expansion, fused by reciprocal-rank fusion; `origin_mark` flags untrusted / directive-quote rows |
+| `filemem_delete(id)` | Delete a memory |
+| `filemem_review_drafts(action, memory_id?, target?, verdict?)` | Confirm/discard session drafts in bulk; `target` disposes a historical session's draft; `plan_probe`/`verdict` is the user's save/dismiss nod on a pending plan-probe panel entry |
+| `filemem_check_promotion` | Tier promotion checks (L0→L1→L2) |
+| `filemem_supersede(old_id, new_content, reason, validity_scope?)` | Invalidate an outdated row (marks it `superseded`, leaves it on disk for audit) and write a correcting row carrying the lineage link — so the stale row stops auto-recalling instead of coexisting with the newer fact |
+| `filemem_plan(action, …)` | Structured multi-step plans (PLAN-type PRD): `list` recalls unfinished plans, `create` lands a new plan, `advance` drives its state machine (continue/revise/block/complete_all/abandon/…) |
+| `gate5_worldview_upsert(content, source, …)` | Land a user world-view / methodology row (how they act, or the order they want you to act); L2, no TTL, replaced only by a later user-confirmed upsert |
+| `filemem_set_bringback(choice, …)` | Cross-session continuity: pin a previous session's confirmed summaries to this session's auto-inject (bring_back / clean_start / fresh / topic_mismatch) |
+| `filemem_handoff_extract(session_id, focus?)` | Extract a handoff summary from a dead / deadlocked session so a new one can continue its work |
+| `filemem_scheduled(action, …)` | Scheduled wake-ups a user wants revisited at a set time (suggest / list / resolve) |
+| `shared_memory_search(query, …)` | Read-only query against the central cross-device shared pool (PostgreSQL `memories` table) |
+| `shared_memory_handoff(id)` / `shared_memory_take(id)` | Hand a row to the central pool / take a central row into this agent's local shard |
 
 ## Install guide
 
@@ -133,23 +146,18 @@ mv ~/.hermes/plugins/filemem "$HOME/filemem.uninstalled"   # keeps storage/
 ## Data layout
 
 ```
-~/.hermes/plugins/filemem/
-├── __init__.py            # provider, hooks, registration (~2300 lines)
-├── config_schema.py       # decay/consolidation config validation
-├── decay.json             # per-tier TTL defaults
-├── consolidation/         # offline consolidation + LLM caller
-│   ├── __init__.py
-│   └── llm_caller.py
-├── extractor/             # extraction docs/notes
-├── plugin.yaml            # manifest (name, version, hooks, tools)
-├── tests/                 # pytest suite (failure detector, gold knowledge, reinforce-recall, v2 self-test)
-├── tools/                 # self-test helpers
-└── storage/               # LIVE DATA — never shipped in the repo
-    ├── MEMORY.md / USER.md
-    ├── memories/*.json
-    ├── consolidated/
-    ├── drafts_*.json
-    └── local_semantic/
+# NEUTRAL STORAGE ROOT (T5b) — every profile converges here; <base> =
+# HERMES_HOME (or ~/.hermes) with a trailing profiles/<name> stripped,
+# e.g. /root/.hermes/filemem. The per-profile path is a legacy fallback only.
+<base>/filemem/
+├── memories/*.json         # L0/L1/L2 rows by type (preference/fact/decision/task/plan/scheduled)
+├── sessions/              # per-session draft + handoff artifacts
+├── graph.json             # 1-hop retrieval expansion graph
+├── decay.json             # per-tier TTL config
+├── consolidation_log.jsonl  # append-only audit (supersede/confirm/consolidation)
+└── …
+# the plugin code itself still ships in ~/.hermes/plugins/filemem/ (the
+# discovery dir); only the DATA lives in the neutral root above.
 ```
 
 ## Development
@@ -187,6 +195,14 @@ The plugin also now **warns at startup** if it detects a sibling `plugin.yaml`
 dir declaring `name: filemem` (`_warn_duplicate_plugin_dirs` in
 `initialize`) — a stale path is meant to be loud, not a silent no-op. Clear the
 WARNING by moving the flagged dir(s) to `archive/`, then restart the gateway.
+
+## Version
+
+`plugin.yaml` declares `version: 1.0.0`. The repo currently tags `filemem-v0.1.0`
+(the tag predates the 1.0.0 tool-surface expansion — 8 new tools: `filemem_supersede`,
+`filemem_plan`, `gate5_worldview_upsert`, `filemem_set_bringback`,
+`filemem_handoff_extract`, `filemem_scheduled`, `shared_memory_*`). Bump a `v1.0.0`
+tag when the next release is cut.
 
 ## Design notes & evidence
 
