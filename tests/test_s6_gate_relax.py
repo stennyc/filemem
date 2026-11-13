@@ -303,5 +303,6 @@ def test_no_host_package_changes_in_diff(tmp_path):
             f"S4-T2 touched a host package path: {c}"
         assert low.startswith(
             ("__init__.py", "consolidation/", "decay.json",
-              "tests/", "spec", "tools/", "shared_memory.py", "plugin.yaml")), \
+              "tests/", "spec", "tools/", "shared_memory.py",
+              "search_index.py", "graph_autorebuild.py", "plugin.yaml")), \
             f"unexpected changed path (non-plugin-surface): {c}"

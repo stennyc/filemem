@@ -41,6 +41,27 @@ _RRF_K = 60  # standard RRF constant (no config surface for SA2-3; YAGNI)
 _LATIN_TOKEN = re.compile(r"[a-z0-9]+")
 _CJK_RUN = re.compile(r"[\u4e00-\u9fff]+")
 _CJK_NGRAMS = (2, 3, 4)  # CJK runs emit ALL char substrings of len 2..4
+# B'-1b (owner 2026-11-13): 1-hop neighbor scores are weighted by the KIND of
+# the edge connecting them, so a node reached through a high-info SEMANTIC
+# edge ranks above one reached through a co-occurrence / temporal edge.
+# Coefficients are the SA2-9 build-side bucket quotas (55/22/23) normalized
+# so the strongest kind (semantic) == 1.0: semantic 0.55/0.55=1.0, temporal
+# 0.23/0.55=0.42, co-occurrence 0.22/0.55=0.40. Deliberately a search-side
+# HARD-CODED constant (NOT read from decay.json): build-side quotas and
+# search-side neighbor weights are independent tuning faces — changing the
+# build mix must not silently rescale the retrieval axis. Neighbor score =
+# _GRAPH_NEIGHBOR_BASE (0.5, unchanged) * kind coef, so a semantic-edge
+# neighbor keeps the legacy 0.5 and only the co-occ/temporal neighbors drop.
+_GRAPH_NEIGHBOR_BASE = 0.5
+# SA2-9 build-side quotas 55/22/23 normalized so the strongest kind
+# (semantic, 0.55) == 1.0; the others are the EXACT fractions (0.23/0.55,
+# 0.22/0.55) so the search-side weights are pinned to the build-side numbers.
+_GRAPH_NEIGHBOR_KIND_COEF = {
+    "semantic": 1.0,            # 0.55/0.55
+    "temporal": 0.23 / 0.55,    # 0.418181...
+    "co-occurrence": 0.22 / 0.55,  # 0.4
+}
+_GRAPH_NEIGHBOR_DEFAULT_COEF = 1.0  # unknown/absent kind keeps the base 0.5
 
 
 def is_cjk_char(ch: str) -> bool:
@@ -170,6 +191,21 @@ def rank_decay_axis(pool: List[Dict], lam: float = 0.05,
     return sorted(range(len(pool)), key=lambda i: (-rank_score(i), i))
 
 
+def _add_adj(adjacency: Dict[str, Dict[str, str]], src: str, dst: str,
+             kind: str, coef: float) -> None:
+    """B'-1b: record dst in src's adjacency, keeping the HIGHEST-coefficient
+    kind when a pair is linked by multiple edge kinds (max-info axis wins).
+    A corrupt/unknown kind falls back to the default coefficient (1.0), so a
+    missing `kind` field keeps the legacy 0.5 neighbor score rather than
+    dropping to 0."""
+    d = adjacency.setdefault(src, {})
+    existing = d.get(dst)
+    existing_coef = _GRAPH_NEIGHBOR_KIND_COEF.get(
+        existing, _GRAPH_NEIGHBOR_DEFAULT_COEF) if existing else 0.0
+    if coef > existing_coef:
+        d[dst] = kind
+
+
 def graph_axis_rank(graph: Optional[Dict], query: str, pool: List[Dict]) -> List[int]:
     """SA2-4: the graph 1-hop expansion axis over the RRF pool (deterministic,
     zero LLM, pure stdlib).
@@ -187,7 +223,11 @@ def graph_axis_rank(graph: Optional[Dict], query: str, pool: List[Dict]) -> List
     """
     if not pool:
         return []
-    adjacency: Dict[str, set] = {}
+    # B'-1b: adjacency now maps node -> {neighbor: kind} so the 1-hop
+    # neighbor score is weighted by the edge kind (max-coef kind wins when a
+    # pair is linked by several kinds). Pre-B'-1b this was {node: set} and
+    # every neighbor scored a flat 0.5 regardless of the connecting edge.
+    adjacency: Dict[str, Dict[str, str]] = {}
     if graph:
         edges = graph.get("edges")
         if isinstance(edges, list):
@@ -197,8 +237,11 @@ def graph_axis_rank(graph: Optional[Dict], query: str, pool: List[Dict]) -> List
                 src, dst = str(e.get("src") or ""), str(e.get("dst") or "")
                 if not src or not dst:
                     continue
-                adjacency.setdefault(src, set()).add(dst)
-                adjacency.setdefault(dst, set()).add(src)
+                _kind = str(e.get("kind") or "")
+                _coef = _GRAPH_NEIGHBOR_KIND_COEF.get(
+                    _kind, _GRAPH_NEIGHBOR_DEFAULT_COEF)
+                _add_adj(adjacency, src, dst, _kind, _coef)
+                _add_adj(adjacency, dst, src, _kind, _coef)
     qtoks = set(tokenize(query))
     if not qtoks or not adjacency:
         return []  # empty graph / empty query = empty term (all zeros)
@@ -215,8 +258,20 @@ def graph_axis_rank(graph: Optional[Dict], query: str, pool: List[Dict]) -> List
         return []
     for i, item in enumerate(pool):
         nid = str(item.get("id") or "")
-        if nid and nid not in hit_ids and adjacency.get(nid, set()) & hit_ids:
-            scores[i] = 0.5
+        if nid and nid not in hit_ids:
+            # B'-1b: among this node's neighbors that are hits, take the
+            # HIGHEST-coefficient edge kind and scale the base neighbor
+            # score by it (semantic-neighbor keeps 0.5, co-occ/temporal drop
+            # to 0.2/0.21). A node with no hit-neighbor stays 0.0.
+            best = 0.0
+            for nb, kind in adjacency.get(nid, {}).items():
+                if nb in hit_ids:
+                    _c = _GRAPH_NEIGHBOR_KIND_COEF.get(
+                        kind, _GRAPH_NEIGHBOR_DEFAULT_COEF)
+                    if _c > best:
+                        best = _c
+            if best > 0.0:
+                scores[i] = _GRAPH_NEIGHBOR_BASE * best
     return sorted(range(len(scores)), key=lambda i: (-scores[i], i))
 
 
