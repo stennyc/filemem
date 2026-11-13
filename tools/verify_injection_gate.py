@@ -45,9 +45,25 @@ sys.path.insert(0, str(PLUGIN_DIR))
 import __init__ as fm  # noqa: E402  (plugin module; imports safely, no I/O)
 
 # Dynamic path resolution (mirrors build_graph.py / backfill_origin.py):
-# HERMES_HOME env > ~/.hermes. No hardcoded /root paths (portability).
+# the provider's T5b NEUTRAL storage root = HERMES_HOME (or ~/.hermes) with a
+# trailing `profiles/<name>` segment stripped, then `/filemem`.  filemem never
+# uses per-profile storage — every profile converges on this one shared tree,
+# so a CLI that naively used `$HERMES_HOME/filemem` would target the
+# per-profile path and silently miss the central rows.
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
-LIVE_STORE = HERMES_HOME / "filemem"  # --store overrides this in main()
+
+
+def _neutral_base() -> Path:
+    """HERMES_HOME with a trailing `profiles/<name>` segment stripped (T5b
+    auto branch). No strip when the tail isn't exactly `.../profiles/<name>`."""
+    home = HERMES_HOME
+    parts = [p for p in home.parts if p]
+    if len(parts) >= 2 and parts[-2] == "profiles":
+        return Path(*parts[:-2]) if len(parts) > 2 else home
+    return home
+
+
+LIVE_STORE = _neutral_base() / "filemem"  # --store overrides this in main()
 
 # Golden smoke queries: real keywords from the live corpus (bookkeeping
 # fact rows, the 9200/APK incident threads, hermes-ui-debug).
