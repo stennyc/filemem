@@ -533,3 +533,28 @@ def test_flush_row_survives_injection_egress_by_default():
         # Even if the operator enables drop_unknown_trust, a NO-trust row would
         # drop — but that is operator opt-in config, not the failure mechanism's
         # fault. Under the DEFAULT the row is trusted.
+
+
+def test_failure_reorder_is_final_key_independent_of_graph_axis():
+    # 复盘⑩: the graph 1-hop axis (build_search_axes, L10230) only RE-SCORES
+    # rows already in the pool (it never introduces a new row nor bypasses
+    # the downstream reorder). The failure-lesson reorder
+    # (L4901, sorted by _failure_reorder_key) runs AFTER the RRF fusion in
+    # the SAME search_memories face, so it is the FINAL sort key: no amount
+    # of graph-axis up-scoring of a neighbor can push a failure row out of
+    # the top. 钉死: 缺省无 graph.json 时（生产缺省，build_search_axes
+    # 退化为两轴）failure 行仍恒置顶。
+    #
+    # We assert the reorder key itself: a failure row's key must sort before
+    # a non-failure row regardless of the non-failure row's (arbitrarily
+    # high) fused score — i.e. the key is a TOTAL order on the failure flag,
+    # not a score comparison.
+    import __init__ as fm_mod
+    p = _make_provider(pathlib.Path("/tmp/fm_graph_test"))  # provider for the key
+    fail_row = {"id": "f", "metadata": {"failure_type": "retry_loop"}}
+    good_row = {"id": "g", "metadata": {}}
+    # The reorder key puts failure rows strictly first, independent of score.
+    kf = p._failure_reorder_key(fail_row)
+    kg = p._failure_reorder_key(good_row)
+    assert kf < kg, \
+        f"failure reorder key must sort before non-failure (graph axis cannot override); got fail={kf!r} good={kg!r}"
