@@ -16,7 +16,9 @@ from collections import deque
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from __init__ import FileMemProvider, MEMORY_TYPES  # noqa: E402
+from __init__ import (  # noqa: E402
+    FileMemProvider, MEMORY_TYPES, _auto_inject_eligible,
+)
 
 
 def _make_provider(tmpdir: pathlib.Path) -> FileMemProvider:
@@ -242,7 +244,37 @@ def test_shutdown_joins_flush_threads():
             "shutdown must clear the recorded flush threads"
 
 
-# ---- ⑤ recall-side boost: _failure_reorder_key (pure) --------------------
+# ---- ⑨ end-to-end: synthesized row PASSES the confirmed gate into the
+#       auto-inject face (复盘④ 致命洞的防护) -------------------------------
+
+def test_synthesized_row_passes_confirmed_gate_into_auto_face():
+    # 复盘④: the confirmed global-skeleton gate (_auto_inject_eligible (3))
+    # folds a memories-pool row without a top-level session_id out of the
+    # auto-inject face unless metadata.confirmed is True. _flush stamps
+    # confirmed=True so the row actually reaches the model. This end-to-end
+    # leg (which the earlier rounds skipped) pins that the synthesized row,
+    # once in the pool, is auto-inject-eligible — NOT just "on disk".
+    with tempfile.TemporaryDirectory() as td:
+        p = _make_provider(pathlib.Path(td))
+        _seed_marker(p)
+        p._flush_unconsumed_failure_markers("sess_A")
+        rows = _read_all(p)
+        assert len(rows) == 1
+        row = rows[0]
+        md = row.get("metadata", {})
+        # The row carries the confirmed stamp + no top-level session_id.
+        assert md.get("confirmed") is True
+        assert "session_id" not in row, "memories-pool row must not carry a top-level session_id"
+        # The end-to-end gate: a memories-pool row (no session_id) is
+        # auto-inject-eligible ONLY via the confirmed leg.
+        eligible = _auto_inject_eligible(row, session_sp=None,
+                                         cur_session_id="someSession")
+        assert eligible is True, \
+            f"synthesized failure row must pass the confirmed gate into the auto face; md={md}"
+        # Negative control: the same row WITHOUT confirmed is folded out.
+        row_unconfirmed = {**row, "metadata": {k: v for k, v in md.items() if k != "confirmed"}}
+        assert _auto_inject_eligible(row_unconfirmed, None, "someSession") is False, \
+            "without confirmed the row must be folded out (the pre-fix hole)"
 
 def test_failure_reorder_key_puts_failure_rows_first():
     with tempfile.TemporaryDirectory() as td:

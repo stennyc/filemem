@@ -6739,6 +6739,26 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             "failure_ctx": ctx,
             "failure_fallback": True,
             "failure_origin_sid": session_id,
+            # 复盘④ (owner 拍板 A): the confirmed global-skeleton gate
+            # (_auto_inject_eligible (3), L952-958) requires a memories-pool row
+            # WITHOUT a top-level session_id to carry metadata.confirmed=True to
+            # enter the auto-inject face. A freshly synthesized failure row has
+            # no session_id and no confirmed stamp by default, so it would be
+            # FOLDED OUT of the auto face and the whole mechanism (a wall the
+            # model hit, surfaced first) would silently never reach the model.
+            # A failure lesson is a mechanical detector verdict (not a user
+            # utterance), and owner 拍板 A treats it as a confirmed negative
+            # example by design: stamp confirmed=True so it lands in the pool
+            # and is auto-injected. Side-effect audit:
+            #   * O1 fold-out keys only on superseded/settled/lapsed
+            #     (L2124) — confirmed alone does NOT fold it out.
+            #   * _cross_session_confirmed_fold (L1030) folds only rows WITH a
+            #     top-level session_id != cur; this row has NO top-level
+            #     session_id (only metadata.origin_session), so it rides the
+            #     global-skeleton leg and survives topic_mismatch.
+            #   * settled is set ONLY by the confirmed_draft source (L7474);
+            #     this row's source is "auto", so no settled stamp, no fold.
+            "confirmed": True,
         }
         # 宿主契约面 (复盘①, owner 拍板 C): _save_memory(source="auto") runs a
         # budget-gated SYNCHRONOUS distill LLM call (L7743-7747) + the P3-1
