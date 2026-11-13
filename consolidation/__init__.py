@@ -50,11 +50,17 @@ DECAY_DEFAULTS = {
         # its own quota (fractions of 2000, must sum to <= 1.0; unused
         # quota in one kind is NOT redistributed to the others — that keeps
         # the truncation a single deterministic pass). Default mix:
-        # semantic 50% (1000) / co-occurrence 30% (600) / temporal 20% (400).
+        # semantic 55% (1100) / co-occurrence 22% (440) / temporal 23% (460).
+        # (SA2-9 owner 2026-11-13: data-driven reweight — on the live
+        #  ~1577-node corpus semantic has the smallest candidate list
+        #  (~1595, the only under-fed axis) and the highest info density;
+        #  50/30/20 gave semantic 51% utilization, 55/22/23 lifts it to
+        #  58.6% (937/1595) while total kept rises 1818 -> 1837, no bucket
+        #  starved: co-occurrence/temporal both still hit their caps.)
         # Re-weight by overriding this dict in decay.json's "search" block
         # (a partial dict REPLACES the whole set — supply all three kinds).
-        "graph_bucket_quotas": {"semantic": 0.5, "co-occurrence": 0.3,
-                                "temporal": 0.2},
+        "graph_bucket_quotas": {"semantic": 0.55, "co-occurrence": 0.22,
+                                "temporal": 0.23},
         # SA2-7 (owner 2026-11-12, option B): anti-stacking guardrail for the
         # per-bucket weight-ordered truncation — no single node may consume
         # more than this fraction of its own bucket's kept slots (default

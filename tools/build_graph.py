@@ -86,7 +86,7 @@ _TOTAL_CAP = 2000     # spec guardrail: total edge cap
 # no second pass). Tweak in decay.json's "search" block under
 # "graph_bucket_quotas". Defaults here are the module-level fallback only;
 # the authoritative defaults live in DECAY_DEFAULTS["search"].
-_DEFAULT_BUCKET_QUOTAS = {"semantic": 0.5, "co-occurrence": 0.3, "temporal": 0.2}
+_DEFAULT_BUCKET_QUOTAS = {"semantic": 0.55, "co-occurrence": 0.22, "temporal": 0.23}
 _LATIN_ENTITY = None  # lazily compiled (keep module-level audit clean)
 import re
 _LATIN_ENTITY = re.compile(r"[A-Za-z0-9]{3,}")   # case-sensitive literal entity

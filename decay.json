@@ -22,9 +22,9 @@
     "graph_rebuild_water_level": 50,
     "graph_rebuild_cooldown_min": 30,
     "graph_bucket_quotas": {
-      "semantic": 0.5,
-      "co-occurrence": 0.3,
-      "temporal": 0.2
+      "semantic": 0.55,
+      "co-occurrence": 0.22,
+      "temporal": 0.23
     },
     "graph_max_node_share": 0.6667
   },
