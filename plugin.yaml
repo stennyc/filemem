@@ -1,7 +1,7 @@
 name: filemem
 version: 1.0.0
 description: File-based memory provider with semantic search and Demo integration
-author: Agnes
+author: stennyc
 license: GPL-3.0-or-later
 hooks:
   pre_llm_call: true

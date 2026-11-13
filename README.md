@@ -226,4 +226,4 @@ tag when the next release is cut.
 
 ## License
 
-GPL-3.0-or-later — see `LICENSE` (non-commercial; commercial use requires a separate license).
+GPL-3.0-or-later — see `LICENSE` (non-commercial; commercial use requires a separate license purchased from the author, stennyc).
