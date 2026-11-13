@@ -6783,9 +6783,25 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         if _in_host:
             try:
                 from agent.memory_provider import spawn_context_thread as _spawn_ct
-                _spawn_ct(_bg_flush,
-                          name=f"filemem-failure-flush-{session_id}").start()
+                _th = _spawn_ct(_bg_flush,
+                                 name=f"filemem-failure-flush-{session_id}")
+                _th.start()
                 _spawned = True
+                # Keep the Thread handle so shutdown() can join the in-flight
+                # flush before the process exits (a daemon thread would
+                # otherwise be killed mid-/_save_memory, losing the row).
+                # Bounded: append-and-cap so a burst of session-ends cannot
+                # grow this list unboundedly; the threads are short-lived
+                # (a single _save_memory + optional distill) so by the time
+                # the cap is hit the oldest are long-finished (join is a no-op
+                # on a dead thread).
+                _threads = getattr(self, "_failure_flush_threads", None)
+                if not isinstance(_threads, list):
+                    _threads = []
+                    self._failure_flush_threads = _threads
+                _threads.append(_th)
+                if len(_threads) > 8:
+                    del _threads[:len(_threads) - 8]
             except Exception:
                 _spawned = False
         if _spawned:
@@ -8152,6 +8168,22 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # Flush any rate-limited queue items (turn-end + shutdown, dedup-gated).
         self._flush_rate_limited_queue()
         self._save_session_drafts()
+        # 复盘①收尾 (owner 2026-11-13): join any in-flight failure-flush bg
+        # threads so a daemon-thread truncation at process exit cannot lose a
+        # synthesized row mid-/_save_memory. Bounded join (each thread is one
+        # _save_memory + optional distill; a 10s cap per thread is generous,
+        # and a hung thread must NOT hold shutdown open-ended — fail-soft:
+        # an over-cap thread is left to die with the process, the row is
+        # best-effort, the marker was already consumed synchronously so no
+        # re-fire next session).
+        _flush_ths = getattr(self, "_failure_flush_threads", None)
+        if isinstance(_flush_ths, list):
+            for _th in _flush_ths:
+                try:
+                    _th.join(timeout=10)
+                except Exception as _jt_e:
+                    logger.debug(f"FileMem: failure-flush thread join skipped: {_jt_e}")
+            self._failure_flush_threads = []
         logger.info("FileMemory: shutdown complete")
 
     def on_pre_compress(self, messages: List[Dict], *, session_id: str = "") -> List[Dict]:

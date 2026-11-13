@@ -210,6 +210,38 @@ def test_in_host_spawn_decision_is_isolated():
         assert "sess_A" not in p._pending_failure_meta
 
 
+# ---- ⑧ shutdown joins in-flight failure-flush bg threads -----------------
+
+def test_shutdown_joins_flush_threads():
+    # 复盘①收尾: the bg flush threads are stored on _failure_flush_threads and
+    # shutdown() joins them (bounded) so a daemon-truncation at process exit
+    # cannot lose a row mid-/_save_memory. This leg pins: after an in-host
+    # flush spawned a thread, that handle is recorded; shutdown() joins it
+    # (the monkeypatched _save_memory lets the thread finish immediately) and
+    # clears the list. A pre-seeded dead thread is joined without error.
+    import threading as _th
+    with tempfile.TemporaryDirectory() as td:
+        p = _make_provider(pathlib.Path(td))
+        p._save_memory = lambda *a, **k: ""
+        p._main_runtime = {"model": "x"}   # in-host -> spawn path
+        _seed_marker(p)
+        p._flush_unconsumed_failure_markers("sess_A")
+        # The spawn recorded at least one Thread handle (the bg leg ran).
+        ths = getattr(p, "_failure_flush_threads", [])
+        assert isinstance(ths, list) and len(ths) >= 1, \
+            "in-host flush should record the bg thread handle"
+        # A second seed -> second thread (re-seed a fresh marker; the first
+        # flush already consumed the original). Keep the list bounded (<8 here).
+        p._pending_failure_meta["sess_A"] = {
+            "failure_type": "tool_error", "tool": "terminal",
+            "ctx": "x", "ts": "y"}
+        p._flush_unconsumed_failure_markers("sess_A")
+        # shutdown joins all + clears.
+        p.shutdown()
+        assert p._failure_flush_threads == [], \
+            "shutdown must clear the recorded flush threads"
+
+
 # ---- ⑤ recall-side boost: _failure_reorder_key (pure) --------------------
 
 def test_failure_reorder_key_puts_failure_rows_first():
