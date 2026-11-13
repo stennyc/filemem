@@ -6377,40 +6377,45 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 if _turn_fm:
                     trace_data["failure"] = _turn_fm
                 trace_line = json.dumps(trace_data, ensure_ascii=False) + "\n"
-                # Idempotent dedupe (owner 2026-11-13, 宿主侧 _sync_external_memory_for_turn
-                # 有两条独立调用路径、无幂等门控，同一轮 turn 可能各触发一次
-                # provider.sync_turn → 同一 (content, assistant) 被 B4 append 两次、
-                # ts 错开 2~3s): 读该 session trace 文件最后一行，若 content+assistant
-                # 字节级相等且 ts 差 < 300s → 跳过本次 append。宁漏勿错：300s 窗口内的
-                # 原样重发=宿主侧双触发（不是新事实），跨 300s 的原样重发=新的逻辑
-                # turn（是新的证据，正常 append）。
+                # Idempotent dedupe (owner 2026-11-13):
+                # 宿主侧 _sync_external_memory_for_turn 两条独立调用路径
+                # （turn_finalizer.py:773 / codex_runtime.py:714）最终都进
+                # 同一个 max_workers=1 的 DaemonThreadPoolExecutor 串行队列
+                # （memory_manager.py:486），所以同进程内双触发是串行的
+                # （前一个 sync_turn 完成写盘后下一个才启动，读尾必看到已
+                # append 的行，ts 差 ~1.2-3s < 300s → 跳过）。
+                #
+                # 跨进程场景（gateway 多 profile co-write，_shard_lock
+                # docstring L3354）两个进程各持一个 provider 实例、并发
+                # sync 同一 session trace 文件时，去重读尾 + append 必须
+                # 在同一把跨进程锁内完成（否则两个进程都读尾 miss → 双写）。
+                # 宁漏勿错：300s 窗口内同 content+assistant = 宿主双触发，
+                # 跨 300s 原样重发 = 新逻辑 turn，正常 append。
                 _b4_skip = False
-                try:
-                    _last = ""
-                    with open(trace_file, "r", encoding="utf-8") as f:
-                        for _l in f:
-                            _last = _l.rstrip("\n")
-                    if _last:
-                        _last_d = json.loads(_last)
-                        if (_last_d.get("content") == trace_data["content"]
-                                and _last_d.get("assistant") == trace_data["assistant"]):
-                            _t1 = datetime.fromisoformat(trace_data["ts"])
-                            _t0 = datetime.fromisoformat(_last_d["ts"])
-                            if (_t1 - _t0).total_seconds() < 300:
-                                _b4_skip = True
-                                logger.info(
-                                    "FileMem: B4 trace dup suppressed "
-                                    f"(ts gap < 300s, same content+assistant) "
-                                    f"session={sid}")
-                except Exception as _dedupe_e:
-                    logger.warning(f"FileMem: trace dedupe check failed: {_dedupe_e}")
-                if not _b4_skip:
-                    # T5b: shard lock on the session-trace append (cross-process
-                    # consistency; single-writer per session in the common case).
-                    with self._shard_lock(trace_file):
+                with self._shard_lock(trace_file):
+                    try:
+                        _last = ""
+                        with open(trace_file, "r", encoding="utf-8") as f:
+                            for _l in f:
+                                _last = _l.rstrip("\n")
+                        if _last:
+                            _last_d = json.loads(_last)
+                            if (_last_d.get("content") == trace_data["content"]
+                                    and _last_d.get("assistant") == trace_data["assistant"]):
+                                _t1 = datetime.fromisoformat(trace_data["ts"])
+                                _t0 = datetime.fromisoformat(_last_d["ts"])
+                                if (_t1 - _t0).total_seconds() < 300:
+                                    _b4_skip = True
+                                    logger.info(
+                                        "FileMem: B4 trace dup suppressed "
+                                        f"(ts gap < 300s, same content+assistant) "
+                                        f"session={sid}")
+                    except Exception as _dedupe_e:
+                        logger.warning(f"FileMem: trace dedupe check failed: {_dedupe_e}")
+                    if not _b4_skip:
                         with open(trace_file, "a", encoding="utf-8") as f:
                             f.write(trace_line)
-                    logger.info(f"FileMem: trace written: {len(trace_line)} bytes session={sid}")
+                        logger.info(f"FileMem: trace written: {len(trace_line)} bytes session={sid}")
             except Exception as e:
                 logger.warning(f"FileMem: session trace write failed: {e}")
 

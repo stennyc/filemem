@@ -532,3 +532,44 @@ def test_h9c_b4_trace_different_content_always_appended(tmp_path, monkeypatch):
     assert len(lines) == 2, (
         "a genuinely different user_content must NEVER be deduped, "
         f"regardless of ts proximity: {lines}")
+
+
+def test_h9d_b4_trace_empty_file_appends(tmp_path, monkeypatch):
+    """空 trace 文件（session 第一轮）：无尾行可比较 → 必须 append（不跳）。
+    reviewer P5 hardening: 原 H9/H9b/H9c 都 pre-seed 了尾行，空文件是
+    漏掉的边界——_last="" 时 if _last: 不进比较分支，_b4_skip 保持 False，
+    走 append 路径。"""
+    p = _make_provider(tmp_path, sid="s_dup", profile="default")
+    p.trigger_router = None
+    from datetime import datetime, timezone
+    t1 = datetime(2026, 11, 13, 6, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+    _real_mod = _sys.modules.get("__init__") or _sys.modules.get("filemem")
+    monkeypatch.setattr(_real_mod, "_utcnow", lambda: t1)
+    p.sync_turn("第一条", "第一个回复", session_id="s_dup")
+    lines = [l for l in (p.sessions_dir / "s_dup.jsonl")
+             .read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(lines) == 1, f"空文件首轮必须 append: {lines}"
+
+
+def test_h9e_b4_trace_corrupt_last_line_fail_open_appends(tmp_path, monkeypatch):
+    """最后一行是损坏 JSON（写盘中断/磁盘错误）：json.loads 抛
+    JSONDecodeError → except fail-open → 必须 append（宁漏勿错）。
+    reviewer P5 hardening: 原 H9/H9b/H9c 没覆盖损坏尾行场景。
+    损坏行末尾无换行符（模拟写盘中断），append 用 "a" 模式会直接
+    接在损坏行后面，物理上仍是 1 行（损坏行 + 新行拼在一起）——
+    所以断言"新 content 出现在文件里"而非"行数 = 2"。"""
+    p = _make_provider(tmp_path, sid="s_dup", profile="default")
+    p.trigger_router = None
+    from datetime import datetime, timezone
+    t1 = datetime(2026, 11, 13, 6, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+    # 写一行损坏 JSON（无尾换行，模拟写盘中断）
+    f = p.sessions_dir / "s_dup.jsonl"
+    f.write_text('{"broken": true, "ts": "2026-11-13T06:00:00", "content":', encoding="utf-8")
+    _real_mod = _sys.modules.get("__init__") or _sys.modules.get("filemem")
+    monkeypatch.setattr(_real_mod, "_utcnow", lambda: t1)
+    p.sync_turn("合法消息", "合法回复", session_id="s_dup")
+    # 损坏行无尾换行 → append 直接拼接 → 物理上 1 行（损坏行 + 新行拼一起）
+    # 断言：新 content 确实在文件里（fail-open 成功，没被吞）
+    raw = f.read_text(encoding="utf-8")
+    assert "合法消息" in raw, f"损坏尾行后必须 fail-open append 新消息: {raw!r}"
+    assert "broken" in raw, f"损坏行应保留（append-only 不删）: {raw!r}"
