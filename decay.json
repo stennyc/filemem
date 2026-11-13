@@ -18,7 +18,15 @@
     "supersede_max_candidates": 2,
     "c3_negation_min_recall": 0.5,
     "gate_relax_alias": false,
-    "auto_recall_max": 3
+    "auto_recall_max": 3,
+    "graph_rebuild_water_level": 50,
+    "graph_rebuild_cooldown_min": 30,
+    "graph_bucket_quotas": {
+      "semantic": 0.5,
+      "co-occurrence": 0.3,
+      "temporal": 0.2
+    },
+    "graph_max_node_share": 0.6667
   },
   "memories_rotate_mb": 1,
   "consolidation": {

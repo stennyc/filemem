@@ -222,6 +222,13 @@ def test_8_register_is_idempotent_on_section_collision():
             return None
         def register_memory_provider(self, provider):
             return None
+        # SA2 tool-surface (owner 2026-11-12): register() now also calls
+        # ctx.register_tool per provider schema. FakeCtx must implement it
+        # so the test exercises the full register() path — without this the
+        # Mock-backed provider.get_tool_schemas() returns a non-iterable
+        # Mock and register() raises TypeError at the schema loop.
+        def register_tool(self, **_kw):
+            return None
 
     # Stub every other register() call site so the test exercises ONLY the
     # section-registration idempotency branch in isolation.
