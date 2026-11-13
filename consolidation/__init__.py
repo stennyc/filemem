@@ -55,6 +55,16 @@ DECAY_DEFAULTS = {
         # (a partial dict REPLACES the whole set — supply all three kinds).
         "graph_bucket_quotas": {"semantic": 0.5, "co-occurrence": 0.3,
                                 "temporal": 0.2},
+        # SA2-7 (owner 2026-11-12, option B): anti-stacking guardrail for the
+        # per-bucket weight-ordered truncation — no single node may consume
+        # more than this fraction of its own bucket's kept slots (default
+        # 2/3). Prevents a dense co-occurrence clique of a handful of
+        # high-frequency nodes from refilling its own degree allowance and
+        # eating the whole bucket (the SA2-7-v1 pure-weight-sort regression:
+        # co-occurrence distinct-node coverage 493 -> 234, temporal 74 -> 55
+        # on the live corpus). 1.0 = guardrail off (any node may fill its
+        # bucket, closest to the pre-guardrail behavior, still deterministic).
+        "graph_max_node_share": 0.6667,
         # EP-1: lineage 候选 gate（确定性零 LLM，确认面归 EP-2）.
         # supersede_min_overlap = Jaccard(token 集) of the NEW content vs an
         # existing same-type row; at-or-above it the old row becomes a

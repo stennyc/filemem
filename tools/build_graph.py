@@ -92,6 +92,25 @@ import re
 _LATIN_ENTITY = re.compile(r"[A-Za-z0-9]{3,}")   # case-sensitive literal entity
 _CJK_TERM = re.compile(r"[\u4e00-\u9fff]{2,}")   # CJK term heuristic
 
+# SA2-7 (owner 2026-11-12, option B): per-kind "information score" — the sort
+# key that REPLACES the pre-SA2-7 lexicographic (src, dst, ...) truncation
+# order WITHIN a bucket, plus an anti-stacking guardrail (max share of a
+# bucket's slots any single node may consume, default 2/3 — a dense
+# co-occurrence clique of a handful of high-frequency nodes can no longer
+# eat the whole bucket's quota, which was the SA2-7-v1 (pure weight sort)
+# on-disk regression: co-occurrence coverage 493 -> 234 distinct nodes,
+# temporal 74 -> 55, because a handful of dense subgraph nodes kept
+# refilling their own 5-slot degree allowance ahead of every other node).
+# Score:
+#   semantic        -> w (Jaccard overlap, already stored per edge)
+#   temporal        -> w (proximity, already stored per edge)
+#   co-occurrence   -> len(entities) (the only real per-edge discriminator;
+#                      w is a constant 1.0 across this whole bucket)
+# All deterministic (never a dict / hash-order read); the secondary
+# lexicographic (src, dst, kind, w, edge-json) tail is a pure tie-breaker,
+# so two runs stay byte-identical.
+_DEFAULT_MAX_NODE_SHARE = 2.0 / 3.0
+
 _K1_DEFAULT = float(DECAY_DEFAULTS["search"]["bm25_k1"])
 _K_B_DEFAULT = float(DECAY_DEFAULTS["search"]["bm25_b"])
 _MIN_OVERLAP_DEFAULT = float(DECAY_DEFAULTS["search"]["graph_min_overlap"])
@@ -372,13 +391,30 @@ def build_graph(storage_root: Path) -> dict:
     # the degree cap's cross-bucket contention is itself deterministic: a
     # node that reaches _DEG_CAP in the earlier-iterated bucket is denied in
     # the later one, ALWAYS (not dependent on dict insertion order).
+    # SA2-7 (owner 2026-11-12, option B): anti-stacking guardrail fraction —
+    # no single node may consume more than this share of its bucket's kept
+    # slots (default 2/3, user-tunable via decay.json's "search" block as
+    # "graph_max_node_share"). This is what fixes the SA2-7-v1 (pure
+    # weight-sort, no guardrail) on-disk regression where a dense
+    # co-occurrence clique of a handful of high-frequency nodes kept
+    # refilling its own 5-slot degree allowance and ate the whole bucket,
+    # dropping distinct-node coverage (co-occurrence 493 -> 234, temporal
+    # 74 -> 55 on the live corpus).
+    max_node_share = float(cfg.get("graph_max_node_share", _DEFAULT_MAX_NODE_SHARE))
     for kind in sorted(buckets):
         edges_kind = buckets[kind]
         cap_kind = int(_TOTAL_CAP * float(quotas.get(kind, 0.0)))
         seen_kind = set()
         kept_count = 0
-        for e in sorted(edges_kind, key=lambda e: (e["src"], e["dst"], e["kind"],
-                                                    e.get("w", 0.0),
+        node_kind_slots = {}  # node -> slots consumed by THIS bucket so far
+
+        def _score(e):
+            if e["kind"] == "co-occurrence":
+                return len(e.get("entities", []))
+            return e.get("w", 0.0)
+
+        for e in sorted(edges_kind, key=lambda e: (-_score(e), e["src"], e["dst"],
+                                                    e["kind"], e.get("w", 0.0),
                                                     json.dumps(e, sort_keys=True))):
             if kept_count >= cap_kind:
                 break
@@ -387,7 +423,14 @@ def build_graph(storage_root: Path) -> dict:
                 continue
             if degree.get(e["src"], 0) >= _DEG_CAP or degree.get(e["dst"], 0) >= _DEG_CAP:
                 continue
+            node_cap = int(cap_kind * max_node_share)
+            if node_cap > 0:
+                if (node_kind_slots.get(e["src"], 0) >= node_cap
+                        or node_kind_slots.get(e["dst"], 0) >= node_cap):
+                    continue
             seen_kind.add(key)
+            node_kind_slots[e["src"]] = node_kind_slots.get(e["src"], 0) + 1
+            node_kind_slots[e["dst"]] = node_kind_slots.get(e["dst"], 0) + 1
             degree[e["src"]] = degree.get(e["src"], 0) + 1
             degree[e["dst"]] = degree.get(e["dst"], 0) + 1
             kept.append(e)
