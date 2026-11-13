@@ -647,3 +647,59 @@ def test_normal_l0_auto_row_still_listed_in_pending_confirm_panel():
         ]
         assert plain_id in queued_ids, \
             f"normal L0 auto row {plain_id} must still land in the panel; got {queued_ids}"
+
+
+def _sm_notify_calls(p):
+    """Spy on _sm_notify: record which row ids would be pushed central."""
+    calls = {"ids": []}
+    def _spy(ids):
+        calls["ids"].extend(ids or [])
+    return calls, _spy
+
+
+def test_failure_row_not_pushed_to_central_new_row_face():
+    # 复盘⑬: a failure-lesson row is device-specific — it must NOT be pushed
+    # to the central shared pool (other devices' shared_memory_search would
+    # surface a negative example that is not their environment's truth).
+    # new-row face (_save_memory L7844): spy _sm_notify, flush a failure
+    # marker, assert its id is NOT in the pushed set while a normal row's id IS.
+    with tempfile.TemporaryDirectory() as td:
+        p = _make_provider(pathlib.Path(td))
+        assert getattr(p, "_main_runtime", None) is None  # sync leg
+        p._pending_confirm = {}
+        calls, _spy = _sm_notify_calls(p)
+        p._sm_notify = _spy
+        _seed_marker(p)
+        p._flush_unconsumed_failure_markers("sess_A")
+        rows = _read_all(p)
+        fail_id = rows[0]["id"]
+        assert rows[0]["metadata"]["failure_type"] is not None
+        # The failure row must NOT have been pushed central.
+        assert fail_id not in calls["ids"], \
+            f"failure row {fail_id} must not be pushed to the central pool; got {calls['ids']}"
+        # A normal row pushed through the same face DOES land central.
+        p._save_memory("plain environmental fact about the host cpu cores and memory layout details",
+                       level="L0", source="auto", _force_write=True)
+        normal_pushed = [i for i in calls["ids"] if i != fail_id]
+        assert normal_pushed, \
+            f"a normal L0 auto row must still be pushed central; got {calls['ids']}"
+
+
+def test_failure_row_not_pushed_to_central_metadata_refresh_face():
+    # 复盘⑬ metadata-refresh face (_update_memory_metadata L8935): distill
+    # writes summary/value/confirmed back through THIS method — it must not
+    # re-push a failure row central. Spy _sm_notify, update the failure row's
+    # metadata, assert no central push.
+    with tempfile.TemporaryDirectory() as td:
+        p = _make_provider(pathlib.Path(td))
+        assert getattr(p, "_main_runtime", None) is None
+        p._pending_confirm = {}
+        calls, _spy = _sm_notify_calls(p)
+        p._sm_notify = _spy
+        _seed_marker(p)
+        p._flush_unconsumed_failure_markers("sess_A")
+        fail_id = _read_all(p)[0]["id"]
+        # Simulate the distill write-back (summary/value) via the refresh face.
+        p._update_memory_metadata("fact", fail_id, {"summary": "s", "value": 0.4})
+        assert fail_id not in calls["ids"], \
+            f"failure row {fail_id} must not be re-pushed central on metadata refresh; got {calls['ids']}"

@@ -7833,7 +7833,15 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 # S2-v3: 门 1 全量沉淀 — 所有落盘行都推中央 (confirmed+unconfirmed),
                 # 由 shared_memory 按 metadata.confirmed 原样带列上中央. 中央行只读
                 # 可查, 不自动注入, 不回写本地. (旧 S2 的 "只推 confirmed 过滤" 已废.)
-                self._sm_notify([item.id])
+                # 复盘⑬ owner ruling (2026-11-13): a metadata.failure_type row
+                # (the _flush failure-lesson row) is DEVICE/ENVIRONMENT-SPECIFIC —
+                # "this host's terminal hit a timeout" does not hold on another
+                # machine. Sharing it into the central pool would let other
+                # devices' shared_memory_search surface a negative example that
+                # is not their environment's truth. Keep it LOCAL: skip the
+                # central push for failure rows; a normal row still flows.
+                if not (_new_row_dict.get("metadata") or {}).get("failure_type"):
+                    self._sm_notify([item.id])
 
                 # LLM pass target: only a NEW auto-extract item (source="auto",
                 # unconfirmed at creation) is distilled. manual / confirmed_draft
@@ -8921,10 +8929,13 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         entry.setdefault("metadata", {}).update(metadata)
                         with open(mem_file, "w", encoding="utf-8") as f:
                             json.dump(items, f, ensure_ascii=False, indent=2)
-                        # S2-v3: 门 1 全量沉淀 — 任何落盘行 (含纯元数据刷新) 都推中央,
-                        # 中央行只读可查. 不区分 confirmed 翻转 (旧 S2 只在 confirm
-                        # 翻转时推, 已随"全量存中央"定稿放宽).
-                        self._sm_notify([item_id])
+                        # 复盘⑬ owner ruling: a metadata.failure_type row is
+                        # device-specific — it must stay LOCAL even on a
+                        # metadata-refresh push (distill writes summary/value/
+                        # confirmed back through THIS method). Skip the central
+                        # push for failure rows; a normal row still flows.
+                        if not entry.get("metadata", {}).get("failure_type"):
+                            self._sm_notify([item_id])
                         return
         except Exception as e:
             logger.warning(f"FileMem: metadata update failed for {item_id}: {e}")
@@ -9009,8 +9020,11 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     # S2-v3: 门 1 全量沉淀 — 本批所有新落盘行都推中央
                     # (confirmed+unconfirmed), 由 shared_memory 按 metadata.confirmed
                     # 原样带列. 旧 S2 的 "批门只推 confirmed" 过滤已废.
+                    # 复盘⑬ owner ruling: device-specific failure rows stay LOCAL
+                    # even in a batch — filter them out of the central push.
                     _sm_batch_ids = [
                         _item["id"] for _item in items[-new_this_type:]
+                        if not (_item.get("metadata") or {}).get("failure_type")
                     ]
                     if _sm_batch_ids:
                         self._sm_notify(_sm_batch_ids)
