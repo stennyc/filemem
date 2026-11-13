@@ -167,3 +167,39 @@ def test_failure_reorder_key_puts_failure_rows_first():
         no_fail = [ord_row, stale_row]
         assert [r["id"] for r in sorted(no_fail, key=p._failure_reorder_key)] \
             == ["o1", "s1"]
+
+
+# ---- ⑥ boost precedes P0-2 cap: a low-rank failure row survives top-N ------
+
+def test_boost_precedes_cap_so_low_rank_failure_row_survives():
+    """AT-RISK① fix: the boost runs BEFORE the P0-2 cap, so a failure row that
+    ranks 4th (below a cap=3 trim) is floated into the top-3 by the stable
+    sort and therefore SURVIVES the cap — it is injected, not silently
+    dropped. Pre-fix (boost after cap) the cap trimmed it first and the boost
+    had nothing to reorder, so the 'wall you hit' row never reached the model."""
+    with tempfile.TemporaryDirectory() as td:
+        p = _make_provider(pathlib.Path(td))
+        # A surviving pool where the failure row is LAST (rank 4 of 4, below
+        # a cap=3 trim that keeps the first 3).
+        fail_row = {"id": "f1", "type": "fact", "content": "wall",
+                    "metadata": {"failure_type": "retry_loop"}}
+        pool = [
+            {"id": "o1", "type": "fact", "content": "a", "metadata": {}},
+            {"id": "o2", "type": "fact", "content": "b", "metadata": {}},
+            {"id": "o3", "type": "fact", "content": "c", "metadata": {}},
+            fail_row,
+        ]
+        cap = 3
+        # Reproduce the production order: boost (stable sort by key) THEN cap.
+        boosted = sorted(pool, key=p._failure_reorder_key)
+        surviving = boosted[:cap] if cap > 0 else boosted
+        # The failure row (key 0) floats to the FRONT, so it is in the top-3.
+        assert surviving[0]["id"] == "f1", \
+            f"failure row must survive cap=3 (boost precedes cap), got {surviving}"
+        # And the ordinary rows keep their relative order behind it.
+        assert [r["id"] for r in surviving] == ["f1", "o1", "o2"]
+        # Contrast: WITHOUT the boost (cap alone, pre-fix order) the failure
+        # row at rank 4 would be trimmed away.
+        no_boost_surviving = pool[:cap]
+        assert "f1" not in [r["id"] for r in no_boost_surviving], \
+            "pre-fix: cap alone would drop the rank-4 failure row"

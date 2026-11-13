@@ -4865,6 +4865,30 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 + self._shared_referral_hint(0),
                 session_id=session_id)
 
+        # Negative-example recall-side boost (owner 2026-11-13 拍板 A): pure
+        # REORDERING of the auto-inject face — rows carrying metadata.failure_type
+        # surface AHEAD of ordinary rows so a recalled "wall you hit" lesson is
+        # seen first. Placed BEFORE the P0-2 cap (below) so a failure row that
+        # ranks below the cap survives the top-N trim: the boost floats it into
+        # the surviving set, exactly like the bringback pin reorder (L4655-4657)
+        # which also precedes the cap. The row SET is unchanged (no add / no
+        # remove); only the order feeding the cap changes. Byte-stability: a
+        # session WITHOUT a failure row keys all-1, the stable sort preserves
+        # the exact pre-boost fused order, so the cap + P3 snapshot + prefix
+        # cache stay byte-identical to today. Zero LLM, zero host dep; the
+        # ⚠️ lesson line is appended per-row at the formatting loop — this boost
+        # only reorders WHO comes first. Fail-soft: a key hiccup keeps the
+        # pre-boost order (the sort below is wrapped).
+        try:
+            _pre_boost = len(results)
+            results = sorted(results, key=self._failure_reorder_key)
+            if len(results) != _pre_boost:
+                # impossible guard (sorted preserves length) — fail-soft log
+                logger.warning("FileMem: failure-boost reorder changed row count "
+                               f"({_pre_boost} -> {len(results)})")
+        except Exception as _fb_e:
+            logger.debug(f"FileMem: failure-boost reorder skipped: {_fb_e}")
+
         # P0-2 denoise ①: cap the AUTO-inject row count (top-N by the existing
         # fused rank = `results` order). A wide recall pool is NOT a
         # token-spend: the auto face injects at most auto_recall_max rows
@@ -4875,7 +4899,9 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # capped list — no capped row can silently bump a reference_count. The
         # EXPLICIT face is unbounded by this gate. Fail-soft: a bad cap value
         # degrades to "no cap" (the full surviving list) — a cap hiccup must
-        # never drop recall.
+        # never drop recall. NOTE: runs AFTER the failure boost above, so a
+        # failure row that would have ranked below the cap is already floated
+        # into the top-N and survives.
         try:
             _cap = int((self._decay.get("search") or {}).get("auto_recall_max", 3))
         except (TypeError, ValueError):
@@ -4886,27 +4912,6 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             logger.info(
                 f"FileMem: P0-2 auto-inject cap kept top-{_cap} of {_pre_cap} "
                 f"surviving rows (denoise)")
-
-        # Negative-example recall-side boost (owner 2026-11-13 拍板 A): pure
-        # REORDERING of the auto-inject face — rows carrying metadata.failure_type
-        # surface AHEAD of ordinary rows so a recalled "wall you hit" lesson is
-        # seen first. Mirrors the bringback pin reorder (L4655-4657) exactly:
-        # the row SET is unchanged (no add / no remove), only the surviving set
-        # is stable-sorted by _failure_reorder_key, so the P3 snapshot + prefix
-        # cache stay byte-stable for any session WITHOUT a failure row (key 1
-        # across the board == today's order). Zero LLM, zero host dep; the
-        # ⚠️ lesson line itself is appended per-row at the formatting loop
-        # (L4942-4944) — this boost only reorders WHO comes first. Fail-soft:
-        # a key hiccup keeps the pre-boost order (the sort below is wrapped).
-        try:
-            _pre_boost = len(results)
-            results = sorted(results, key=self._failure_reorder_key)
-            if len(results) != _pre_boost:
-                # impossible guard (sorted preserves length) — fail-soft log
-                logger.warning("FileMem: failure-boost reorder changed row count "
-                               f"({_pre_boost} -> {len(results)})")
-        except Exception as _fb_e:
-            logger.debug(f"FileMem: failure-boost reorder skipped: {_fb_e}")
 
         # P0-v2 (Gap A+B): recalled durable items reinforce their own
         # reference_count and drive the promotion loop. Persisted under lock,
@@ -6686,6 +6691,11 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             of garbage. A DIFFERENT ctx = a genuinely new wall = a new row.
           * L0 clamp: source="auto" is clamped to L0 by the SESSION_ISOLATION_V2
             D gate (L7262) — a synthesized fallback must not grow into L1/L2.
+          * _force_write=True: a session-end fallback must NOT enter the 30s
+            rate-limit queue (the queue is only flushed at turn-end / shutdown;
+            a host that skips both would evaporate the synthesized row with the
+            instance — re-opening the exact hole this fallback closes). Forcing
+            the write lands it now, via the new-row / dedup-upsert path.
           * Fail-soft: any exception is swallowed by the caller; the flush
             never raises into the end-flow.
 
@@ -6726,6 +6736,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             level="L0",
             source="auto",
             _extra_meta=extra_meta,
+            _force_write=True,
         )
         # Consume the marker now (the synthesized row is the LAST chance to
         # carry it). Pop BOTH the on_session_end key and the instance key:
