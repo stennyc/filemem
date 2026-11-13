@@ -8369,7 +8369,34 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # A successful high-value distill flips confirmed True (the LLM
         # judgment IS the confirmation). A failed / low-value result
         # (res["confirmed"] False, the fail-soft default) leaves it False.
-        meta_update["confirmed"] = bool(res.get("confirmed"))
+        # EXCEPTION (owner ruling, 复盘⑥): rows stamped with
+        # metadata.failure_type (the _flush failure-lesson rows) are
+        # mechanically-confirmed by the detector + owner design intent, so
+        # distill must NOT re-judge their confirmed state — otherwise the
+        # LLM's default res["confirmed"]=False (fail-soft) would wash the
+        # stamp back to False and re-open the confirmed gate hole. Read the
+        # row's current metadata directly from the shard file (the item is
+        # already on disk by the time distill runs); a failure row keeps its
+        # confirmed, a normal row keeps the LLM-judged confirmed.
+        _existing_meta: Dict[str, Any] = {}
+        try:
+            _mem_file = self.memories_dir / f"{mem_type}.json"
+            if _mem_file.exists():
+                with open(_mem_file, "r", encoding="utf-8") as _mf:
+                    _items = json.load(_mf)
+                for _entry in _items:
+                    if isinstance(_entry, dict) and str(_entry.get("id")) == str(item_id):
+                        _existing_meta = _entry.get("metadata", {}) or {}
+                        break
+        except Exception:
+            _existing_meta = {}
+        if _existing_meta.get("failure_type"):
+            # failure row: only carry summary/value forward, keep the
+            # mechanically-stamped confirmed (do NOT let the LLM wash it).
+            if _existing_meta.get("confirmed") is True:
+                meta_update["confirmed"] = True
+        else:
+            meta_update["confirmed"] = bool(res.get("confirmed"))
         meta_update["distilled_at"] = _utcnow().isoformat()
         self._update_memory_metadata(mem_type, item_id, meta_update)
 

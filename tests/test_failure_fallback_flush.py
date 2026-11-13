@@ -334,3 +334,81 @@ def test_boost_precedes_cap_so_low_rank_failure_row_survives():
         no_boost_surviving = pool[:cap]
         assert "f1" not in [r["id"] for r in no_boost_surviving], \
             "pre-fix: cap alone would drop the rank-4 failure row"
+
+
+
+def _row_meta(td: pathlib.Path, mem_type: str, item_id: str) -> dict:
+    """Read one row's metadata straight off the shard file (no provider
+    helper dependency — the test only needs the on-disk truth)."""
+    f = pathlib.Path(td) / "memories" / f"{mem_type}.json"
+    if not f.exists():
+        return {}
+    for entry in json.loads(f.read_text(encoding="utf-8")):
+        if isinstance(entry, dict) and str(entry.get("id")) == str(item_id):
+            return entry.get("metadata", {}) or {}
+    return {}
+
+
+def _patch_llm(monkeypatch, distill_return: dict):
+    """Monkeypatch the MODULE-LEVEL _load_llm_caller so _distill_item's LLM
+    seam returns a fixed distill() result (controlling the fail-soft
+    res["confirmed"] shape under test)."""
+    import __init__ as fm_mod
+    class _FakeLlm:
+        def distill(self, main_runtime, content):
+            return distill_return
+    monkeypatch.setattr(fm_mod, "_load_llm_caller", lambda: _FakeLlm())
+
+
+def test_distill_does_not_wash_confirmed_on_failure_row(monkeypatch):
+    # 复盘⑥: _flush stamps confirmed=True on the failure row; _save_memory
+    # then triggers _distill_item (source=auto), whose pre-fix line
+    # meta_update["confirmed"] = bool(res.get("confirmed")) would wash the
+    # stamp back to the LLM fail-soft default (False) and re-open the
+    # confirmed gate hole. 修: _distill_item exempts failure_type rows.
+    #
+    # End-to-end: seed a confirmed failure row, run _distill_item with the
+    # LLM returning NO confirmed key (the fail-soft shape that used to wash
+    # it), assert the row's confirmed SURVIVES.
+    with tempfile.TemporaryDirectory() as td:
+        p = _make_provider(pathlib.Path(td))
+        _seed_marker(p)
+        p._flush_unconsumed_failure_markers("sess_A")
+        rows = _read_all(p)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["metadata"]["confirmed"] is True
+        assert row["metadata"]["failure_type"] is not None
+        item_id = row["id"]
+
+        p._main_runtime = {"provider": "custom", "model": "m"}
+        _patch_llm(monkeypatch, {"summary": "s", "value": 0.4})  # no confirmed key
+        p._distill_item("fact", item_id, row["content"], session_id="sess_A")
+
+        after = _row_meta(td, "fact", item_id)
+        assert after.get("confirmed") is True, \
+            f"distill washed the failure row's confirmed to {after.get('confirmed')!r}"
+        assert after.get("summary") == "s", "distill still carries summary forward"
+        assert after.get("distilled_at"), "distill still records distilled_at"
+
+
+def test_distill_still_washes_confirmed_on_normal_row(monkeypatch):
+    # Negative control: a NORMAL row (no failure_type) still gets its
+    # confirmed re-judged by the LLM — exemption is scoped to failure rows.
+    with tempfile.TemporaryDirectory() as td:
+        p = _make_provider(pathlib.Path(td))
+        p._save_memory("user fact row about a thing", level="L0",
+                       source="manual", _force_write=True)
+        rows = _read_all(p)
+        target = rows[0]["id"]
+        p._update_memory_metadata("fact", target, {"confirmed": True})
+        assert _row_meta(td, "fact", target).get("confirmed") is True
+
+        p._main_runtime = {"provider": "custom", "model": "m"}
+        _patch_llm(monkeypatch, {"confirmed": False, "summary": "s"})
+        p._distill_item("fact", target, "user fact row about a thing",
+                        session_id="s")
+
+        after = _row_meta(td, "fact", target)
+        assert after.get("confirmed") is False, \
+            f"normal row should be washed to confirmed=False by LLM default; got {after.get('confirmed')!r}"
