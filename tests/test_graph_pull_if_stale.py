@@ -162,5 +162,35 @@ def test_pull_bypasses_cold_start_cooldown(tmp_path, recorded_spawn):
     assert p._graph_building is True
 
 
+def test_pull_spawn_failure_resets_building_flag(tmp_path, monkeypatch):
+    """6. REVIEWER-复盘 (deleg_b1d735bf, 2026-11-13): spawn 在 _graph_building
+    置 True 之后抛异常 (比如 _graph_spawn_bg_thread 本身挂) — pull 的 except
+    路径必须把 _graph_building reset 回 False (对齐 tick 侧 _graph_maybe_spawn_bg_build
+    的 except 9357-9360)。否则读侧 pull 永久 wedge 到进程重启。
+    pre-fix 这个 test 会 FAIL: flag 卡在 True, 后续 pull 全被重入锁挡掉。"""
+    root = _make_store(tmp_path, [_row(i) for i in range(5)])
+    _force_stale(root)
+    spawned = {"count": 0}
+
+    def _exploding_spawner():
+        # spawner 本身能返回, 但返回的 spawn 在调用时抛 — 模拟 thread 起不来的场景
+        spawned["count"] += 1
+        def _boom(target, args=(), name="", on_done=None):
+            raise RuntimeError("thread-pool exhausted (simulated)")
+        return _boom
+
+    monkeypatch.setattr(fm, "_graph_spawn_bg_thread", _exploding_spawner)
+    p = _make_pull_provider(root, last_pull_ts=time.time() - 3600,
+                            spawned=spawned)
+    p._graph_pull_if_stale()  # 内部 spawn() 抛, 走 except -> reset flag
+    assert p._graph_building is False, \
+        "spawn failure must reset _graph_building (reviewer wedge fix)"
+    # flag 没卡死 -> 下一个 pull (过了 read-side throttle) 仍能再试
+    p._graph_last_pull_ts = 0.0
+    p._graph_pull_if_stale()
+    assert spawned["count"] == 2, "second pull after reset must re-attempt"
+    assert p._graph_building is False, "still reset after second failure"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q", "-p", "no:cacheprovider"]))

@@ -9305,7 +9305,13 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                        "background rebuild spawned (this search reads the "
                        "previous graph; next search reads the fresh one)")
         except Exception as e:
-            logger.debug(f"FileMem: graph read-side pull skipped (graph intact): {e}")
+            # Reviewer 复盘 (deleg_b1d735bf, 2026-11-13): 对齐 tick 侧
+            # _graph_maybe_spawn_bg_build 的 except 路径 (9357-9360) — spawn 在
+            # _graph_building=True 之后抛异常时, 必须 reset 标志, 否则读侧 pull
+            # 永久 wedge 到进程重启 (tick 侧有 reset, 读侧原来漏了)。
+            with self._lock:
+                self._graph_building = False
+            logger.warning(f"FileMem: graph read-side pull failed (flag reset, graph.json intact): {e}")
 
     def _graph_maybe_spawn_bg_build(self, graph_root: "Path", _graph_build_bg) -> None:
         """SA2-5 (owner 2026-11-12, 选2 filemem 自持 daemon 线程, 不用 cronjob):
