@@ -136,6 +136,46 @@ MEMORY_TYPES = ["preference", "fact", "decision", "task", "plan", "scheduled"]
 # Memory levels
 MEMORY_LEVELS = ["L0", "L1", "L2"]
 
+
+def _pending_fingerprint(pending):
+    """Order-sensitive digest of the post-noise-filter pending confirm queue.
+
+    Used by FileMemProvider._turn_report_line to cache the rendered
+    [记忆报告] block per (sid, queue-fingerprint) so an unchanged queue
+    re-renders byte-identically across turns (provider prefix-cache
+    stability). Encodes exactly the fields the render path reads
+    (content / level / kind / id): two queues that would render
+    identically produce the same digest, and any consumed row changes
+    the digest, busting the cache so semantic changes propagate.
+
+    Pure stdlib (hashlib + json), zero I/O, zero LLM. A malformed
+    (non-serializable) row degrades to a per-row repr digest so the
+    result is still deterministic — the cache is a pure optimization and
+    a digest miss just forces a re-render, never a wrong byte.
+    """
+    try:
+        rows = [
+            [
+                it.get("content", ""),
+                it.get("level", "L0"),
+                it.get("kind", "l0"),
+                it.get("id", ""),
+            ]
+            for it in (pending or [])
+        ]
+        return hashlib.md5(
+            json.dumps(rows, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+    except Exception:
+        # Fail-soft: an unhashable queue falls back to a length+repr digest
+        # so the cache still keys on something deterministic. Worst case a
+        # collision/miss re-renders — the bytes are identical either way.
+        return hashlib.md5(
+            repr(
+                [(len(pending or []), [str(x) for x in p]) for p in (pending or [])]
+            ).encode("utf-8")
+        ).hexdigest()
+
 # ── scheduled 门 read-side wake prompt (owner 2026-11-12) ────────────────────
 # The due-wake face (Step 3, pre_llm_call injection) compares due_at purely by
 # CODE (zero LLM on the due/detection side). When a due row is surfaced to the
@@ -4371,16 +4411,31 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # P3: remember this turn's query so the snapshot write at the tail
         # (_save_injected_snapshot) can persist its token fingerprint.
         self._last_recall_query = query
-        # F2: refresh the session's decay time anchor ONCE per user turn,
-        # at the prefetch entry (before any search). Wall-clock enters the
-        # decay computation ONLY here; the anchor is then frozen for the
-        # whole search below, so a same-turn / same-pool re-prefetch is
-        # byte-stable (provider prefix-cache friendly). The refresh is
-        # idempotent within a turn — a re-entered prefetch for the same
-        # session re-anchors to a few seconds later, which cannot reorder a
-        # decay axis (sub-minute age deltas are below the lambda resolution
-        # that ever changes an RRF rank), so no new drift class is introduced.
-        self._f2_time_anchor = datetime.now(timezone.utc)
+        # F2: session-scoped decay time anchor (provider prefix-cache
+        # stability, 2026-11-14). Refresh the anchor ONLY when the session
+        # changes; within one session it is FROZEN at the first prefetch,
+        # so the decay axis (which feeds build_search_axes RRF fusion as
+        # `now`) is byte-stable across consecutive turns for the same
+        # query + pool snapshot.
+        #
+        # Rationale: wall-clock drift within a session cannot reorder the
+        # RRF rank on its own (sub-second age deltas are far below the
+        # lambda resolution), so freezing is semantically inert for
+        # ranking — but it ELIMINATES the per-turn top-N set instability
+        # that was the root cause of the provider prefix-cache stall:
+        # the current-turn user content tail (compose_user_api_content)
+        # re-renders the recall block each turn; when the recall block's
+        # bytes drift, that user message's tail bytes differ on the
+        # next-turn history replay, and the provider prefix cache from
+        # that message onward goes cold (cache_read stuck, write=0).
+        # A cross-session prefetch refreshes the anchor (new session,
+        # fresh wall-clock is the correct baseline).
+        _sid_anchor = session_id or getattr(self, "session_id", None)
+        _prev_anchor_sid = getattr(self, "_f2_anchor_sid", None)
+        if _prev_anchor_sid != _sid_anchor:
+            self._f2_anchor_sid = _sid_anchor
+            self._f2_time_anchor = datetime.now(timezone.utc)
+        # else: same session -> reuse the frozen self._f2_time_anchor
 
         # HANDOFF owner re-spec ② (白底短路, 2026-10-17): when this session has
         # an EXPLICIT valid pin whose <sid>.jsonl yields a dedup'd
@@ -5859,6 +5914,25 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # NOT surfaced — the user cannot judge a JSON fragment. They stay in
         # draft storage (audit face untouched); the panel just skips them.
         pending = [it for it in pending if not self._is_noise_confirm_row(it.get("content") or "")]
+        # CACHE HIT (2026-11-14, provider prefix-cache stability): the
+        # [记忆报告] block is cached per (sid, pending-fingerprint). The
+        # fingerprint is computed AFTER the noise filter (so noise-row
+        # churn does not bust the cache) and encodes exactly the rows the
+        # render path reads below. A queue UNCHANGED across turns reuses
+        # the cached byte-identical string — no re-render -> stable
+        # user-tail bytes -> the provider prefix cache can accumulate past
+        # this user message. A consumed item (confirm/discard/delete)
+        # changes the queue and therefore the fingerprint, forcing a fresh
+        # render, so semantic changes still propagate. The cache is a pure
+        # optimization: a miss / exception just re-renders as before.
+        _fp = _pending_fingerprint(pending)
+        _tcache = getattr(self, "_turn_report_cache", None)
+        if _tcache is None:
+            _tcache = {}
+            self._turn_report_cache = _tcache
+        _hit = _tcache.get(_fp)
+        if _hit is not None and _hit[0] == sid:
+            return _hit[1]
         if not pending:
             return ""
         # P5 face-1: the current session topic (the trace title, fail-soft to
@@ -5940,14 +6014,23 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                           'memory_id=<probe id>)；不存用 verdict="dismiss"（两者都消耗面板条目）。')
         if _has_sched:
             _disposal += (" 检测到到期事项（scheduled 条目）：确认存为到期提醒用 "
-                          'filemem_review_drafts(action="scheduled", verdict="confirm", '
-                          'memory_id=<sched id>[, due_at=ISO时间戳])；不存用 verdict="dismiss"（两者都消耗面板条目）。')
-        return (
+                      'filemem_review_drafts(action="scheduled", verdict="confirm", '
+                      'memory_id=<sched id>[, due_at=ISO时间戳])；不存用 verdict="dismiss"（两者都消耗面板条目）。')
+        _report = (
             "\n\n[记忆报告] 以下记忆将保存/已自动生成，可批量处置：\n"
             + "\n".join(lines)
             + f"\n{self.LEVEL_LEGEND}\n"
             + _disposal
         )
+        # Cache the rendered block keyed on the pending fingerprint (the _fp
+        # computed at the top of this method, after the noise filter). Cap
+        # the cache at 32 entries with insertion-order eviction: a long-lived
+        # provider instance must not accumulate unbounded (sid, block)
+        # pairs, and the hot key is the current sid's fingerprint.
+        if len(_tcache) >= 32:
+            _tcache.pop(next(iter(_tcache)))
+        _tcache[_fp] = (sid, _report)
+        return _report
 
     def _draft_content_dup_in_session(
             self, content: str, skip_id: Optional[str] = None) -> bool:
