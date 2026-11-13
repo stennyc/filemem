@@ -214,4 +214,4 @@ tag when the next release is cut.
 
 ## License
 
-MIT — see `LICENSE`.
+GPL-3.0-or-later — see `LICENSE` (non-commercial; commercial use requires a separate license).

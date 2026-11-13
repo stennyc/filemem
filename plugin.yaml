@@ -2,7 +2,7 @@ name: filemem
 version: 1.0.0
 description: File-based memory provider with semantic search and Demo integration
 author: Agnes
-license: MIT
+license: GPL-3.0-or-later
 hooks:
   pre_llm_call: true
   post_llm_call: true
