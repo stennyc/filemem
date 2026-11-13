@@ -30,6 +30,18 @@ DECAY_DEFAULTS = {
         # graph_temporal_window_days = max event-time gap for temporal edges.
         "graph_min_overlap": 0.1,
         "graph_temporal_window_days": 7,
+        # SA2-5 (owner 2026-11-12): graph full-build DETACH knobs. The 39s
+        # full build now runs on a dedicated daemon thread (detached from the
+        # tick thread's 10s join budget). Rebuilds are throttled by two
+        # gates, mirroring S3's water-level override:
+        #   graph_rebuild_water_level  — corpus rows added since the last full
+        #       build before a re-build is warranted (default 50; user-tunable
+        #       here in decay.json, e.g. 100 to rebuild less often).
+        #   graph_rebuild_cooldown_min — min minutes between two full builds
+        #       (default 30; a 39s build must not self-spin). 0 disables the
+        #       cooldown (rebuild every time the water level is crossed).
+        "graph_rebuild_water_level": 50,
+        "graph_rebuild_cooldown_min": 30,
         # EP-1: lineage 候选 gate（确定性零 LLM，确认面归 EP-2）.
         # supersede_min_overlap = Jaccard(token 集) of the NEW content vs an
         # existing same-type row; at-or-above it the old row becomes a

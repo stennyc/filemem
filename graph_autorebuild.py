@@ -42,7 +42,15 @@ _PLUGIN_DIR = Path(__file__).resolve().parent
 _MODULE_NAME = "_fm_build_graph"
 
 MIN_CORPUS_ROWS = 100   # below this, a graph adds no retrieval value
-MAX_WALL_TIME_S = 8.0   # stay well under the tick thread's 10s join budget
+
+# SA2-5 (owner 2026-11-12): the full ~39s build is DETACHED from the tick
+# thread's 10s join budget — it now runs on a dedicated daemon thread spawned
+# by the provider (see FileMemProvider._graph_maybe_spawn_bg_build in
+# __init__.py). ensure_fresh's old "graph_status full-rescan inside an 8s
+# soft deadline -> permanent defer" dead loop is gone: needs_rebuild is an
+# O(1) mtime gate only, and build_background carries the full build with no
+# wall-time cap. Rebuilds are further throttled by the provider-side
+# water-level + cooldown knobs (DECAY_DEFAULTS["search"].graph_rebuild_*).
 
 
 def _load_build_graph():
@@ -86,38 +94,73 @@ def _count_corpus_rows(root: Path) -> int:
     return n
 
 
-def ensure_fresh(storage_root=None,
-                 min_corpus_rows: int = MIN_CORPUS_ROWS,
-                 max_wall_time_s: float = MAX_WALL_TIME_S) -> bool:
-    """Rebuild graph.json iff it is stale AND the store is large enough to
-    warrant a graph; return True if a write happened, False if it was
-    already fresh / missing / under the min-corpus threshold / over the
-    soft deadline / or anything went wrong."""
-    t0 = time.monotonic()
+def _mtime_verdict(root: Path) -> str:
+    """O(1) mtime-only stale verdict (same recipe as the provider's
+    _graph_freshness): graph.json mtime vs newest corpus file under
+    memories/ + episodic/. Pure stat, zero corpus rescan, zero fingerprint.
+    Returns 'missing' | 'fresh' | 'stale'. Fail-soft -> 'missing'."""
+    graph_path = root / "graph.json"
+    try:
+        if not graph_path.is_file():
+            return "missing"
+        graph_mtime = graph_path.stat().st_mtime
+    except OSError:
+        return "missing"
+    newest = 0.0
+    for sub in ("memories", "episodic"):
+        d = root / sub
+        if not d.is_dir():
+            continue
+        try:
+            for f in d.iterdir():
+                if f.is_file():
+                    newest = max(newest, f.stat().st_mtime)
+        except OSError:
+            continue
+    # SA2-5: use >= not >: a corpus write that lands in the SAME mtime
+    # resolution window as a graph write (e.g. a test fixture, or the rare
+    # real-world same-instant write) must still count as "stale" — err on
+    # the side of triggering a background full rebuild (idempotent +
+    # detached, no tick-thread cost) rather than betting on sub-microsecond
+    # mtime ordering to catch every corpus drift.
+    return "stale" if newest >= graph_mtime else "fresh"
+
+
+def needs_rebuild(storage_root=None,
+                  min_corpus_rows: int = MIN_CORPUS_ROWS) -> bool:
+    """SA2-5: O(1) staleness gate for the tick thread. True iff a background
+    full rebuild is warranted (corpus newer than graph.json, or graph.json
+    missing) AND the store is large enough to warrant a graph. NEVER does a
+    corpus rescan or fingerprint recompute — that moved to build_background
+    on a dedicated daemon thread, so the tick thread's 10s join budget is
+    intact and the old "39s graph_status inside an 8s soft deadline"
+    dead loop is gone. Fail-soft: any probe hiccup -> False (no rebuild
+    this tick; the next tick retries)."""
     try:
         build_graph = _load_build_graph()
         root = Path(storage_root) if storage_root else build_graph.default_storage_root()
-
         if _count_corpus_rows(root) < min_corpus_rows:
             return False
+        return _mtime_verdict(root) in ("stale", "missing")
+    except Exception:
+        return False
 
-        verdict = build_graph.graph_status(root)
-        if verdict["status"] != "stale":
-            # "fresh": zero work. "missing": no corpus -> building an empty
-            # graph adds nothing (search already degrades to two-axis in
-            # that case, matching today's behavior — do NOT change it).
-            return False
 
-        if time.monotonic() - t0 > max_wall_time_s:
-            # graph_status itself (the expensive stale-decision pass)
-            # already blew the budget; skip the second expensive pass
-            # (build_and_write) and let the next tick retry from scratch.
-            logger.info("FileMem: graph auto-rebuild deferred (soft deadline "
-                        f"{max_wall_time_s}s hit after graph_status)")
-            return False
-
+def build_background(storage_root=None) -> bool:
+    """SA2-5: the FULL ~39s build_graph + atomic build_and_write, meant to
+    run on a DEDICATED daemon thread with NO wall-time budget (detached from
+    the tick thread's join). Returns True iff graph.json was actually
+    written (a fingerprint-idempotent re-run that skips the write is
+    reported as a log line and returns False, not an error). Re-entrancy is
+    the CALLER's job — the provider guards it with a per-instance
+    _graph_building flag + cooldown + water-level (see __init__.py)."""
+    try:
+        build_graph = _load_build_graph()
+        root = Path(storage_root) if storage_root else build_graph.default_storage_root()
         result = build_graph.build_and_write(root)
+        if result.get("skipped"):
+            logger.info(f"FileMem: graph background build skipped ({result['skipped']})")
         return bool(result.get("written"))
     except Exception as e:
-        logger.warning(f"FileMem: graph auto-rebuild tick skipped: {e}")
+        logger.warning(f"FileMem: graph background build failed (graph.json intact): {e}")
         return False

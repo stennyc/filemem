@@ -640,15 +640,16 @@ def test_reg_graph_skip_when_storage_dir_uninitialized(tmp_path, monkeypatch):
     # simulate a provider that never ran initialize().
     del p.storage_dir
 
-    # Seam: record every ensure_fresh call the tick body makes, so we can
+    # SA2-5: record every needs_rebuild call the tick body makes, so we can
     # assert it was NEVER called with a None/guessed root (the pre-fix
-    # fail-open behavior was ensure_fresh(None) -> default_storage_root()).
+    # fail-open behavior was ensure_fresh(None) -> default_storage_root();
+    # now the O(1) gate is needs_rebuild).
     import graph_autorebuild
     calls = []
     def _rec(sr=None, **kw):
         calls.append((sr, kw))
         return False
-    monkeypatch.setattr(graph_autorebuild, "ensure_fresh", _rec)
+    monkeypatch.setattr(graph_autorebuild, "needs_rebuild", _rec)
 
     created = _recorded_sct(monkeypatch)
     p._maybe_spawn_consolidation_tick()
@@ -659,9 +660,9 @@ def test_reg_graph_skip_when_storage_dir_uninitialized(tmp_path, monkeypatch):
 
     # The C face (zero-LLM) still did its work -> fail-soft, not a hard fail:
     assert (store / "knowledge" / "archive").exists()
-    # The graph segment must NOT have guessed a default root: ensure_fresh
+    # The graph segment must NOT have guessed a default root: needs_rebuild
     # was never invoked at all (no None, no str(guessed root)).
-    assert calls == [], f"ensure_fresh must not be called when storage_dir is missing, got: {calls}"
+    assert calls == [], f"needs_rebuild must not be called when storage_dir is missing, got: {calls}"
     assert not (store / "graph.json").exists()
 
 
@@ -715,7 +716,8 @@ def test_no_host_package_changes_in_diff():
         assert "hermes-agent" not in low and "hermes_agent" not in low, \
             f"S1b touched a host package path: {c}"
         assert low.startswith(("__init__.py", "consolidation/", "decay.json",
-                                "tests/", "spec", "tools/", "shared_memory.py", "plugin.yaml")), \
+                                "tests/", "spec", "tools/", "shared_memory.py",
+                                "plugin.yaml", "graph_autorebuild.py")), \
             f"unexpected changed path (non-plugin-surface): {c}"
 
 

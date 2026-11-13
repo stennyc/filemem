@@ -389,7 +389,15 @@ def build_and_write(storage_root: Path, dry_run: bool = False) -> dict:
         if not bak.is_file():  # first mutation only — keep the original
             bak.write_bytes(out.read_bytes())
             result["backup"] = str(bak)
-    out.write_text(serialize(graph), encoding="utf-8")
+    # SA2-5 (owner 2026-11-12): atomic replace. write_text is truncate+write —
+    # a concurrent reader (_load_graph's lazy json.load, now running on the
+    # search face while a background full rebuild writes) could observe a
+    # half-written file. Write a .tmp sibling then os.replace (single atomic
+    # rename syscall): the reader sees either the OLD or the NEW complete
+    # file, never a partial.
+    tmp = out.with_name(GRAPH_NAME + ".tmp")
+    tmp.write_text(serialize(graph), encoding="utf-8")
+    os.replace(tmp, out)
     result["written"] = str(out)
     return result
 

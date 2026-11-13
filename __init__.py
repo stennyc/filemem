@@ -2570,6 +2570,69 @@ def detect_turn_failures(history, recent):
     return failures
 
 
+# ── SA2-5 (owner 2026-11-12): graph full-build detach helpers ────────────────
+# Module-level (not provider methods) so the dedicated background thread's
+# spawner + the row-count baseline helper don't carry a provider instance
+# reference they don't need: needs_rebuild/build_background (imported by the
+# tick thread) do all the heavy lifting; these two just wrap fail-soft
+# around the plumbing (thread spawn, O(n) row count for the water-level
+# baseline). Both are pure-function, zero-LLM, stdlib-only, matching the
+# rest of this file's "deterministic, ops-only, host-turn-zero-blocking"
+# discipline for the graph face.
+
+def _graph_count_rows_safe(graph_root: "Path") -> int:
+    """O(n) corpus row count for the graph water-level baseline / backlog
+    delta — reuses graph_autorebuild._count_corpus_rows (the same counter
+    the needs_rebuild gate already uses, so the gate and the water-level
+    math agree on what "rows" means). Fail-soft to 0 on any hiccup:
+    0 makes backlog read "no backlog" → no self-spin, the safe side."""
+    try:
+        from graph_autorebuild import _count_corpus_rows
+        return _count_corpus_rows(Path(graph_root))
+    except Exception:
+        return 0
+
+
+def _graph_spawn_bg_thread():
+    """SA2-5: background-thread spawner for the dedicated graph full-build
+    thread. Prefers the host's spawn_context_thread (contextvar-bound daemon
+    thread, the established pattern for every other filemem background face)
+    when running in-host; falls back to a plain threading.Thread for
+    standalone / test-fixture use where the host import isn't available.
+    The graph build is context-independent (reads the store on disk, never
+    touches an LLM ctx), so the fallback is safe — it just loses the
+    contextvar binding this face doesn't use. The returned callable has the
+    signature (target, args=(), name="...", on_done=None) and must be
+    called and .start()ed by the caller (matching host contract:
+    spawn_context_thread returns an UNSTARTED thread)."""
+    try:
+        from agent.memory_provider import spawn_context_thread
+
+        def _spawn(target, args=(), name="filemem-graph-full", on_done=None):
+            def _wrap():
+                try:
+                    ok = target(*args)
+                except Exception:
+                    ok = False
+                if on_done:
+                    on_done(ok)
+            return spawn_context_thread(_wrap, name=name)
+        return _spawn
+    except Exception:
+        def _plain(target, args=(), name="filemem-graph-full", on_done=None):
+            import threading as _th
+
+            def _wrap():
+                try:
+                    ok = target(*args)
+                except Exception:
+                    ok = False
+                if on_done:
+                    on_done(ok)
+            return _th.Thread(target=_wrap, name=name, daemon=True)
+        return _plain
+
+
 class FileMemProvider(MemoryProvider):
     """File-based memory provider with keyword-overlap search and tiered storage."""
 
@@ -9150,6 +9213,89 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         except (json.JSONDecodeError, OSError):
             return None  # corrupt graph = no graph, not a crash
 
+    def _graph_maybe_spawn_bg_build(self, graph_root: "Path", _graph_build_bg) -> None:
+        """SA2-5 (owner 2026-11-12, 选2 filemem 自持 daemon 线程, 不用 cronjob):
+        called by the tick thread AFTER the O(1) needs_rebuild gate returned
+        True. Spawns a DEDICATED background thread that runs the full ~39s
+        build with NO wall-time budget (detached from the tick thread's 10s
+        join budget); per-instance re-entrancy + throttling guards:
+
+        - _graph_building      : full build in progress (prevents double writes
+                                 of graph.json; a second tick just sets
+                                 _graph_pending and returns)
+        - _graph_pending       : set True when corpus changes while a build is
+                                 running; the completion callback decides
+                                 (water-level + cooldown) whether the NEXT tick
+                                 re-triggers a full build. NEVER self-spins in
+                                 the background thread itself.
+        - _graph_last_build_ts : cooldown anchor (graph_rebuild_cooldown_min,
+                                 default 30, user-tunable in decay.json's
+                                 "search" block alongside the other graph_* knobs)
+        - _graph_base_rows     : corpus row count at the moment of the last
+                                 successful full build — the baseline for the
+                                 "water level" (graph_rebuild_water_level,
+                                 default 50) backlog check.
+
+        Both knobs read from DECAY_DEFAULTS["search"] via load_decay_config
+        (decay.json overrides the same keys if present, same merge
+        convention as every other knob in that block).
+        """
+        try:
+            with self._lock:
+                if getattr(self, "_graph_building", False):
+                    self._graph_pending = True
+                    return
+                cfg = (getattr(self, "_decay", None) or {}).get("search") or {}
+                cool_min = float(cfg.get("graph_rebuild_cooldown_min", 30))
+                now = time.time()
+                if (now - getattr(self, "_graph_last_build_ts", 0.0)) < cool_min * 60.0:
+                    return          # cooldown not yet elapsed; next tick re-checks
+                self._graph_building = True
+                self._graph_last_build_ts = now
+                self._graph_pending = False
+                self._graph_base_rows = _graph_count_rows_safe(graph_root)
+                spawn = _graph_spawn_bg_thread()
+                spawn(_graph_build_bg, args=(str(graph_root),),
+                      name=f"filemem-graph-full-{getattr(self, 'session_id', 'default')}",
+                      on_done=lambda ok: self._graph_build_done(ok, cfg, graph_root))
+            logger.info("FileMem: graph full build spawned on dedicated daemon "
+                       "thread (detached from tick join budget)")
+        except Exception as e:
+            logger.warning(f"FileMem: graph bg-spawn failed (flag reset, graph.json intact): {e}")
+            with self._lock:
+                self._graph_building = False
+
+    def _graph_build_done(self, ok: bool, cfg: Dict[str, Any], graph_root: "Path") -> None:
+        """SA2-5: background full-build completion callback. Clears the
+        re-entrancy flag + stamps the cooldown anchor + refreshes the row
+        baseline on success. 追平 (rebuild again) is decided by the
+        water-level + cooldown gate — matching S3's water-level override
+        semantics — and only SETS _graph_pending; it never re-runs the
+        build in-thread (that would self-spin the ~39s full build). The next
+        tick's O(1) needs_rebuild gate + this flag is what actually
+        re-triggers a background build (tick is interval-throttled, so
+        this is rate-limited by construction)."""
+        try:
+            with self._lock:
+                self._graph_building = False
+                water = int(cfg.get("graph_rebuild_water_level", 50))
+                cool_min = float(cfg.get("graph_rebuild_cooldown_min", 30))
+                if ok:
+                    self._graph_base_rows = _graph_count_rows_safe(graph_root)
+                    self._graph_last_build_ts = time.time()
+                cur_rows = _graph_count_rows_safe(graph_root)
+                baseline = getattr(self, "_graph_base_rows", 0) or 0
+                backlog = cur_rows - baseline
+                cooled = (time.time() - getattr(self, "_graph_last_build_ts", 0.0)) >= cool_min * 60.0
+                self._graph_pending = bool(ok and water > 0 and backlog >= water and cooled)
+                if self._graph_pending:
+                    logger.info(f"FileMem: graph backlog {backlog} ≥ water {water} & cooled "
+                                "→ _graph_pending set; next tick's O(1) gate will spawn "
+                                "a fresh background full build (no in-thread self-spin)")
+        except Exception as e:
+            logger.warning(f"FileMem: graph bg-build completion handler failed (flag may "
+                           f"remain set; next tick in_flight guard will surface it): {e}")
+
     def _graph_freshness(self) -> Dict[str, Any]:
         """O(1) mtime-only freshness verdict for the search envelope.
 
@@ -15612,28 +15758,32 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                 self._observe_consolidate()
             except Exception as e:
                 logger.warning(f"FileMem: observe spawn failed (existing observations intact): {e}")
-            # SA2-4: deterministic graph auto-rebuild rides the same async
-            # consolidation thread (rescore -> confirm -> mine -> observe ->
-            # GRAPH REBUILD -> semantic-merge -> ...). Zero LLM, zero new
-            # lock/concurrency — graph_autorebuild.ensure_fresh is a pure
-            # "is the fingerprint stale, rebuild if so" check over the
-            # existing idempotent build_and_write (its own .bak/zero-write
-            # semantics already guard the write), with two guards that keep
-            # it inside this tick thread's join budget: a min-corpus gate
-            # (tiny stores — e.g. test fixtures — skip graphing entirely)
-            # and a soft wall-time deadline (a cold full-store pass defers
-            # to the next tick instead of starving the other LLM faces).
-            # Pass the provider's OWN live store (self.storage_dir, the root
-            # build_graph's collect_corpus reads from) rather than defaulting
-            # to build_graph.default_storage_root(): the hook must rebuild
-            # the graph for EXACTLY the store this provider is serving, not
-            # some environment-resolved guess.
-            # Fail-soft: any exception leaves the on-disk graph.json
-            # exactly as-is (search stays two-axis, unchanged behavior);
-            # host turn stays zero-blocking (daemon thread, same as every
-            # other face here).
+            # SA2-4 + SA2-5 (owner 2026-11-12, 选2 filemem 自持 daemon 线程,
+            # 不用 cronjob): the deterministic graph full build is now DETACHED
+            # from this tick thread's 10s join budget. The tick does ONLY the
+            # O(1) mtime gate (needs_rebuild — no corpus rescan, no 39s
+            # fingerprint pass); when it signals "a background rebuild is
+            # warranted", spawn a DEDICATED daemon thread that runs the full
+            # build with NO wall-time cap. Rebuilds are further throttled by
+            # the provider's per-instance water-level + cooldown knobs
+            # (DECAY_DEFAULTS["search"].graph_rebuild_* / decay.json), and
+            # re-entrancy is guarded by the _graph_building flag — so the
+            # old "39s graph_status inside an 8s soft deadline -> permanent
+            # defer" dead loop is gone, and the other LLM faces in this tick
+            # body never pay for a graph rebuild.
+            # Still passes the provider's OWN live store (self.storage_dir),
+            # not build_graph.default_storage_root(): the rebuild must target
+            # EXACTLY the store this provider serves, never an
+            # environment-resolved guess.
+            # Fail-soft: any exception leaves the on-disk graph.json intact
+            # (search stays two-axis, unchanged behavior); host turn stays
+            # zero-blocking (the gate is O(1) on this thread; the full build
+            # runs on its own daemon thread, same as every other face here).
             try:
-                from graph_autorebuild import ensure_fresh as _graph_ensure_fresh
+                from graph_autorebuild import (
+                    needs_rebuild as _graph_needs_rebuild,
+                    build_background as _graph_build_bg,
+                )
                 _graph_root = getattr(self, "storage_dir", None)
                 if not _graph_root:
                     # Fail-soft, not fail-open: a provider that never ran
@@ -15649,7 +15799,8 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                         "has no initialized storage_dir (e.g. constructed "
                         "without initialize()); not guessing a default root.")
                 else:
-                    _graph_ensure_fresh(str(_graph_root))
+                    _graph_needs_rebuild(str(_graph_root)) and self._graph_maybe_spawn_bg_build(
+                        Path(_graph_root), _graph_build_bg)
             except Exception as e:
                 logger.warning(f"FileMem: graph auto-rebuild spawn failed (existing graph.json intact): {e}")
             # S3: semantic-merge face (cross-shard same-fact fold, LLM #5 in
