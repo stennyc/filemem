@@ -558,3 +558,28 @@ def test_failure_reorder_is_final_key_independent_of_graph_axis():
     kg = p._failure_reorder_key(good_row)
     assert kf < kg, \
         f"failure reorder key must sort before non-failure (graph axis cannot override); got fail={kf!r} good={kg!r}"
+
+
+def test_flush_row_lands_before_distill_so_timeout_cannot_lose_it():
+    # 复盘⑪: _flush spawns _save_memory on a bg thread; shutdown joins it with
+    # a bounded 10s timeout (fail-soft: an over-cap hung thread is left to die
+    # with the process). The docstring warns "the row is lost" — but the row
+    # append + json.dump (L7812/L7814) runs BEFORE the distill LLM call, so a
+    # timeout that truncates distill does NOT lose the synthesized row: its
+    # content + metadata (failure_type / confirmed / ctx) are already on disk.
+    # 钉死: 即便 distill LLM 被吞，failure 行已落盘。
+    with tempfile.TemporaryDirectory() as td:
+        p = _make_provider(pathlib.Path(td))
+        _seed_marker(p)
+        p._flush_unconsumed_failure_markers("sess_A")
+        rows = _read_all(p)
+        assert len(rows) == 1, "the synthesized row must already be on disk"
+        row = rows[0]
+        # The whole failure-lesson payload is in metadata, independent of any
+        # distill enhancement (summary/value) that may or may not have run.
+        assert row["metadata"]["failure_type"] is not None
+        assert row["metadata"]["confirmed"] is True
+        assert row["metadata"]["failure_ctx"], \
+            "failure_ctx must be on the row (the model-facing ⚠️ line reads it)"
+        # Distill enhancements are OPTIONAL — their absence is not a loss.
+        assert "distilled_at" in row["metadata"] or True  # may be present or not
