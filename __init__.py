@@ -3171,6 +3171,21 @@ class FileMemProvider(MemoryProvider):
         # Fail-soft: never raises into the end-flow; runs BEFORE the drafts gate.
         self._record_last_closed_session(session_id)
 
+        # Negative-example v1 fallback (堵悬空 marker 洞): if this session
+        # detected tool-failures (retry_loop / tool_error) but no subsequent
+        # memory write consumed the marker via _failure_meta_for, the failure
+        # lesson would evaporate with the instance at session end and the
+        # model would never "know" it hit this wall. Synthesize one
+        # self-describing L0 negative-example row so it enters the auto-inject
+        # pool (egress-kept via metadata.failure_type, L7767) and is recalled
+        # alongside a matching hit item (L4927-4929). Runs BEFORE the drafts
+        # gate so a zero-draft session (the common case) still flushes it.
+        # Fail-soft: any exception here must never raise into the end-flow.
+        try:
+            self._flush_unconsumed_failure_markers(session_id)
+        except Exception as _ff_e:
+            logger.warning(f"FileMem: failure-marker flush failed: {_ff_e}")
+
         if not drafts:
             return None
 
@@ -6618,6 +6633,96 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             meta["failure_ctx"] = fm.get("ctx", "")
             self._pending_failure_meta.pop(sid, None)
         return meta
+
+    def _flush_unconsumed_failure_markers(self, session_id: str) -> None:
+        """Negative-example v1 fallback (堵悬空 marker 洞), called from
+        on_session_end BEFORE the drafts gate.
+
+        If this session detected tool-failures (retry_loop / tool_error) and
+        no subsequent memory write consumed the marker via _failure_meta_for,
+        synthesize ONE self-describing L0 negative-example row so the lesson
+        enters the auto-inject pool instead of evaporating with the instance.
+
+        Why a synthesized row (not just the trace): the B4 trace line carries
+        the `failure` key but has no recall consumer — it is an audit log, not
+        a memory. Only a row in the memories pool can be auto-injected (the
+        egress face keeps metadata.failure_type rows, L7767, and the
+        formatting loop appends the ⚠️ lesson line alongside a hit item,
+        L4927-4929). So a marker with no consumer = a wall the model will
+        never know it hit; the fallback turns it into a durable L0 fact.
+
+        Design:
+          * content is a self-describing lesson sentence carrying the tool name
+            + failure type + ctx, so RRF keyword recall on a future matching
+            turn ("terminal" / "timeout" / the tool name) hits this row.
+          * metadata carries failure_type/failure_ctx/failure_tool (the
+            egress-keep + recall-time lesson-line keys) plus failure_fallback
+            = True (audit stamp: this row was synthesized by the session-end
+            flush, not naturally captured by _failure_meta_for).
+          * Dedup is inherited from _save_memory's content-hash idempotent
+            upsert (_find_duplicate_by_hash, L7179): a re-flush with the same
+            ctx collapses to the same row (bump marker_count), never a stack
+            of garbage. A DIFFERENT ctx = a genuinely new wall = a new row.
+          * L0 clamp: source="auto" is clamped to L0 by the SESSION_ISOLATION_V2
+            D gate (L7262) — a synthesized fallback must not grow into L1/L2.
+          * Fail-soft: any exception is swallowed by the caller; the flush
+            never raises into the end-flow.
+
+        No-op when: no pending marker for this session, or sessions_dir is
+        unset (standalone / test fixture without the episodic face)."""
+        fm = self._pending_failure_meta.get(session_id)
+        if not fm:
+            return  # marker was consumed by a real memory write (the normal
+                    # case) or never detected — nothing to flush.
+        ctx = (fm.get("ctx") or "").strip()
+        ftype = fm.get("failure_type", "tool_error")
+        tool = fm.get("tool", "")
+        # Self-describing lesson body: the model reads this at recall time.
+        # Carrying the tool name + type + ctx as prose keywords lets a future
+        # matching turn's RRF recall surface it (the lesson line at L4927
+        # then appends the raw ctx verbatim alongside the hit row).
+        content = (
+            f"⚠️ 失败教训({ftype}): 本 session 内 {tool or '工具'} 调用失败过"
+            + (f"（{ctx[:120]}）" if ctx else "")
+            + "——同情境下原参数重试大概率再撞同一堵墙，换姿势（变参/改背景/"
+              "先查清前置）再发。"
+        )
+        # Carry the failure metadata EXPLICITLY via _extra_meta (not via
+        # _save_memory's internal _failure_meta_for) so the dedup-upsert
+        # branch (L7398-7422, which returns BEFORE reaching _failure_meta_for)
+        # still gets a consistent row on re-flush. The egress keep (L7767)
+        # keys on metadata.failure_type, so the synthesized row is kept in
+        # the auto-inject pool regardless of which _save_memory branch ran.
+        extra_meta = {
+            "failure_type": ftype,
+            "failure_tool": tool,
+            "failure_ctx": ctx,
+            "failure_fallback": True,
+            "failure_origin_sid": session_id,
+        }
+        row_id = self._save_memory(
+            content,
+            level="L0",
+            source="auto",
+            _extra_meta=extra_meta,
+        )
+        # Consume the marker now (the synthesized row is the LAST chance to
+        # carry it). Pop BOTH the on_session_end key and the instance key:
+        # _save_memory's internal _failure_meta_for may have already popped
+        # self.session_id on the new-row branch; the dedup-upsert branch
+        # returns before that, so the marker would survive and re-fire next
+        # session if we only popped one key. Belt-and-suspenders both.
+        self._pending_failure_meta.pop(session_id, None)
+        self._pending_failure_meta.pop(
+            getattr(self, "session_id", None) or "default", None)
+        if row_id:
+            logger.info(
+                f"FileMem: failure-marker flushed to L0 row {row_id[:12]} "
+                f"({ftype}, tool={tool or '?'}) sid={session_id}")
+        else:
+            logger.info(
+                f"FileMem: failure-marker flushed (queued/dedup, no new row id) "
+                f"({ftype}, tool={tool or '?'}) sid={session_id}")
 
     def _handle_memory_trigger(self, route_result: Dict, content: str) -> None:
         """Handle memory trigger based on route result."""
