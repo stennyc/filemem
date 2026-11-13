@@ -46,7 +46,7 @@ _CJK_NGRAMS = (2, 3, 4)  # CJK runs emit ALL char substrings of len 2..4
 # edge ranks above one reached through a co-occurrence / temporal edge.
 # Coefficients are the SA2-9 build-side bucket quotas (55/22/23) normalized
 # so the strongest kind (semantic) == 1.0: semantic 0.55/0.55=1.0, temporal
-# 0.23/0.55=0.42, co-occurrence 0.22/0.55=0.40. Deliberately a search-side
+# 0.23/0.55=0.4182, co-occurrence 0.22/0.55=0.40. Deliberately a search-side
 # HARD-CODED constant (NOT read from decay.json): build-side quotas and
 # search-side neighbor weights are independent tuning faces — changing the
 # build mix must not silently rescale the retrieval axis. Neighbor score =
