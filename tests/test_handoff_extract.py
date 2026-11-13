@@ -320,3 +320,104 @@ def test_h7_foreign_profile_source_rows_not_collected(tmp_path):
         "foreign row" not in json.dumps(data.get("filemem_rows", [])), (
         "a foreign-profile source row must NOT enter this profile's "
         "handoff (不串 profile)")
+
+
+# ── H8: trace transcript settles the compact gap (owner 2026-11-13) ──────────
+
+def _write_trace(tmp: Path, sid: str, user_rows: list, model_rows: list):
+    """Seed the REAL-TIME trace pair the supercompress engine keeps beside
+    the compact ledger: <home>/supercompress_store/<sid>.jsonl (user source,
+    one seq per user message) + <sid>.model.jsonl (model source, one seq per
+    model turn — the two seq spaces are INDEPENDENT counters, so a given seq
+    value can exist in BOTH files at different ts)."""
+    d = tmp / "supercompress_store"
+    d.mkdir(parents=True, exist_ok=True)
+    def _dump(fn, rows):
+        (d / fn).write_text("\n".join(json.dumps(r, ensure_ascii=False)
+                                      for r in rows) + "\n", encoding="utf-8")
+    _dump(f"{sid}.jsonl", user_rows)
+    _dump(f"{sid}.model.jsonl", model_rows)
+
+
+def _trace_row(seq, ts, prov, text, tier="P0"):
+    return {"seq": seq, "ts": ts, "provenance": prov, "tier": tier,
+            "original_text": text}
+
+
+def test_h8_trace_transcript_covers_compact_gap(tmp_path):
+    """compact.json's watermark = the max GLOBAL page seq parsed by the same
+    regex the compact_ledger engine uses (NOT the top-level seq field, which
+    is a generation counter); the trace transcript is the user+model pair
+    merged by ts, filtered to seq strictly ABOVE that watermark — exactly
+    the settling-gap the compact snapshot can't cover (the '接手不完整' root
+    cause, owner 2026-11-13)."""
+    p = _make_provider(tmp_path, sid="s_cur", profile="default")
+    # compact ledger: 57 page segments, global seqs 0..41 (top-level seq=1 on
+    # purpose — the generation counter, NOT the watermark)
+    _write_compact_ledger(tmp_path, "s_src", entries=[{
+        "seq": 1,
+        "text": "\n---\n".join(
+            f"#1 P0 prov=user seq={i} [L3]\nline {i}" for i in range(42))}])
+    # trace pair: user source seq 0/1/42 (42 is the settling gap); model
+    # source seq 40/41/43 (40/41 already covered by the compact watermark,
+    # 43 is the settling gap)
+    _write_trace(tmp_path, "s_src",
+                 user_rows=[_trace_row(0, 100.0, "user", "u-0"),
+                             _trace_row(1, 110.0, "user", "u-1"),
+                             _trace_row(42, 140.0, "user", "u-42")],
+                 model_rows=[_trace_row(40, 120.0, "model", "m-40"),
+                             _trace_row(41, 130.0, "model", "m-41"),
+                             _trace_row(43, 150.0, "model", "m-43")])
+
+    wm = p._handoff_compact_watermark("s_src")
+    assert wm == 41, (
+        "the watermark must be the page-level max GLOBAL seq (41), parsed by "
+        "the _PAGE_SEQ_RE-style regex — NOT the top-level seq field (1, the "
+        f"generation counter): got {wm}")
+
+    segs = p._handoff_trace_transcript("s_src", wm)
+    bodies = [s.split("\n", 1)[1] for s in segs]
+    assert bodies == ["u-42", "m-43"], (
+        f"only the settling-gap rows (seq strictly > watermark 41) may enter "
+        f"the trace transcript, ts-ordered: {bodies}")
+
+    # the watermark itself (seq 41) is EXACTLY covered by compact -> excluded
+    segs_boundary = p._handoff_trace_transcript("s_src", 40)
+    assert [s.split("\n", 1)[1] for s in segs_boundary] == \
+        ["m-41", "u-42", "m-43"], "seq 41 (== watermark 40+1) must be kept"
+
+
+def test_h8b_no_trace_files_degrades_to_empty(tmp_path):
+    """A dead session may have lost its raw trace pair: the trace leg must
+    degrade to an empty list, never a crash (the compact + rows legs are the
+    floor, same fail-soft posture as the pre-H8 design)."""
+    p = _make_provider(tmp_path, sid="s_cur", profile="default")
+    _write_compact_ledger(tmp_path, "s_src")
+    assert p._handoff_trace_transcript("s_src", 0) == []
+    out = _call(p, "s_cur", "s_src")  # no LLM fake, no trace files
+    assert out["success"] is True, out
+    data = json.loads((tmp_path / "handoffs" / "s_src.json").read_text())
+    assert data.get("trace_transcript") == []
+    assert not any("trace" in m for m in data["materials"])
+
+
+def test_h8c_trace_transcript_feeds_fallback_summary(tmp_path):
+    """The deterministic fallback (no host LLM) must concatenate the settling-
+    gap segments AFTER the compact segments, BEFORE the filemem rows — the
+    same leg order the LLM bundle face uses (compact -> trace -> rows)."""
+    p = _make_provider(tmp_path, sid="s_cur", profile="default")
+    _write_compact_ledger(tmp_path, "s_src", entries=[{
+        "seq": 1, "text": "#1 P0 prov=user seq=0 [L3]\ncompact 基线段"}])
+    _write_trace(tmp_path, "s_src",
+                 user_rows=[], model_rows=[
+                     _trace_row(5, 200.0, "model", "gap-段-model")],
+                 )
+    # compact watermark from the single-segment ledger = 0 -> the seq-5 model
+    # row is above it and must enter the settling-gap leg
+    out = _call(p, "s_cur", "s_src")  # main_runtime None -> fallback face
+    assert out["success"] is True, out
+    data = json.loads((tmp_path / "handoffs" / "s_src.json").read_text())
+    summary = data["summary"]
+    assert "compact 基线段" in summary and "gap-段-model" in summary
+    assert any("trace" in m for m in data["materials"]), (
+        f"the settling-gap leg must be declared in materials: {data['materials']}")

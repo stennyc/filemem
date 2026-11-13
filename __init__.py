@@ -13515,6 +13515,79 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             return None
         return home / "supercompress_store" / f"{source_sid}.compact.json"
 
+    _COMPACT_PAGE_SEQ_RE = re.compile(r"(?m)^#\d+ \w+ prov=\S+ seq=(\d+)")
+
+    def _handoff_compact_watermark(self, source_sid: str) -> int:
+        """compact.json 页内解析出的最大全局段序（= 'compact 已追到哪'的水位线）。
+
+        判定式跟 compact_ledger 引擎自己的 _PAGE_SEQ_RE 完全同款（行首段标记位
+        `#<rel> <tier> prov=<…> seq=<全局>` 取全局 seq）——NOT 顶层 seq 字段
+        （那是 ledger 页代际号，seal 一次 +1，跟内容覆盖度无关；本 session
+        顶层 seq=1 但页内实际已追到全局段 41，两个数差 40 倍，拿错会重复喂）。
+        页内解析空（全新 session、compact 还没跑过）→ 返回 0，退化成全量喂
+        trace（没有 compact 基线，就该全量喂，行为合理）。"""
+        lp = self._handoff_compact_ledger_path(source_sid)
+        if lp is None or not lp.exists():
+            return 0
+        try:
+            ledger = json.loads(lp.read_text(encoding="utf-8"))
+        except Exception:
+            return 0
+        max_seq = 0
+        for entry in (ledger.get("entries") or []):
+            text = (entry.get("text") or "") if isinstance(entry, dict) else ""
+            for m in self._COMPACT_PAGE_SEQ_RE.findall(text):
+                max_seq = max(max_seq, int(m))
+        return max_seq
+
+    def _handoff_trace_transcript(self, source_sid: str, after_seq: int = 0) -> List[str]:
+        """实时 trace（.jsonl user 源 + .model.jsonl model 源合流）里
+        seq > after_seq 的段（compact 结算空窗段），按 (ts, user先) 排序。
+
+        compact.json 是 compress 事件里 lazy append 的结算快照，两次 compress
+        之间又推进的轮次不在里面——这是 owner 2026-11-13 抓到的"接手不完整"
+        根因。全量读两文件（真值：本 session 共 108 行 / 192KB，读+解析 ~2ms，
+        session 越长也远低于 LLM 面任何一次调用的耗时，不是性能瓶颈），
+        过滤掉 seq <= after_seq 的行（compact 已覆盖、别重复喂给 LLM）。
+        任一文件缺失（dead session 可能没留 trace）→ 跳过，fail-soft。"""
+        home = getattr(self, "hermetis_home", None)
+        if home is None:
+            return []
+        base = Path(home) / "supercompress_store"
+        rows = []
+        for f in (base / f"{source_sid}.jsonl",
+                  base / f"{source_sid}.model.jsonl"):
+            if not f.is_file():
+                continue
+            try:
+                lines = f.read_text(encoding="utf-8").splitlines()
+            except Exception:
+                continue
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue  # corrupt line skipped, not fatal
+                if not isinstance(r, dict):
+                    continue
+                ts = r.get("ts")
+                if ts is None:
+                    continue  # 无时间戳的行无法合流排序，跳过（fail-soft）
+                if int(r.get("seq") or 0) <= after_seq:
+                    continue  # compact 已覆盖的水位之下，不重复喂
+                text = (r.get("original_text") or "").strip()
+                if not text:
+                    continue
+                rows.append((float(ts), 0 if r.get("provenance") == "user" else 1,
+                             r.get("seq"), r.get("tier") or "P0",
+                             r.get("provenance") or "model", text))
+        rows.sort(key=lambda x: (x[0], x[1]))
+        return [f"#{i} {tier} prov={prov} seq={seq} [trace]\n{text}"
+                for i, (ts, _prio, seq, tier, prov, text) in enumerate(rows, 1)]
+
     def _gather_handoff_materials(self, source_sid: str,
                                   focus: str) -> Dict[str, Any]:
         """Gather the handoff material bundle for one source session.
@@ -13532,7 +13605,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         ledger + rows are the floor)."""
         materials: Dict[str, Any] = {
             "compact_segments": [], "filemem_rows": [],
-            "raw_lines": [], "focus": (focus or "").strip(),
+            "trace_transcript": [], "raw_lines": [],
+            "focus": (focus or "").strip(),
         }
         # (1) compact ledger
         lp = self._handoff_compact_ledger_path(source_sid)
@@ -13568,6 +13642,16 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     if row_sp != cur_sp:
                         continue  # foreign-profile row: 不串 profile
                     materials["filemem_rows"].append(row)
+        # (2b) compact 结算空窗追平：实时 trace（.jsonl user 源 + .model.jsonl
+        #      model 源合流）里 seq > compact 水位 的段——compact.json 是
+        #      compress 事件里 lazy append 的结算快照，两次 compress 之间又
+        #      推进的轮次不在里面（owner 2026-11-13 抓到的"接手不完整"根因）。
+        #      水位 = compact.json 页内解析出的最大全局 seq（_COMPACT_PAGE_SEQ_RE
+        #      同款判定式，NOT 顶层 seq 字段——那个是页代际号，拿错会重复喂）；
+        #      水位之上才是"compact 没追上的空窗段"，只喂这部分，不重复喂
+        #      compact 已覆盖的段（省 LLM budget + 避免同信息多份存根）。
+        materials["trace_transcript"] = self._handoff_trace_transcript(
+            source_sid, self._handoff_compact_watermark(source_sid))
         # (3) focus-matched raw lines ONLY when focus is set
         if materials["focus"]:
             home = getattr(self, "hermetis_home", None)
@@ -13588,12 +13672,16 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                                   source_sid: str) -> str:
         """Deterministic fallback when no host LLM is available: the compact
         segments concatenated (the task-state floor, 不吞脏), then the
+        trace-transcript settling-gap segments (compact 水位之上的实时段，
+        owner 2026-11-13), then the
         session's confirmed filemem rows, then any focus-matched raw lines.
         Audit-visible: the artifact carries llm_used=False so the continuing
         session knows it is a mechanical extraction, not a curated one."""
         parts = [f"[HANDOFF fallback: session {source_sid} — LLM unavailable, "
                  f"deterministic segment concatenation]"]
         parts.extend(materials.get("compact_segments") or [])
+        for seg in (materials.get("trace_transcript") or []):
+            parts.append(seg)
         for row in materials.get("filemem_rows") or []:
             content = (row.get("content") or "").strip()
             if content:
@@ -13622,6 +13710,17 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         lines.append("## Compact ledger segments (task state)")
         for seg in (materials.get("compact_segments") or [])[:50]:
             lines.append(seg)
+        # 结算空窗追平层（owner 2026-11-13）：compact.json 是 compress 事件
+        # lazy append 的快照，两次 compress 之间又推进的轮次不在里面；这层
+        # 喂的是"compact 水位之上"的实时 trace 段（seq > 水位，.jsonl user
+        # 源 + .model.jsonl model 源按 ts 合流），跟 compact 段不重复。
+        trace_segs = materials.get("trace_transcript") or []
+        if trace_segs:
+            lines.append("")
+            lines.append("## Trace transcript since last compact (settling-gap, "
+                         "real-time user+model turns beyond the compact watermark)")
+            for seg in trace_segs[:200]:
+                lines.append(seg)
         lines.append("")
         lines.append("## Confirmed filemem rows (decisions / preferences)")
         for row in (materials.get("filemem_rows") or [])[:50]:
@@ -13707,15 +13806,16 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         focus = (args.get("focus") or "").strip()
         materials = self._gather_handoff_materials(src, focus)
         has_compact = bool(materials["compact_segments"])
+        has_trace = bool(materials.get("trace_transcript"))
         has_rows = bool(materials["filemem_rows"])
         has_raw = bool(materials["raw_lines"])
-        if not (has_compact or has_rows or has_raw):
+        if not (has_compact or has_trace or has_rows or has_raw):
             return json.dumps({"success": False,
                                "source_session_id": src,
                                "reason": "no materials",
-                               "note": ("neither a compact ledger nor this "
-                                        "profile's filemem rows exist for "
-                                        f"{src}; nothing to hand off")})
+                               "note": ("neither a compact ledger, a live trace "
+                                        "transcript, nor this profile's filemem "
+                                        f"rows exist for {src}; nothing to hand off")})
         # LLM face (explicit host main_runtime; the live-resolve ladder is
         # the same as every other LLM face — standalone / no-host degrades
         # to the deterministic fallback, never a crash).
@@ -13741,6 +13841,9 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         materials_list = []
         if has_compact:
             materials_list.append("compact.json")
+        if has_trace:
+            materials_list.append(
+                f"trace-transcript({len(materials['trace_transcript'])})")
         if has_rows:
             materials_list.append(f"filemem-rows({len(materials['filemem_rows'])})")
         if has_raw:
@@ -13761,6 +13864,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     "filemem_rows": [
                         (r.get("content") or "")
                         for r in materials["filemem_rows"][:50]],
+                    "trace_transcript": (materials.get("trace_transcript") or [])[:50],
                     "summary": summary,
                     "llm_used": llm_used,
                 }, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -17613,30 +17717,39 @@ def register(ctx) -> None:
     #    不会让整个 register() 崩（#23194 invariant）
     _schemas = provider.get_tool_schemas()
     _registered = 0
-    for _schema in _schemas:
-        _tname = _schema.get("name") if isinstance(_schema, dict) else None
-        if not _tname:
-            continue
-        # handler(args: dict, **kw) -> str；闭包捕获 _tname + provider 实例
-        def _mk_handler(tname=_tname, prov=provider):
-            def _handler(args, **kw):
-                return prov.handle_tool_call(tname, args, **kw)
-            _handler.__name__ = f"filemem_{tname}"
-            return _handler
-        try:
-            ctx.register_tool(
-                name=_tname,
-                toolset="filemem",
-                schema=_schema,
-                handler=_mk_handler(),
-                emoji="🧠",
-                description=_schema.get("description", ""),
-            )
-            _registered += 1
-        except Exception as _e:
-            # fail-soft: 单个工具注册失败（如 override 被门禁拒）不阻断其余 13 个
-            logger.warning(f"FileMem: register_tool({_tname}) failed: {_e}")
-    logger.info(f"FileMem: registered plugin tool surface ({_registered}/{len(_schemas)} tools, toolset='filemem')")
+    # fail-soft: if get_tool_schemas() returns a non-iterable (test Mock,
+    # or a provider subclass that overrides it to None), skip the whole
+    # loop rather than crashing register() — mirrors the per-tool
+    # try/except below. (owner 2026-11-12)
+    if not isinstance(_schemas, (list, tuple)):
+        logger.warning(
+            f"FileMem: get_tool_schemas() returned {type(_schemas).__name__} "
+            "(non-iterable); skipping plugin tool-surface registration")
+    else:
+        for _schema in _schemas:
+            _tname = _schema.get("name") if isinstance(_schema, dict) else None
+            if not _tname:
+                continue
+            # handler(args: dict, **kw) -> str；闭包捕获 _tname + provider 实例
+            def _mk_handler(tname=_tname, prov=provider):
+                def _handler(args, **kw):
+                    return prov.handle_tool_call(tname, args, **kw)
+                _handler.__name__ = f"filemem_{tname}"
+                return _handler
+            try:
+                ctx.register_tool(
+                    name=_tname,
+                    toolset="filemem",
+                    schema=_schema,
+                    handler=_mk_handler(),
+                    emoji="🧠",
+                    description=_schema.get("description", ""),
+                )
+                _registered += 1
+            except Exception as _e:
+                # fail-soft: 单个工具注册失败（如 override 被门禁拒）不阻断其余 13 个
+                logger.warning(f"FileMem: register_tool({_tname}) failed: {_e}")
+    logger.info(f"FileMem: registered plugin tool surface ({_registered}/{len(_schemas) if isinstance(_schemas, (list, tuple)) else '?'} tools, toolset='filemem')")
 
     # Memory-toolset self-heal (2026-10-11): the host gates external-provider
     # tool injection on the BUILT-IN 'memory' toolset being present in the
