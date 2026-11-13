@@ -4474,7 +4474,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         results = self.search_memories(_q_for_search, limit=8,
                                        min_score=self.min_search_score,
                                        profile_scope=_session_sp,
-                                       time_anchor=self._f2_time_anchor)
+                                       time_anchor=self._f2_time_anchor,
+                                       obs_face="auto")
         # O1 ① auto-face fold-out: superseded rows (EP-1 save-door / O1 explicit
         # supersede / EP-2 confirmed all write metadata.superseded) and (b)
         # lapsed rows (valid_until already past) leave the AUTO-INJECT face
@@ -9618,7 +9619,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                         window: Optional[Dict[str, Any]] = None,
                         profile_scope: Optional[str] = None,
                         mem_type: Optional[str] = None,
-                        time_anchor: Optional[datetime] = None) -> List[Dict]:
+                        time_anchor: Optional[datetime] = None,
+                        obs_face: Optional[str] = None) -> List[Dict]:
         """Multi-axis RRF retrieval: bm25 keyword axis + decay/recency axis
         (+ graph axis stub, SA2-4), fused by reciprocal rank fusion.
 
@@ -9927,9 +9929,30 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 # a detached daemon thread). THIS search still uses the
                 # current graph (fail-soft, zero-blocking).
                 self._graph_pull_if_stale()
+                _graph_obj = self._load_graph()
                 fused_scores = build_search_axes(
                     all_memories, query_for_axes, decay=self._decay,
-                    graph=self._load_graph(), now=_f2_anchor)
+                    graph=_graph_obj, now=_f2_anchor)
+                # C1-M2 (owner 2026-11-13): observability-only — measure the
+                # graph axis's MARGINAL contribution (1-hop neighbors a
+                # keyword/BM25 axis alone would not have surfaced). Pure
+                # logger, zero behavior change, fail-soft. Both read-memory
+                # faces (auto _prefetch_body + explicit _recall_and_format)
+                # funnel through here, tagged via obs_face.
+                try:
+                    from search_index import graph_marginal_neighbors
+                    _marg = (graph_marginal_neighbors(
+                        _graph_obj, query_for_axes, all_memories)
+                        if query_for_axes else 0)
+                    logger.info(
+                        "C1-GRAPH-MARGINAL face=%s sid=%s marg=%d "
+                        "graph_edges=%d",
+                        obs_face or "unmarked",
+                        getattr(self, "session_id", "default"), _marg,
+                        len((_graph_obj or {}).get("edges") or []))
+                except Exception as _ge:  # pragma: no cover - observability
+                    logger.debug(f"FileMem: C1-M2 marginal-neighbor "
+                                  f"diagnostic skipped: {_ge}")
             except Exception as e:  # pragma: no cover - fail-soft gate
                 logger.warning(f"FileMem: RRF axes failed, legacy keyword scoring: {e}")
                 fused_scores = None
@@ -12068,12 +12091,14 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         """
         results = self.search_memories(query, limit=limit, min_score=min_score,
                                        profile_scope=profile_scope,
-                                       window=window, mem_type=mem_type)
+                                       window=window, mem_type=mem_type,
+                                       obs_face="explicit")
         hit_pool = "self" if profile_scope is not None else "all"
         if cascade and not results:
             results = self.search_memories(query, limit=limit, min_score=min_score,
                                            profile_scope=None,
-                                           window=window, mem_type=mem_type)
+                                           window=window, mem_type=mem_type,
+                                           obs_face="explicit")
             hit_pool = "all" if results else "empty"
         if egress_mode == "auto" and not raw:
             _dropped = sum(1 for r in results if self._egress_cut(r))

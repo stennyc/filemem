@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional
 
 __all__ = ["is_cjk_char", "tokenize", "BM25Index", "rrf_fuse",
            "rank_decay_axis", "graph_axis_rank", "graph_axis_stub",
-           "build_search_axes"]
+           "build_search_axes", "graph_marginal_neighbors"]
 
 _RRF_K = 60  # standard RRF constant (no config surface for SA2-3; YAGNI)
 _LATIN_TOKEN = re.compile(r"[a-z0-9]+")
@@ -223,10 +223,35 @@ def graph_axis_rank(graph: Optional[Dict], query: str, pool: List[Dict]) -> List
     """
     if not pool:
         return []
-    # B'-1b: adjacency now maps node -> {neighbor: kind} so the 1-hop
-    # neighbor score is weighted by the edge kind (max-coef kind wins when a
-    # pair is linked by several kinds). Pre-B'-1b this was {node: set} and
-    # every neighbor scored a flat 0.5 regardless of the connecting edge.
+    scores, hit_ids = _graph_scores(graph, query, pool)
+    # EMPTY SIGNAL RULE: a degenerate graph term (no adjacency / no query
+    # tokens / no hits) yields an empty order, which RRF treats as all-zeros
+    # (the SA2-3 two-axis fail-soft gate, spec SA2-4/4).
+    if not hit_ids:
+        return []
+    return sorted(range(len(scores)), key=lambda i: (-scores[i], i))
+
+
+def _graph_scores(graph: Optional[Dict], query: str,
+                  pool: List[Dict]):
+    """C1-M2 shared graph-axis scoring core (B'-1b). Returns
+    ``(scores, hit_ids)`` where ``scores[i]`` is the graph-axis score
+    (0.0 / 1.0 for a content-token HIT / 0.2~0.5 for a 1-hop NEIGHBOR,
+    weighted by the connecting edge kind) and ``hit_ids`` is the set of
+    pool-node ids that directly hit. Both ``graph_axis_rank`` (retrieval
+    order) and ``graph_marginal_neighbors`` (observability) read from this
+    one core so the scoring never diverges between the retrieval path and
+    the diagnostic path.
+
+    Deterministic + fail-soft by construction: a corrupt graph shape (bad
+    edges list / non-dict edge / missing src|dst) is skipped per-edge;
+    an empty pool / empty query / no adjacency returns (all-zeros, empty
+    hit set)."""
+    scores = [0.0] * len(pool)
+    if not pool:
+        return scores, set()
+    # B'-1b: adjacency maps node -> {neighbor: kind}; the 1-hop neighbor
+    # score is weighted by the connecting edge kind (max-coef kind wins).
     adjacency: Dict[str, Dict[str, str]] = {}
     if graph:
         edges = graph.get("edges")
@@ -244,8 +269,7 @@ def graph_axis_rank(graph: Optional[Dict], query: str, pool: List[Dict]) -> List
                 _add_adj(adjacency, dst, src, _kind, _coef)
     qtoks = set(tokenize(query))
     if not qtoks or not adjacency:
-        return []  # empty graph / empty query = empty term (all zeros)
-    scores = [0.0] * len(pool)
+        return scores, set()  # empty graph / empty query = all-zeros term
     hit_ids = set()
     for i, item in enumerate(pool):
         nid = str(item.get("id") or "")
@@ -255,7 +279,7 @@ def graph_axis_rank(graph: Optional[Dict], query: str, pool: List[Dict]) -> List
             scores[i] = 1.0
             hit_ids.add(nid)
     if not hit_ids:
-        return []
+        return scores, hit_ids
     for i, item in enumerate(pool):
         nid = str(item.get("id") or "")
         if nid and nid not in hit_ids:
@@ -272,7 +296,23 @@ def graph_axis_rank(graph: Optional[Dict], query: str, pool: List[Dict]) -> List
                         best = _c
             if best > 0.0:
                 scores[i] = _GRAPH_NEIGHBOR_BASE * best
-    return sorted(range(len(scores)), key=lambda i: (-scores[i], i))
+    return scores, hit_ids
+
+
+def graph_marginal_neighbors(graph: Optional[Dict], query: str,
+                             pool: List[Dict]) -> int:
+    """C1-M2 diagnostic (observability only, NOT part of RRF fusion): the
+    number of pool items whose ONLY reason to be graph-ranked is a 1-hop
+    NEIGHBOR edge — a non-HIT item carrying a positive graph score. This is
+    the graph axis's MARGINAL contribution: the items a keyword/BM25 axis
+    alone would not have surfaced. Direct HITs (content-token overlap) are
+    EXCLUDED because a BM25 axis can already reach them. Returns 0 when the
+    graph axis is empty (fail-soft: no graph / no hits / empty pool)."""
+    scores, hit_ids = _graph_scores(graph, query, pool)
+    # neighbors are exactly the items with a positive-but-not-1.0 graph
+    # score (HITs are 1.0, neighbors are in (0, 0.5]). Counting the
+    # strictly-positive, non-1.0 band isolates the marginal neighbor set.
+    return sum(1 for s in scores if 0.0 < s < 1.0)
 
 
 def graph_axis_stub(graph: Optional[Dict] = None,
