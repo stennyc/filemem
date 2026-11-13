@@ -6351,7 +6351,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # trigger-router level, but this explicit guard is a second path for safety.
         # G2: skip L0 fallback for foreign-author turns
         if user_content and not self._turn_foreign:
-            _rr = self.trigger_router.detect_and_route(user_content)
+            _rr = (self.trigger_router.detect_and_route(user_content)
+                   if self.trigger_router is not None else {"level": ""})
             if not _rr["level"] and self._is_fact_candidate(user_content):
                 # P1-1 safety: bg-review prompts are structural scaffolding, not facts.
                 if not user_content.strip().lower().startswith("review the conversation"):
@@ -6376,12 +6377,40 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 if _turn_fm:
                     trace_data["failure"] = _turn_fm
                 trace_line = json.dumps(trace_data, ensure_ascii=False) + "\n"
-                # T5b: shard lock on the session-trace append (cross-process
-                # consistency; single-writer per session in the common case).
-                with self._shard_lock(trace_file):
-                    with open(trace_file, "a", encoding="utf-8") as f:
-                        f.write(trace_line)
-                logger.info(f"FileMem: trace written: {len(trace_line)} bytes session={sid}")
+                # Idempotent dedupe (owner 2026-11-13, 宿主侧 _sync_external_memory_for_turn
+                # 有两条独立调用路径、无幂等门控，同一轮 turn 可能各触发一次
+                # provider.sync_turn → 同一 (content, assistant) 被 B4 append 两次、
+                # ts 错开 2~3s): 读该 session trace 文件最后一行，若 content+assistant
+                # 字节级相等且 ts 差 < 300s → 跳过本次 append。宁漏勿错：300s 窗口内的
+                # 原样重发=宿主侧双触发（不是新事实），跨 300s 的原样重发=新的逻辑
+                # turn（是新的证据，正常 append）。
+                _b4_skip = False
+                try:
+                    _last = ""
+                    with open(trace_file, "r", encoding="utf-8") as f:
+                        for _l in f:
+                            _last = _l.rstrip("\n")
+                    if _last:
+                        _last_d = json.loads(_last)
+                        if (_last_d.get("content") == trace_data["content"]
+                                and _last_d.get("assistant") == trace_data["assistant"]):
+                            _t1 = datetime.fromisoformat(trace_data["ts"])
+                            _t0 = datetime.fromisoformat(_last_d["ts"])
+                            if (_t1 - _t0).total_seconds() < 300:
+                                _b4_skip = True
+                                logger.info(
+                                    "FileMem: B4 trace dup suppressed "
+                                    f"(ts gap < 300s, same content+assistant) "
+                                    f"session={sid}")
+                except Exception as _dedupe_e:
+                    logger.warning(f"FileMem: trace dedupe check failed: {_dedupe_e}")
+                if not _b4_skip:
+                    # T5b: shard lock on the session-trace append (cross-process
+                    # consistency; single-writer per session in the common case).
+                    with self._shard_lock(trace_file):
+                        with open(trace_file, "a", encoding="utf-8") as f:
+                            f.write(trace_line)
+                    logger.info(f"FileMem: trace written: {len(trace_line)} bytes session={sid}")
             except Exception as e:
                 logger.warning(f"FileMem: session trace write failed: {e}")
 
