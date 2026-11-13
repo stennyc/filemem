@@ -21,6 +21,7 @@
     "auto_recall_max": 3,
     "graph_rebuild_water_level": 50,
     "graph_rebuild_cooldown_min": 30,
+    "graph_rebuild_pull_throttle_min": 5,
     "graph_bucket_quotas": {
       "semantic": 0.55,
       "co-occurrence": 0.22,

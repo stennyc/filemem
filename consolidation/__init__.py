@@ -42,6 +42,18 @@ DECAY_DEFAULTS = {
         #       cooldown (rebuild every time the water level is crossed).
         "graph_rebuild_water_level": 50,
         "graph_rebuild_cooldown_min": 30,
+        # A1-1 (owner 2026-11-13): read-side pull throttle. The search hot-path
+        # (_graph_pull_if_stale) stats the graph's freshness and, when stale,
+        # spawns a background rebuild. This knob (default 5 min) throttles
+        # how often that read-side pull may re-spawn, so the hot path never
+        # stat-spawns on every single search. Deliberately INDEPENDENT of
+        # graph_rebuild_cooldown_min (the tick-side proactive-patrol cooldown)
+        # — a reactive read of a stale graph must catch up without waiting for
+        # the 30-min tick window (re-applying that here would reintroduce the
+        # "defer to a later window" dead-end SA2-5 fixed; a cold start with
+        # _graph_last_build_ts==0 that the tick cooldown blocks forever would
+        # still catch up on its first stale read).
+        "graph_rebuild_pull_throttle_min": 5,
         # SA2-6 (owner 2026-11-12): per-kind edge-bucket quotas for the graph
         # full build (tools/build_graph.py). Pre-SA2-6 a single shared
         # _TOTAL_CAP=2000 pool let the high-volume temporal + co-occurrence

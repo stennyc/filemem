@@ -9242,6 +9242,65 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         except (json.JSONDecodeError, OSError):
             return None  # corrupt graph = no graph, not a crash
 
+    def _graph_pull_if_stale(self) -> None:
+        """A1-1 (owner 2026-11-13): read-side freshness pull on the search
+        hot-path. When a search reads graph.json and the graph is STALE
+        (corpus newer than the graph), spawn a BACKGROUND rebuild so the
+        NEXT search reads the fresh graph — without waiting for the 30-min
+        consolidation tick that previously was the ONLY trigger (which is
+        how a graph could sit stale for a day).
+
+        GATE SEMANTICS (deliberately DIFFERENT from the tick-side
+        _graph_maybe_spawn_bg_build, which is throttled by cooldown + water
+        level for the proactive-patrol rhythm): this pull gate is
+        freshness-only —
+          - _graph_building re-entrancy lock (shared flag: a build already
+            running wins; a pull during a build just returns, no double-
+            write)
+          - a read-side throttle (_graph_last_pull_ts,
+            graph_rebuild_pull_throttle_min default 5) so the hot path does
+            not stat+spawn on every single search
+        It deliberately BYPASSES _graph_last_build_ts cooldown and the
+        water-level backlog check: those throttle the *proactive* tick
+        patrol, but a *reactive* read of a stale graph must catch up now —
+        re-applying them here would reintroduce the exact "defer to a later
+        window" dead-end SA2-5 fixed (a cold start with _graph_last_build_ts
+        == 0 that the tick cooldown would block forever still catches up on
+        its first stale read).
+
+        The ~39s build runs on a detached daemon thread (shared with the
+        tick face via _graph_spawn_bg_thread + graph_autorebuild.
+        build_background). THIS search still reads the OLD graph (zero-
+        blocking, fail-soft); the NEXT search reads the fresh one. Any
+        probe/spawn hiccup is swallowed (graph intact, search degrades to
+        two-axis, host turn never breaks)."""
+        try:
+            root = getattr(self, "storage_dir", None)
+            if not isinstance(root, Path):
+                return
+            if self._graph_freshness().get("status") != "stale":
+                return  # fresh / missing -> nothing to catch up
+            now = time.time()
+            cfg = (getattr(self, "_decay", None) or {}).get("search") or {}
+            throttle_min = float(cfg.get("graph_rebuild_pull_throttle_min", 5))
+            if (now - getattr(self, "_graph_last_pull_ts", 0.0)) < throttle_min * 60.0:
+                return  # read-side throttle; next search retries
+            with self._lock:
+                if getattr(self, "_graph_building", False):
+                    return  # a build (tick-side or a prior pull) is running
+                self._graph_last_pull_ts = now
+                self._graph_building = True
+                from graph_autorebuild import build_background as _graph_build_bg
+                spawn = _graph_spawn_bg_thread()
+                spawn(_graph_build_bg, args=(str(root),),
+                      name=f"filemem-graph-pull-{getattr(self, 'session_id', 'default')}",
+                      on_done=lambda ok: self._graph_build_done(ok, cfg, root))
+            logger.info("FileMem: graph read-side pull — stale detected, "
+                       "background rebuild spawned (this search reads the "
+                       "previous graph; next search reads the fresh one)")
+        except Exception as e:
+            logger.debug(f"FileMem: graph read-side pull skipped (graph intact): {e}")
+
     def _graph_maybe_spawn_bg_build(self, graph_root: "Path", _graph_build_bg) -> None:
         """SA2-5 (owner 2026-11-12, 选2 filemem 自持 daemon 线程, 不用 cronjob):
         called by the tick thread AFTER the O(1) needs_rebuild gate returned
@@ -9856,6 +9915,13 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 # audit allowlist in __init__.py (plugin-level module, not
                 # stdlib/agent). Kept inside the fail-soft gate.
                 from search_index import build_search_axes
+                # A1-1 (owner 2026-11-13): read-side freshness pull — if the
+                # graph on disk is stale (corpus newer), spawn a background
+                # rebuild so the NEXT search reads the fresh graph. O(1) on
+                # the hot path (stat + throttle check; the ~39s build runs on
+                # a detached daemon thread). THIS search still uses the
+                # current graph (fail-soft, zero-blocking).
+                self._graph_pull_if_stale()
                 fused_scores = build_search_axes(
                     all_memories, query_for_axes, decay=self._decay,
                     graph=self._load_graph(), now=_f2_anchor)
