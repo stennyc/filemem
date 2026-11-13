@@ -482,3 +482,54 @@ def test_c3_negation_channel_does_not_supersede_failure_row():
         f"C3 channel must also exempt failure rows; got stamped={stamped_ids}"
     assert existing[0].get("metadata", {}).get("superseded") in (None, False), \
         "C3 channel must not flip the failure row superseded"
+
+
+def test_flush_row_never_stamped_settled_true():
+    # 复盘⑧: _flush passes source="auto"; the settled=True stamp (which the
+    # O1 auto-face fold keys on, L2167) is ONLY set for source=="confirmed_draft"
+    # (L7722). An auto row at worst gets settled_candidate=True (a pure
+    # nomination that does NOT fold out, L2165/L554). So a flushed failure row
+    # must never carry settled=True, regardless of whether its content happens
+    # to hit _SETTLED_DONE_SIGNALS.
+    import __init__ as fm_mod
+    with tempfile.TemporaryDirectory() as td:
+        p = _make_provider(pathlib.Path(td))
+        # Force the synthesized content to hit a settled-done signal to prove
+        # even the worst case only nominates, never settles.
+        _seed_marker(p, sid="sess_A", ctx="全部 done 收工 全修完")  # hit signals
+        p._flush_unconsumed_failure_markers("sess_A")
+        rows = _read_all(p)
+        assert len(rows) == 1
+        md = rows[0]["metadata"]
+        assert md.get("settled") is not True, \
+            f"flushed auto row must never carry settled=True; md={md}"
+        # At worst it may carry settled_candidate (non-folding nomination).
+        assert md.get("settled_candidate") in (None, True)
+        # The auto-face fold predicate: not settled, not superseded, not
+        # lapsed -> eligible (the row is NOT folded out by the settled channel).
+        import __init__ as _fm
+        assert _fm._auto_inject_eligible(rows[0], session_sp=None,
+                                         cur_session_id="someSession") is True, \
+            "flushed row must not be folded out via the settled channel"
+
+
+def test_flush_row_survives_injection_egress_by_default():
+    # 复盘⑨: the injection origin_mark gate only DROPS a row when
+    # metadata.trust=="low" (Rule 2) or (trust is None AND
+    # drop_unknown_trust, Rule 3, default False). A flushed failure row carries
+    # NO trust stamp -> under the default injection cfg it is never dropped.
+    # directive-quote (Rule 4) is allow+note, not drop.
+    import __init__ as fm_mod
+    with tempfile.TemporaryDirectory() as td:
+        p = _make_provider(pathlib.Path(td))
+        _seed_marker(p)
+        p._flush_unconsumed_failure_markers("sess_A")
+        row = _read_all(p)[0]
+        # Default injection cfg: no directive_patterns, drop_unknown_trust False.
+        default_cfg = {}
+        action, mark = fm_mod.injection_gate_decision(row, default_cfg)
+        assert action == "allow", \
+            f"failure row must not be egress-dropped under default cfg; got {action}/{mark}"
+        # Even if the operator enables drop_unknown_trust, a NO-trust row would
+        # drop — but that is operator opt-in config, not the failure mechanism's
+        # fault. Under the DEFAULT the row is trusted.
