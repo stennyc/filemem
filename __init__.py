@@ -6709,14 +6709,23 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         ftype = fm.get("failure_type", "tool_error")
         tool = fm.get("tool", "")
         # Self-describing lesson body: the model reads this at recall time.
-        # Carrying the tool name + type + ctx as prose keywords lets a future
-        # matching turn's RRF recall surface it (the lesson line at L4927
-        # then appends the raw ctx verbatim alongside the hit row).
+        # CRITICAL (复盘②): keep the body a FIXED skeleton carrying only the
+        # tool name + failure type — NEVER the raw ctx. The ctx is free-form
+        # (an error snippet) and may contain task/decision strong-signal words
+        # (必须 / should / todo / 待办 / 拍板 …); if spliced into the body,
+        # _detect_type (regex over the whole content, L7943) misfiles the row
+        # into the task/decision shard, which then trips the plan-probe
+        # (L7750: source=='auto' and mem_type in task/decision) and pollutes
+        # the clarify channel with a "fake PRD candidate" for what is really a
+        # failure lesson. The full ctx still reaches the model: it is stored
+        # in metadata.failure_ctx and rendered verbatim by the recall ⚠️ line
+        # (L4970), independent of the body. RRF recall keeps its keyword
+        # signal from the tool name + type in the body; the ctx detail is a
+        # metadata-side read, not a body keyword.
         content = (
             f"⚠️ 失败教训({ftype}): 本 session 内 {tool or '工具'} 调用失败过"
-            + (f"（{ctx[:120]}）" if ctx else "")
-            + "——同情境下原参数重试大概率再撞同一堵墙，换姿势（变参/改背景/"
-              "先查清前置）再发。"
+            "——同情境下原参数重试大概率再撞同一堵墙，换姿势（变参/改背景/"
+            "先查清前置）再发。详见 failure_ctx。"
         )
         # Carry the failure metadata EXPLICITLY via _extra_meta (not via
         # _save_memory's internal _failure_meta_for) so the dedup-upsert

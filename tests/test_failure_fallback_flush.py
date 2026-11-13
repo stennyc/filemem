@@ -132,15 +132,46 @@ def test_reflush_same_ctx_collapses_to_one_row():
 
 # ---- ④ distinct ctx → genuinely new row (no false dedup) ----------------
 
-def test_reflush_distinct_ctx_is_new_row():
+def test_reflush_distinct_tool_is_new_row():
+    # Body no longer carries ctx (复盘② fix), so dedup granularity is
+    # tool+type, not ctx. Same tool+type with different ctx COLLAPSES to one
+    # row; a different tool is a genuinely different wall = a new row.
     with tempfile.TemporaryDirectory() as td:
         p = _make_provider(pathlib.Path(td))
-        _seed_marker(p, ctx="terminal: HTTP 503 upstream")
+        _seed_marker(p, tool="terminal", ftype="retry_loop",
+                     ctx="terminal: HTTP 503 upstream")
         p._flush_unconsumed_failure_markers("sess_A")
-        _seed_marker(p, ctx="terminal: Permission denied /root/x")
+        # same tool+type, different ctx -> same fixed body -> collapse
+        _seed_marker(p, tool="terminal", ftype="retry_loop",
+                     ctx="terminal: Permission denied /root/x")
+        p._flush_unconsumed_failure_markers("sess_A")
+        assert len(_read_all(p)) == 1, "same tool+type collapses to one row"
+        # different tool -> different body -> new row
+        _seed_marker(p, tool="browser_vault", ftype="tool_error",
+                     ctx="browser_vault: origin_mismatch")
+        p._flush_unconsumed_failure_markers("sess_A")
+        assert len(_read_all(p)) == 2, "different tool is a new row"
+
+
+def test_body_immune_to_ctx_strong_signal_words():
+    # 复盘② core guard: a ctx containing task/decision strong-signal words
+    # (必须 / 拍板 / 待办 …) must NOT refile the synthesized row into the
+    # task/decision shard (which would trip the plan-probe). The body is a
+    # fixed skeleton, so _detect_type always returns 'fact' regardless of ctx.
+    with tempfile.TemporaryDirectory() as td:
+        p = _make_provider(pathlib.Path(td))
+        _seed_marker(p, tool="terminal", ftype="retry_loop",
+                     ctx="terminal: error: 必须用 background=true；拍板用 docker")
         p._flush_unconsumed_failure_markers("sess_A")
         rows = _read_all(p)
-        assert len(rows) == 2, "distinct walls must be distinct rows"
+        assert len(rows) == 1
+        # The row must land in the fact shard, NOT task/decision.
+        assert rows[0]["type"] == "fact", \
+            f"ctx strong-signal leaked into type: {rows[0]['type']}"
+        # And the fixed body never contains the ctx's strong-signal words.
+        assert "必须" not in rows[0]["content"]
+        # The full ctx is preserved in metadata for the recall ⚠️ line.
+        assert "必须用 background=true" in rows[0]["metadata"]["failure_ctx"]
 
 
 # ---- ⑤ recall-side boost: _failure_reorder_key (pure) --------------------
