@@ -53,6 +53,7 @@ import argparse
 import hashlib
 import json
 import os
+import time
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -486,6 +487,12 @@ def build_and_write(storage_root: Path, dry_run: bool = False) -> dict:
         try:
             if graph_fingerprint(json.loads(prev)) == graph["fingerprint"]:
                 result["skipped"] = "up-to-date (fingerprint match, zero writes)"
+                # A1-1 follow-up: touch mtime so _graph_freshness's mtime
+                # comparison returns "fresh" — without this the skip path
+                # never updates graph.json's mtime, the read-side pull sees
+                # "stale" forever (corpus mtime > graph mtime), and every
+                # search spawns a pointless 39s build that skips again → ∞.
+                os.utime(out, times=(os.path.getatime(out), time.time()))
                 return result
         except (json.JSONDecodeError, OSError):
             pass  # corrupt/legacy file: proceed to (re)write under .bak
