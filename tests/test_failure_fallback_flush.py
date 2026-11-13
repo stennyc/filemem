@@ -583,3 +583,67 @@ def test_flush_row_lands_before_distill_so_timeout_cannot_lose_it():
             "failure_ctx must be on the row (the model-facing ⚠️ line reads it)"
         # Distill enhancements are OPTIONAL — their absence is not a loss.
         assert "distilled_at" in row["metadata"] or True  # may be present or not
+
+
+def test_flush_failure_row_not_listed_in_pending_confirm_panel():
+    # 复盘⑫: a metadata.failure_type row is mechanically-confirmed (confirmed=True),
+    # NOT a draft the user must adjudicate. The L0-auto save face
+    # (_save_memory L7821) used to list EVERY L0-auto row in the pending-confirm
+    # panel — putting a "⚠️ 失败教训" under 待确认保存/丢弃, which is backwards.
+    # 修: L7821 exempts failure_type rows. A normal L0 auto row still lands.
+    #
+    # End-to-end: flush a failure marker (sync path, _main_runtime None), then
+    # check the provider's _pending_confirm queue — the failure row's id must
+    # NOT be listed under kind="l0".
+    with tempfile.TemporaryDirectory() as td:
+        p = _make_provider(pathlib.Path(td))
+        assert getattr(p, "_main_runtime", None) is None  # sync leg
+        p._pending_confirm = {}  # __new__ fixture skipped __init__; seed the queue
+        _seed_marker(p)
+        p._flush_unconsumed_failure_markers("sess_A")
+        rows = _read_all(p)
+        assert len(rows) == 1
+        fail_id = rows[0]["id"]
+        assert rows[0]["metadata"]["failure_type"] is not None
+        # Sanity: a NORMAL L0 auto row WOULD land in this queue (so the queue
+        # is live) — proves the absence of the failure row is the exemption,
+        # not a dead queue.
+        p._save_memory("plain environmental fact about the host cpu cores and memory layout details",
+                       level="L0", source="auto", _force_write=True)
+        pc = getattr(p, "_pending_confirm", {})
+        queued_ids = [
+            e.get("id") for q in pc.values() for e in q
+            if e.get("kind") == "l0"
+        ]
+        assert fail_id not in queued_ids, \
+            f"failure row {fail_id} must not appear in the pending-confirm panel; got {queued_ids}"
+        assert any(qid != fail_id for qid in queued_ids), \
+            f"queue must be live (normal row landed) so the failure-row absence is meaningful; got {queued_ids}"
+
+
+def test_normal_l0_auto_row_still_listed_in_pending_confirm_panel():
+    # Negative control: a NORMAL L0 auto row (no failure_type) still lands in
+    # the pending-confirm panel — the exemption is scoped to failure rows only.
+    with tempfile.TemporaryDirectory() as td:
+        p = _make_provider(pathlib.Path(td))
+        assert getattr(p, "_main_runtime", None) is None  # sync leg
+        # The __new__-constructed fixture never ran __init__, so the
+        # _pending_confirm queue (initialized in __init__ L2783) is absent —
+        # _push_pending_confirm no-ops on a missing queue (L6106-6108). Seed
+        # it here so the assertion reads the real queue, not the None no-op.
+        p._pending_confirm = {}
+        # A plain L0 auto row through _save_memory (not a failure marker).
+        p._save_memory("plain environmental fact about the host cpu cores and memory layout details", level="L0",
+                       source="auto", _force_write=True)
+        rows = _read_all(p)
+        plain = [r for r in rows if r["metadata"].get("failure_type") is None]
+        assert plain, "need at least one normal L0 auto row to assert on"
+        plain_id = plain[0]["id"]
+
+        pc = getattr(p, "_pending_confirm", {})
+        queued_ids = [
+            e.get("id") for q in pc.values() for e in q
+            if e.get("kind") == "l0"
+        ]
+        assert plain_id in queued_ids, \
+            f"normal L0 auto row {plain_id} must still land in the panel; got {queued_ids}"

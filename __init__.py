@@ -7818,7 +7818,15 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 # the next turn's [记忆报告] shows it one-per-line with its id.
                 # (T3's per-turn delta counters were superseded by the pending
                 # queue — the report is now driven purely by _pending_confirm.)
-                if level == "L0" and source == "auto":
+                # 复盘⑫ owner ruling: a metadata.failure_type row (the _flush
+                # failure-lesson row) is mechanically-confirmed by the detector
+                # + owner design intent — it is NOT a draft the user must
+                # adjudicate. Listing it in the pending-confirm panel would put
+                # a "⚠️ 失败教训" under 待你确认保存/丢弃, which is semantically
+                # backwards (it is already confirmed=True, not a candidate).
+                # Exempt it; a normal L0 auto row still lands here as today.
+                if level == "L0" and source == "auto" \
+                        and not (_new_row_dict.get("metadata") or {}).get("failure_type"):
                     _ts = getattr(self, "_turn_active_sid", None) or self.session_id
                     self._push_pending_confirm(_ts, item.id, level, content, kind="l0")
 
