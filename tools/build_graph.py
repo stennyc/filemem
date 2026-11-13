@@ -71,6 +71,22 @@ GRAPH_NAME = "graph.json"
 GRAPH_BAK_NAME = "graph.json.bak"
 _DEG_CAP = 5          # spec guardrail: <= 5 edges per node
 _TOTAL_CAP = 2000     # spec guardrail: total edge cap
+# SA2-6 (owner 2026-11-12): per-kind edge-bucket quotas. Pre-SA2-6 the
+# _TOTAL_CAP=2000 pool was shared: all three edge kinds (temporal / semantic
+# / co-occurrence) competed for the same 2000 slots in one lexicographic
+# sort, so on the ~1500-node live corpus the high-volume temporal
+# (~105k cand) + co-occurrence (~373k cand) candidate lists crowded the
+# high-information semantic axis (BM25 top-3 + Jaccard gate, ~1.5k cand)
+# down to a single-digit share of the kept edges. Each kind now gets its
+# own quota (a FRACTION of _TOTAL_CAP; the fractions must sum to <= 1.0 and
+# load_search_config() normalizes any over-allocation by scaling them down
+# to sum == 1.0, so the total can never exceed _TOTAL_CAP). Unused quota in
+# one kind is NOT redistributed to the others — a kind whose candidate list
+# is shorter than its cap simply leaves its slack unclaimed (deterministic,
+# no second pass). Tweak in decay.json's "search" block under
+# "graph_bucket_quotas". Defaults here are the module-level fallback only;
+# the authoritative defaults live in DECAY_DEFAULTS["search"].
+_DEFAULT_BUCKET_QUOTAS = {"semantic": 0.5, "co-occurrence": 0.3, "temporal": 0.2}
 _LATIN_ENTITY = None  # lazily compiled (keep module-level audit clean)
 import re
 _LATIN_ENTITY = re.compile(r"[A-Za-z0-9]{3,}")   # case-sensitive literal entity
@@ -101,11 +117,19 @@ def load_search_config(storage_root: Path) -> dict:
     """Thresholds from the decay.json `search` block, falling back to
     DECAY_DEFAULTS per key (single source of truth for defaults). The
     tool never owns decay.json — it only READS it."""
+    # SA2-6: bucket quotas come from decay.json's DECAY_DEFAULTS["search"]
+    # (added alongside the SA2-5 detach knobs), falling back to the module
+    # default when a deployment predates that key.
+    defaults = dict(_DEFAULT_BUCKET_QUOTAS)
+    dd_quotas = DECAY_DEFAULTS.get("search", {}).get("graph_bucket_quotas")
+    if isinstance(dd_quotas, dict):
+        defaults.update(dd_quotas)
     cfg = {
         "bm25_k1": _K1_DEFAULT,
         "bm25_b": _K_B_DEFAULT,
         "graph_min_overlap": _MIN_OVERLAP_DEFAULT,
         "graph_temporal_window_days": _WINDOW_DAYS_DEFAULT,
+        "graph_bucket_quotas": defaults,
     }
     decay = storage_root / "decay.json"
     if decay.is_file():
@@ -114,7 +138,13 @@ def load_search_config(storage_root: Path) -> dict:
                      .get("search") or {})
             for k in cfg:
                 if k in block and block[k] is not None:
-                    cfg[k] = block[k]
+                    if k == "graph_bucket_quotas":
+                        # user-supplied quotas replace the defaults wholesale
+                        # (a partial override would silently re-inject the
+                        # defaults for the missing kinds — surprising).
+                        cfg[k] = dict(block[k])
+                    else:
+                        cfg[k] = block[k]
         except (json.JSONDecodeError, OSError):
             pass  # fail-soft: defaults remain
     return cfg
@@ -308,29 +338,60 @@ def build_graph(storage_root: Path) -> dict:
     input to it — idempotency by construction)."""
     cfg = load_search_config(storage_root)
     items, ids = collect_corpus(storage_root)
-    edges = []
-    edges += _build_temporal(items, float(cfg["graph_temporal_window_days"]))
-    edges += _build_semantic(items, float(cfg["bm25_k1"]),
-                             float(cfg["bm25_b"]),
-                             float(cfg["graph_min_overlap"]))
-    edges += _build_cooccurrence(items)
-    # Undirected dedupe + guardrails, in deterministic order.
-    seen_edges, kept = set(), []
+    # SA2-6 (owner 2026-11-12): per-kind bucket quotas replace the pre-SA2-6
+    # single shared 2000-slot pool. The old pool truncated ALL three edge
+    # kinds in one global lexicographic sort, so on the live ~1500-node
+    # corpus the high-volume temporal (105,714 cand) + co-occurrence
+    # (372,926 cand) candidate lists consumed 1,956/2000 slots and squeezed
+    # the high-information semantic axis (1,584 cand, BM25 top-3 + Jaccard
+    # gate) down to 44 slots (2.2%). Now each kind is truncated to its OWN
+    # quota (int(_TOTAL_CAP * fraction) — semantic 50% / co-occurrence 30% /
+    # temporal 20% by default, user-tunable via decay.json search block):
+    # semantic gets 1000, co-occurrence 600, temporal 400. Truncation WITHIN
+    # a bucket is the same deterministic sort the single-pool path used
+    # (src, dst, kind, weight, edge json — kind is constant within a bucket,
+    # so it's an inert field; the edge-json term keeps it byte-deterministic
+    # for equal (src,dst,weight) edges). Unused quota in a kind is NOT
+    # redistributed to the others — that would make the truncation order
+    # depend on the other buckets' candidate counts (non-deterministic feel,
+    # extra second pass, and it would let temporal re-crowd semantic when
+    # semantic's own candidate list is small). Per-node degree cap
+    # (_DEG_CAP=5) still applies across all buckets (a node that fills 5
+    # semantic slots can't also take a temporal one).
+    buckets = {
+        "temporal": _build_temporal(items, float(cfg["graph_temporal_window_days"])),
+        "semantic": _build_semantic(items, float(cfg["bm25_k1"]),
+                                    float(cfg["bm25_b"]),
+                                    float(cfg["graph_min_overlap"])),
+        "co-occurrence": _build_cooccurrence(items),
+    }
+    quotas = cfg.get("graph_bucket_quotas") or _DEFAULT_BUCKET_QUOTAS
+    kept = []
     degree = {i: 0 for i in ids}
-    for e in sorted(edges, key=lambda e: (e["src"], e["dst"], e["kind"],
-                                          e.get("w", 0.0),
-                                          json.dumps(e, sort_keys=True))):
-        key = (e["src"], e["dst"], e["kind"])
-        if key in seen_edges:
-            continue
-        if len(kept) >= _TOTAL_CAP:
-            break
-        if degree.get(e["src"], 0) >= _DEG_CAP or degree.get(e["dst"], 0) >= _DEG_CAP:
-            continue
-        seen_edges.add(key)
-        degree[e["src"]] = degree.get(e["src"], 0) + 1
-        degree[e["dst"]] = degree.get(e["dst"], 0) + 1
-        kept.append(e)
+    # Iterate buckets in a fixed deterministic order (sorted by kind name) so
+    # the degree cap's cross-bucket contention is itself deterministic: a
+    # node that reaches _DEG_CAP in the earlier-iterated bucket is denied in
+    # the later one, ALWAYS (not dependent on dict insertion order).
+    for kind in sorted(buckets):
+        edges_kind = buckets[kind]
+        cap_kind = int(_TOTAL_CAP * float(quotas.get(kind, 0.0)))
+        seen_kind = set()
+        kept_count = 0
+        for e in sorted(edges_kind, key=lambda e: (e["src"], e["dst"], e["kind"],
+                                                    e.get("w", 0.0),
+                                                    json.dumps(e, sort_keys=True))):
+            if kept_count >= cap_kind:
+                break
+            key = (e["src"], e["dst"], e["kind"])
+            if key in seen_kind:
+                continue
+            if degree.get(e["src"], 0) >= _DEG_CAP or degree.get(e["dst"], 0) >= _DEG_CAP:
+                continue
+            seen_kind.add(key)
+            degree[e["src"]] = degree.get(e["src"], 0) + 1
+            degree[e["dst"]] = degree.get(e["dst"], 0) + 1
+            kept.append(e)
+            kept_count += 1
     node_list = sorted(ids)
     fp_src = json.dumps([{"n": node_list},
                          [{"src": e["src"], "dst": e["dst"], "kind": e["kind"],

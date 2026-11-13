@@ -42,6 +42,19 @@ DECAY_DEFAULTS = {
         #       cooldown (rebuild every time the water level is crossed).
         "graph_rebuild_water_level": 50,
         "graph_rebuild_cooldown_min": 30,
+        # SA2-6 (owner 2026-11-12): per-kind edge-bucket quotas for the graph
+        # full build (tools/build_graph.py). Pre-SA2-6 a single shared
+        # _TOTAL_CAP=2000 pool let the high-volume temporal + co-occurrence
+        # candidate lists crowd the high-information semantic axis down to
+        # ~44/2000 slots on the live ~1500-node corpus. Now each kind gets
+        # its own quota (fractions of 2000, must sum to <= 1.0; unused
+        # quota in one kind is NOT redistributed to the others — that keeps
+        # the truncation a single deterministic pass). Default mix:
+        # semantic 50% (1000) / co-occurrence 30% (600) / temporal 20% (400).
+        # Re-weight by overriding this dict in decay.json's "search" block
+        # (a partial dict REPLACES the whole set — supply all three kinds).
+        "graph_bucket_quotas": {"semantic": 0.5, "co-occurrence": 0.3,
+                                "temporal": 0.2},
         # EP-1: lineage 候选 gate（确定性零 LLM，确认面归 EP-2）.
         # supersede_min_overlap = Jaccard(token 集) of the NEW content vs an
         # existing same-type row; at-or-above it the old row becomes a
