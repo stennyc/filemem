@@ -39,10 +39,32 @@ sys.path.insert(0, str(PLUGIN_DIR))
 
 import __init__ as fm  # noqa: E402  (plugin module; import-time is I/O-free)
 
-# Dynamic path resolution (mirrors build_graph.py / backfill_origin.py /
-# verify_injection_gate.py): HERMES_HOME env > ~/.hermes. No hardcoded paths.
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
-LIVE_STORE = HERMES_HOME / "filemem"
+
+def _default_live_store() -> Path:
+    """Replicate the provider's T5b auto storage-root resolution for the CLI's
+    default --store (ZERO I/O, no initialize(), no config read).
+
+    The provider (host) runs with HERMES_HOME pointing at the ACTIVE profile
+    (e.g. /root/.hermes/profiles/coder) and auto-resolves its store to the
+    NEUTRAL shared root: strip a trailing ``profiles/<name>`` segment, then
+    append ``/filemem``  ->  /root/.hermes/filemem.  A CLI that naively used
+    ``$HERMES_HOME/filemem`` would land on the per-profile path
+    (/root/.hermes/profiles/coder/filemem, typically empty) and silently miss
+    every central row.  Mirror the provider's auto branch here so the default
+    targets the same tree the host writes.  HERMES_HOME unset -> ~/.hermes.
+    """
+    home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+    parts = [p for p in home.parts if p]
+    # strip the trailing "profiles/<name>" tail ONLY when it really ends in
+    # exactly that shape (same guard as the provider).
+    if len(parts) >= 2 and parts[-2] == "profiles":
+        base = Path(*parts[:-2]) if len(parts) > 2 else home
+    else:
+        base = home
+    return base / "filemem"
+
+
+LIVE_STORE = _default_live_store()
 
 
 def _now_iso() -> str:
