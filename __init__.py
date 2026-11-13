@@ -6740,13 +6740,62 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             "failure_fallback": True,
             "failure_origin_sid": session_id,
         }
-        row_id = self._save_memory(
-            content,
-            level="L0",
-            source="auto",
-            _extra_meta=extra_meta,
-            _force_write=True,
-        )
+        # 宿主契约面 (复盘①, owner 拍板 C): _save_memory(source="auto") runs a
+        # budget-gated SYNCHRONOUS distill LLM call (L7743-7747) + the P3-1
+        # plan-probe leg. on_session_end is a host hook with a 60s suppression
+        # window (L3230): a synchronous LLM call that pushes the hook past that
+        # window makes the host SKIP on_session_end, which is the exact moment
+        # this fallback runs — so the synthesized row never lands and the hole
+        # this closes re-opens. Run the _save_memory work on a background
+        # daemon thread (the established filemem pattern, L16292-16309:
+        # spawn_context_thread in-host, plain daemon fallback standalone) so the
+        # end-flow stays O(1) zero-blocking. The marker is consumed SYNCHRONOUSLY
+        # below (never re-fired next session); only the row landing + distill
+        # move off-thread. Fail-soft: a spawn hiccup degrades to a synchronous
+        # save (the pre-fix behavior — the hook may time out, but the lesson
+        # still lands rather than being lost to a no-op spawn).
+        def _bg_flush() -> None:
+            try:
+                self._save_memory(
+                    content,
+                    level="L0",
+                    source="auto",
+                    _extra_meta=extra_meta,
+                    _force_write=True,
+                )
+            except Exception as _bg_e:
+                logger.warning(
+                    f"FileMem: failure-marker bg flush save failed "
+                    f"({_bg_e}); marker already consumed, row may be pending")
+        _spawned = False
+        # Only spawn a bg thread when this provider is IN-HOST — a captured
+        # main_runtime exists, which is the case where _save_memory's sync
+        # distill LLM call would actually run and could push the hook past the
+        # 60s window. Read self._main_runtime directly (the register()-time
+        # snapshot, L2710) rather than _live_main_runtime(): the _flush leg is
+        # a THREADING decision ("is this provider in-host at all"), not an LLM
+        # gate — it must NOT count as one of the LLM-face gate sites that the
+        # _live_main_runtime census (tests/test_live_main_runtime.py) tracks.
+        # Standalone / a non-registered fixture has _main_runtime None, so
+        # distill self-skips (L8278) and the sync path is zero-cost +
+        # deterministic (no thread race).
+        _in_host = getattr(self, "_main_runtime", None) is not None
+        if _in_host:
+            try:
+                from agent.memory_provider import spawn_context_thread as _spawn_ct
+                _spawn_ct(_bg_flush,
+                          name=f"filemem-failure-flush-{session_id}").start()
+                _spawned = True
+            except Exception:
+                _spawned = False
+        if _spawned:
+            logger.debug(
+                f"FileMem: failure-marker flush spawned on bg daemon thread "
+                f"sid={session_id} (end-flow stays O(1))")
+        else:
+            # standalone / no main_runtime: run synchronously — distill
+            # self-skips (L8278), zero LLM cost, no thread race.
+            _bg_flush()
         # Consume the marker now (the synthesized row is the LAST chance to
         # carry it). Pop BOTH the on_session_end key and the instance key:
         # _save_memory's internal _failure_meta_for may have already popped
@@ -6756,26 +6805,14 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         self._pending_failure_meta.pop(session_id, None)
         self._pending_failure_meta.pop(
             getattr(self, "session_id", None) or "default", None)
-        if row_id:
-            logger.info(
-                f"FileMem: failure-marker flushed to L0 row {row_id[:12]} "
-                f"({ftype}, tool={tool or '?'}) sid={session_id}")
-        else:
-            # EMPTY is NOT a failure signal: with _force_write=True the row has
-            # already landed on disk by the time _save_memory returns (the
-            # append happens before the _session_save_count>20 check at L7771,
-            # which returns "" on cap but the row is kept). The empty return
-            # covers: (a) dedup-upsert collapse onto an existing same-ctx row,
-            # (b) the auto-save OOM cap (count>20) returning "" after the row
-            # is already written, (c) an ingress-quarantine (rare — the ⚠️ body
-            # is not a tool-dump/JSON/structural opener). In all three the
-            # marker is consumed and the lesson is in the pool (or quarantined,
-            # audited). Log neutral: do NOT call (c) "no row id" as if the
-            # lesson were lost.
-            logger.info(
-                f"FileMem: failure-marker flushed (row landed or collapsed; "
-                f"empty id is not a loss) ({ftype}, tool={tool or '?'}) "
-                f"sid={session_id}")
+        # row_id is not available here: _save_memory now runs on a bg thread
+        # (or sync in standalone), its return value is consumed inside
+        # _bg_flush and not propagated back. The marker is consumed either
+        # way (the pops above), and the row lands in the bg/sync save. Log
+        # the spawn posture, not a row id.
+        logger.info(
+            f"FileMem: failure-marker flushed ({ftype}, tool={tool or '?'}) "
+            f"sid={session_id} via {'bg-thread' if _spawned else 'sync-fallback'}")
 
     def _handle_memory_trigger(self, route_result: Dict, content: str) -> None:
         """Handle memory trigger based on route result."""

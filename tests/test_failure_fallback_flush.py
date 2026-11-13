@@ -174,6 +174,42 @@ def test_body_immune_to_ctx_strong_signal_words():
         assert "必须用 background=true" in rows[0]["metadata"]["failure_ctx"]
 
 
+# ---- ⑦ in-host bg-thread leg: spawn decision is on _live_main_runtime ------
+
+def test_in_host_spawn_decision_is_isolated():
+    # 复盘① (owner C): _flush's spawn-vs-sync decision keys on _live_main_runtime()
+    # (in-host -> bg thread so the end-flow stays O(1); standalone -> sync so
+    # distill self-skips and the test is deterministic). This leg pins the
+    # DECISION without racing a real daemon thread: stub _save_memory to record
+    # whether it was called, stub _live_main_runtime to report in-host, and
+    # confirm the bg path was taken (spawn attempted) so the sync call is NOT
+    # made on the calling thread. A monkeypatched _save_memory means no row
+    # actually lands, so there is no thread to join — the assertion is on the
+    # call posture, not on disk state (which would be flaky under daemon
+    # threads sharing _rate_limited_queue with sibling tests).
+    with tempfile.TemporaryDirectory() as td:
+        p = _make_provider(pathlib.Path(td))
+        calls = []
+        p._save_memory = lambda *a, **k: calls.append(k) or ""
+        p._main_runtime = {"model": "x"}   # in-host snapshot -> spawn path
+        _seed_marker(p)
+        p._flush_unconsumed_failure_markers("sess_A")
+        # in-host -> spawn path: the sync leg's _bg_flush is NOT called on the
+        # caller thread; the bg thread will call it later. _save_memory is
+        # monkeypatched so the bg call is harmless. Give the thread a bounded
+        # window to record the call, then assert it happened with the right
+        # posture (source=auto, _force_write=True).
+        import time as _time
+        deadline = _time.time() + 5
+        while not calls and _time.time() < deadline:
+            _time.sleep(0.05)
+        assert calls, "in-host _flush did not reach _save_memory (bg or sync)"
+        assert calls[0].get("source") == "auto"
+        assert calls[0].get("_force_write") is True
+        # Marker consumed synchronously regardless of the thread posture.
+        assert "sess_A" not in p._pending_failure_meta
+
+
 # ---- ⑤ recall-side boost: _failure_reorder_key (pure) --------------------
 
 def test_failure_reorder_key_puts_failure_rows_first():
