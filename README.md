@@ -6,26 +6,38 @@
 >
 > **核心能力：**
 > - **L0–L2 分层记忆**：L0 环境事实（自动存）→ L1 操作经验（会话结束确认）→ L2 架构决策（显式确认才升级）
-> - **四类记忆**：偏好（preference）/ 事实（fact）/ 决策（decision）/ 任务（task），各存各的 JSON 文件
-> - **双模检索**：零依赖关键词重叠评分 + 可选模型辅助（走 Hermes 辅助 LLM 任务，无 LLM 时自动降级为纯关键词）
+> - **六类记忆**：偏好（preference）/ 事实（fact）/ 决策（decision）/ 任务（task）/ 计划（plan）/ 定时（scheduled），各存各的 JSON 文件
+> - **多轴检索（RRF）**：BM25 关键词（拉丁词 + 中文 n-gram，idf 加权）× 衰减/新鲜度 × 图谱 1-hop 扩展，三路倒排 rank fusion；`origin_mark` 标记低可信 / 指令引用行
 > - **会话自动抽取（post-LLM hook）**：每轮自动从最近消息里捞出值得长期记住的事实/偏好，去重后进草稿箱——绝不裸写
-> - **草稿确认闭环**：新会话首句自动检索时，会注入 `[未决草稿]` 提示（列出待确认的历史草稿文件），由 LLM 调 `filemem_review_drafts(action="confirm", target="<文件名>")` 处置；不指定 target 则处置当前会话草稿
-> - **自动回忆（pre-LLM hook）**：每次调用 LLM 前自动注入相关记忆，跨会话"记得住"
+> - **草稿确认闭环**：新会话首句自动检索时，会注入 `[未决草稿]` 提示，由 LLM 调 `filemem_review_drafts(action="confirm")` 处置
+> - **自动回忆（pre-LLM hook）**：每次调用 LLM 前自动注入相关记忆，跨会话「记得住」
+> - **跨 session 延续**：`filemem_set_bringback` 把上个 session 的已确认摘要钉进当前 session 自动注入面；`filemem_handoff_extract` 从死锁 session 抽交接摘要
+> - **结构化计划**：`filemem_plan` 管理多步 PRD 计划（list/create/advance 状态机）
+> - **用户思维底座**：`gate5_worldview_upsert` 落用户世界观/方法论行（L2，无 TTL，仅用户拍板可写）
+> - **顶替/更正**：`filemem_supersede` 让过时行退出自动召回池（留盘审计），写更正行带血缘链
+> - **跨设备共享池**：可选 PostgreSQL 中央池（`shared_memory_search/handoff/take`），failure 行设备特定不推中央
+> - **failure 行语义**：失败工具调用/报错轮被打上 `failure_type` 标，豁免 LLM 重判、不推共享池、不进自动确认面板——坏轮次不会污染持久记忆
 > - **群聊杂讯守卫**：识别并拒绝把群聊骨架（`[System note`、`Group chat:`、JSON dump、`(pass)` 块等）存成持久记忆，入口 + 离线整理双保险
-> - **离线 consolidation**：辅助 LLM 任务做重要性打分 + 情景摘要，衰减 TTL 按层级可配
+> - **离线 consolidation**：宿主主模型 LLM 面做重要性打分 + 情景摘要，衰减 TTL 按层级可配
+>
+> **14 个工具面**（完整清单见下方英文版 Tools exposed 表）：filemem_read / write / search / delete / review_drafts / check_promotion / supersede / plan / gate5_worldview_upsert / set_bringback / handoff_extract / scheduled / shared_memory_search / shared_memory_handoff / shared_memory_take。
 >
 > **一行安装：**
 > ```bash
-> bash install.sh   # 幂等；自动备份旧版、保留你的活数据 storage/、自动启用配置并自检
+> bash install.sh                          # 幂等；自动备份、保留活数据、启用配置
+> FM_EXCLUDE=4d,amoi,culinary,default bash install.sh --all-profiles   # multiplex 宿主：全 profile 启用（可排除）
 > ```
 >
 > **使用示例：**
 > ```text
 > filemem_write(type="preference", content="偏好简洁回复")        # 写一条记忆
-> filemem_search(query="部署 117", min_score=0.4)                # 检索相关记忆
+> filemem_search(query="部署 117", min_score=0.4)                # 多轴检索
 > filemem_read(type="fact", limit=10)                            # 按类型读取
 > filemem_review_drafts(action="confirm")                        # 确认会话草稿转正
+> filemem_supersede(old_id, new_content, reason)                 # 顶替过时行
 > ```
+>
+> **许可证：GPL-3.0-or-later**——非商用自由使用/修改/分发（copyleft，衍生作品同许可）；**商用需另购授权**。详见 `LICENSE`。
 >
 > ---
 
