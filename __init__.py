@@ -4887,6 +4887,27 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 f"FileMem: P0-2 auto-inject cap kept top-{_cap} of {_pre_cap} "
                 f"surviving rows (denoise)")
 
+        # Negative-example recall-side boost (owner 2026-11-13 拍板 A): pure
+        # REORDERING of the auto-inject face — rows carrying metadata.failure_type
+        # surface AHEAD of ordinary rows so a recalled "wall you hit" lesson is
+        # seen first. Mirrors the bringback pin reorder (L4655-4657) exactly:
+        # the row SET is unchanged (no add / no remove), only the surviving set
+        # is stable-sorted by _failure_reorder_key, so the P3 snapshot + prefix
+        # cache stay byte-stable for any session WITHOUT a failure row (key 1
+        # across the board == today's order). Zero LLM, zero host dep; the
+        # ⚠️ lesson line itself is appended per-row at the formatting loop
+        # (L4942-4944) — this boost only reorders WHO comes first. Fail-soft:
+        # a key hiccup keeps the pre-boost order (the sort below is wrapped).
+        try:
+            _pre_boost = len(results)
+            results = sorted(results, key=self._failure_reorder_key)
+            if len(results) != _pre_boost:
+                # impossible guard (sorted preserves length) — fail-soft log
+                logger.warning("FileMem: failure-boost reorder changed row count "
+                               f"({_pre_boost} -> {len(results)})")
+        except Exception as _fb_e:
+            logger.debug(f"FileMem: failure-boost reorder skipped: {_fb_e}")
+
         # P0-v2 (Gap A+B): recalled durable items reinforce their own
         # reference_count and drive the promotion loop. Persisted under lock,
         # fail-soft — a disk hiccup must never block recall (search already done).
@@ -17045,6 +17066,32 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                     and isinstance(row, dict) \
                     and row.get("session_id") == pin_session_id \
                     and ((row.get("metadata") or {}).get("confirmed")):
+                return 0
+        except Exception:
+            pass
+        return 1
+
+    def _failure_reorder_key(self, row: Any) -> int:
+        """Negative-example recall-side boost (owner 2026-11-13 拍板 A):
+        pure REORDER key for the auto-inject face. A row carrying
+        metadata.failure_type (a recalled "wall you hit" negative example,
+        whether naturally stamped by _failure_meta_for or synthesized by the
+        session-end fallback _flush_unconsumed_failure_markers) keys to 0 ->
+        surfaces at the TOP; every other surviving row keys to 1 -> stays
+        below. This is a REORDERING, not a collection predicate — the row set
+        is unchanged (no add / no remove); it only surfaces the failure lesson
+        ahead of ordinary rows so the model sees the ⚠️ lesson line (appended
+        at the formatting loop) before the rest.
+
+        Byte-stability / cache safety: for a session with NO failure row in
+        the surviving set, every row keys to 1, so the stable sort preserves
+        the exact pre-boost order — the P3 snapshot + prefix cache are
+        byte-identical to today (no new drift). The key is a flat 0/1 int
+        (like _bringback_reorder_key), zero LLM, fail-soft to 1 (a row whose
+        metadata is unreadable keeps its pre-boost position)."""
+        try:
+            if isinstance(row, dict) and (row.get("metadata") or {}).get(
+                    "failure_type"):
                 return 0
         except Exception:
             pass

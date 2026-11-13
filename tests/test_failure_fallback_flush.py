@@ -141,3 +141,29 @@ def test_reflush_distinct_ctx_is_new_row():
         p._flush_unconsumed_failure_markers("sess_A")
         rows = _read_all(p)
         assert len(rows) == 2, "distinct walls must be distinct rows"
+
+
+# ---- ⑤ recall-side boost: _failure_reorder_key (pure) --------------------
+
+def test_failure_reorder_key_puts_failure_rows_first():
+    with tempfile.TemporaryDirectory() as td:
+        p = _make_provider(pathlib.Path(td))
+        fail_row = {"id": "f1", "type": "fact", "content": "wall",
+                    "metadata": {"failure_type": "retry_loop"}}
+        ord_row = {"id": "o1", "type": "fact", "content": "ordinary",
+                   "metadata": {}}
+        stale_row = {"id": "s1", "type": "fact", "content": "no meta"}
+        # key: failure -> 0, everything else -> 1
+        assert p._failure_reorder_key(fail_row) == 0
+        assert p._failure_reorder_key(ord_row) == 1
+        assert p._failure_reorder_key(stale_row) == 1
+        # stable sort: failure row floats to the top, others keep relative
+        # order (o1 before s1, both key 1).
+        ordered = sorted([ord_row, stale_row, fail_row],
+                         key=p._failure_reorder_key)
+        assert [r["id"] for r in ordered] == ["f1", "o1", "s1"]
+        # Byte-stability: a set with NO failure row keys all-1 -> the stable
+        # sort preserves the exact input order (== pre-boost, no cache drift).
+        no_fail = [ord_row, stale_row]
+        assert [r["id"] for r in sorted(no_fail, key=p._failure_reorder_key)] \
+            == ["o1", "s1"]
