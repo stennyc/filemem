@@ -6752,9 +6752,21 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 f"FileMem: failure-marker flushed to L0 row {row_id[:12]} "
                 f"({ftype}, tool={tool or '?'}) sid={session_id}")
         else:
+            # EMPTY is NOT a failure signal: with _force_write=True the row has
+            # already landed on disk by the time _save_memory returns (the
+            # append happens before the _session_save_count>20 check at L7771,
+            # which returns "" on cap but the row is kept). The empty return
+            # covers: (a) dedup-upsert collapse onto an existing same-ctx row,
+            # (b) the auto-save OOM cap (count>20) returning "" after the row
+            # is already written, (c) an ingress-quarantine (rare — the ⚠️ body
+            # is not a tool-dump/JSON/structural opener). In all three the
+            # marker is consumed and the lesson is in the pool (or quarantined,
+            # audited). Log neutral: do NOT call (c) "no row id" as if the
+            # lesson were lost.
             logger.info(
-                f"FileMem: failure-marker flushed (queued/dedup, no new row id) "
-                f"({ftype}, tool={tool or '?'}) sid={session_id}")
+                f"FileMem: failure-marker flushed (row landed or collapsed; "
+                f"empty id is not a loss) ({ftype}, tool={tool or '?'}) "
+                f"sid={session_id}")
 
     def _handle_memory_trigger(self, route_result: Dict, content: str) -> None:
         """Handle memory trigger based on route result."""
