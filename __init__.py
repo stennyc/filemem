@@ -6537,9 +6537,20 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 with self._shard_lock(trace_file):
                     try:
                         _last = ""
-                        with open(trace_file, "r", encoding="utf-8") as f:
-                            for _l in f:
-                                _last = _l.rstrip("\n")
+                        # 首帧特判 (owner 2026-11-14, option B): the dedupe read
+                        # happens BEFORE the first append, so on the very first
+                        # write of a session the .jsonl does not exist yet and
+                        # open("r") would raise ENOENT. That is a legal "no
+                        # predecessor" frame — NOT an error. A missing file
+                        # means there is no tail to compare against, so we skip
+                        # the dup check silently and fall through to the append
+                        # below. (The append's open("a") is what creates the
+                        # file; by the NEXT sync_turn call the tail read
+                        # succeeds and dedupe is live.)
+                        if trace_file.exists():
+                            with open(trace_file, "r", encoding="utf-8") as f:
+                                for _l in f:
+                                    _last = _l.rstrip("\n")
                         if _last:
                             _last_d = json.loads(_last)
                             if (_last_d.get("content") == trace_data["content"]
@@ -6552,8 +6563,12 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                                         "FileMem: B4 trace dup suppressed "
                                         f"(ts gap < 300s, same content+assistant) "
                                         f"session={sid}")
+                    except FileNotFoundError:
+                        # ENOENT on the tail read = first frame, no predecessor.
+                        # Legal, not an error — skip dedupe, append below.
+                        pass
                     except Exception as _dedupe_e:
-                        logger.warning(f"FileMem: trace dedupe check failed: {_dedupe_e}")
+                        logger.debug(f"FileMem: trace dedupe check failed: {_dedupe_e}")
                     if not _b4_skip:
                         with open(trace_file, "a", encoding="utf-8") as f:
                             f.write(trace_line)
