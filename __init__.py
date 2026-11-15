@@ -4044,9 +4044,16 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             plugin_entries = config.get("plugins", {}).get("entries", {})
             filemem_config = plugin_entries.get("filemem", {})
 
-            # Merge configs
-            self.auto_extract = filemem_config.get("auto_extract", True)
-            self.min_search_score = filemem_config.get("min_search_score", 0.3)
+            # Merge configs (two-level fallback: .settings first — the panel save
+            # path; then the legacy flat entries.filemem key for backward compat)
+            settings_block = filemem_config.get("settings") or {}
+            for key, default in (("auto_extract", True), ("min_search_score", 0.3)):
+                if key in settings_block:
+                    setattr(self, key, settings_block[key])
+                elif key in filemem_config:
+                    setattr(self, key, filemem_config[key])
+                else:
+                    setattr(self, key, default)
 
         except Exception as e:
             logger.warning(f"Failed to load filemem config: {e}")

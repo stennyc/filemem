@@ -26,3 +26,14 @@ provides_tools:
 - filemem_set_bringback
 - filemem_handoff_extract
 - filemem_scheduled
+config_schema:
+  auto_extract:
+    type: bool
+    default: true
+    label: Auto extract
+    description: 从对话自动沉淀记忆条目。
+  min_search_score:
+    type: float
+    default: 0.3
+    label: Min search score
+    description: 检索相关度门控（0-1），低于此分数不注入。
