@@ -3120,16 +3120,24 @@ class FileMemProvider(MemoryProvider):
     def _resolve_profile_name(hermes_home: Path) -> Optional[str]:
         """Derive the owning profile from a profile-scoped home path.
 
-        SESSION-ISOLATION FIX (owner 2026-10-10, Fix 2): a home WITH a
-        ``profiles/<name>`` segment resolves to ``<name>``. A home WITHOUT that
-        segment (the base/default home, e.g. ``~/.hermes`` or
-        ``<HERMES_HOME>`` with no profiles/ subdir) is the NEUTRAL profile and
-        resolves to **None** — the write faces then stamp NEUTRAL rows (no
-        ``source_profile`` key) instead of the string ``"default"``. The old
-        ``"default"`` string stamp made launch-profile rows invisible to every
-        other profile's P0-2 isolated auto face (a cross-profile row by
-        construction); None keeps them neutral and visible to ALL profiles.
+        Delegates to Hermes core's ``profile_name_for_home`` so that the
+        base/default home resolves to ``"default"`` (not ``None``) — this
+        eliminates the Desktop ``source_profile=None`` warnings while keeping
+        the multiplex-gateway case intact (``profiles/<name>`` still resolves
+        to the named profile).
+
+        SESSION-ISOLATION (owner 2026-10-10, Fix 2 + 2026-11-15 forward-fix):
+        previously returned ``None`` for the base home, which kept all rows
+        stamped NEUTRAL and visible to every profile but triggered the
+        P0-2 / pending-draft warnings on Desktop. Now mirrors the core
+        behaviour: base home → ``"default"``, named profile home → its name.
         """
+        try:
+            from hermes_constants import profile_name_for_home
+            return profile_name_for_home(hermes_home)
+        except Exception:
+            pass
+        # Legacy fallback — should never be reached in a normal install.
         parts = [p for p in hermes_home.parts if p]
         if "profiles" in parts:
             idx = parts.index("profiles")
