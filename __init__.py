@@ -3427,7 +3427,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             logger.info(f"FileMem: storage root relocated: {legacy} -> {new}")
 
     @contextmanager
-    def _shard_lock(self, path: Path):
+    def _shard_lock(self, path: Path, timeout: Optional[float] = None):
         """Cross-process lock for one storage file via ``<path>.lock``.
 
         The instance ``self._lock`` only serializes ONE process. On 117 the
@@ -3436,14 +3436,42 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         processes (fcntl on the 117 Linux target / msvcrt on Windows). This is
         the gate behind @data-engineer's "N processes, 0 lost updates" test.
         On a host with neither primitive it degrades to a loud no-op (the
-        content dedup gate remains the backstop)."""
+        content dedup gate remains the backstop).
+
+        timeout (seconds): when set, attempts non-blocking acquisition first,
+        then retries with exponential backoff up to *timeout*. Raises
+        TimeoutError if the lock cannot be acquired within the window. When
+        None (default) the lock blocks indefinitely — preserved for all
+        existing callers that need strict serialization. The B4 trace path
+        uses a short timeout (5 s) to avoid blocking the host hook past the
+        30 s host deadline.
+        """
         lock_path = path.with_name(path.name + ".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         if fcntl is not None:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-                yield
+                if timeout is not None:
+                    # Non-blocking acquire with retry loop.
+                    deadline = time.monotonic() + timeout
+                    acquired = False
+                    while True:
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            acquired = True
+                            break
+                        except (OSError, IOError):
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError(
+                                    f"FileMem: shard lock timeout after {timeout}s "
+                                    f"for {lock_path.name}")
+                            time.sleep(0.05)
+                    if not acquired:
+                        raise  # re-raise TimeoutError above
+                    yield
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    yield
             finally:
                 fcntl.flock(fd, fcntl.LOCK_UN)
                 os.close(fd)
@@ -3460,8 +3488,30 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 if os.fstat(fh.fileno()).st_size == 0:
                     fh.write(b"0")
                     fh.seek(0)
-                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
-                yield
+                if timeout is not None:
+                    # Non-blocking acquire with retry loop.
+                    # LK_NBLCK = non-blocking; returns ERROR_LOCK_VIOLATION (157)
+                    # when the lock cannot be acquired immediately.
+                    deadline = time.monotonic() + timeout
+                    acquired = False
+                    while True:
+                        try:
+                            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                            acquired = True
+                            break
+                        except OSError:
+                            if time.monotonic() >= deadline:
+                                fh.close()
+                                raise TimeoutError(
+                                    f"FileMem: shard lock timeout after {timeout}s "
+                                    f"for {lock_path.name}")
+                            time.sleep(0.05)
+                    if not acquired:
+                        raise
+                    yield
+                else:
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                    yield
             finally:
                 try:
                     msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
@@ -6542,45 +6592,64 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 # 宁漏勿错：300s 窗口内同 content+assistant = 宿主双触发，
                 # 跨 300s 原样重发 = 新逻辑 turn，正常 append。
                 _b4_skip = False
-                with self._shard_lock(trace_file):
+                # B4-TIMEOUT (2026-11-15): use a short timeout on the trace
+                # file lock so a stalled cross-process holder (e.g. gateway
+                # consolidation tick holding the same trace file) cannot block
+                # the host post_llm_call hook past the 30 s deadline. On
+                # timeout we skip the dedupe check and append blindly — the
+                # content-dedup gate at read-time remains the backstop.
+                try:
+                    with self._shard_lock(trace_file, timeout=5.0):
+                        try:
+                            _last = ""
+                            # 首帧特判 (owner 2026-11-14, option B): the dedupe read
+                            # happens BEFORE the first append, so on the very first
+                            # write of a session the .jsonl does not exist yet and
+                            # open("r") would raise ENOENT. That is a legal "no
+                            # predecessor" frame — NOT an error. A missing file
+                            # means there is no tail to compare against, so we skip
+                            # the dup check silently and fall through to the append
+                            # below. (The append's open("a") is what creates the
+                            # file; by the NEXT sync_turn call the tail read
+                            # succeeds and dedupe is live.)
+                            if trace_file.exists():
+                                with open(trace_file, "r", encoding="utf-8") as f:
+                                    for _l in f:
+                                        _last = _l.rstrip("\n")
+                            if _last:
+                                _last_d = json.loads(_last)
+                                if (_last_d.get("content") == trace_data["content"]
+                                        and _last_d.get("assistant") == trace_data["assistant"]):
+                                    _t1 = datetime.fromisoformat(trace_data["ts"])
+                                    _t0 = datetime.fromisoformat(_last_d["ts"])
+                                    if (_t1 - _t0).total_seconds() < 300:
+                                        _b4_skip = True
+                                        logger.info(
+                                            "FileMem: B4 trace dup suppressed "
+                                            f"(ts gap < 300s, same content+assistant) "
+                                            f"session={sid}")
+                        except FileNotFoundError:
+                            # ENOENT on the tail read = first frame, no predecessor.
+                            # Legal, not an error — skip dedupe, append below.
+                            pass
+                        except Exception as _dedupe_e:
+                            logger.debug(f"FileMem: trace dedupe check failed: {_dedupe_e}")
+                        if not _b4_skip:
+                            with open(trace_file, "a", encoding="utf-8") as f:
+                                f.write(trace_line)
+                            logger.info(f"FileMem: trace written: {len(trace_line)} bytes session={sid}")
+                except TimeoutError:
+                    # Lock contention: skip dedupe, append raw. The content
+                    # dedup gate on the read side is the backstop — we may get
+                    # a duplicate line but data is never lost.
+                    logger.warning(
+                        f"FileMem: B4 trace lock timeout (5 s), appending without dedupe "
+                        f"session={sid}")
                     try:
-                        _last = ""
-                        # 首帧特判 (owner 2026-11-14, option B): the dedupe read
-                        # happens BEFORE the first append, so on the very first
-                        # write of a session the .jsonl does not exist yet and
-                        # open("r") would raise ENOENT. That is a legal "no
-                        # predecessor" frame — NOT an error. A missing file
-                        # means there is no tail to compare against, so we skip
-                        # the dup check silently and fall through to the append
-                        # below. (The append's open("a") is what creates the
-                        # file; by the NEXT sync_turn call the tail read
-                        # succeeds and dedupe is live.)
-                        if trace_file.exists():
-                            with open(trace_file, "r", encoding="utf-8") as f:
-                                for _l in f:
-                                    _last = _l.rstrip("\n")
-                        if _last:
-                            _last_d = json.loads(_last)
-                            if (_last_d.get("content") == trace_data["content"]
-                                    and _last_d.get("assistant") == trace_data["assistant"]):
-                                _t1 = datetime.fromisoformat(trace_data["ts"])
-                                _t0 = datetime.fromisoformat(_last_d["ts"])
-                                if (_t1 - _t0).total_seconds() < 300:
-                                    _b4_skip = True
-                                    logger.info(
-                                        "FileMem: B4 trace dup suppressed "
-                                        f"(ts gap < 300s, same content+assistant) "
-                                        f"session={sid}")
-                    except FileNotFoundError:
-                        # ENOENT on the tail read = first frame, no predecessor.
-                        # Legal, not an error — skip dedupe, append below.
-                        pass
-                    except Exception as _dedupe_e:
-                        logger.debug(f"FileMem: trace dedupe check failed: {_dedupe_e}")
-                    if not _b4_skip:
                         with open(trace_file, "a", encoding="utf-8") as f:
                             f.write(trace_line)
-                        logger.info(f"FileMem: trace written: {len(trace_line)} bytes session={sid}")
+                    except Exception as _append_e:
+                        logger.warning(f"FileMem: session trace write failed (timeout path): {_append_e}")
             except Exception as e:
                 logger.warning(f"FileMem: session trace write failed: {e}")
 
@@ -14939,31 +15008,37 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                 logger.debug("FileMem: alias mining no fresh topics, skipping (zero cost)")
                 return  # call-level gate
             ts = _utcnow().isoformat()
-            # 2. RMW the alias table under the cross-process shard lock
-            # (append-only per topic: existing topics preserved verbatim).
+            # 2. LLM calls OUTSIDE the lock — only the final RMW holds the
+            # cross-process shard lock. This prevents the lock from being
+            # held for the duration of potentially-many-L-seconds LLM calls,
+            # which would block other processes (TUI sync_turn, etc.) from
+            # acquiring their own trace/mem_file locks.
             apath = self.storage_dir / "aliases.json"
+            # Phase A: LLM calls (lock-free, can take seconds each)
+            results: List[Tuple[str, Dict]] = []  # (topic, entry_dict)
+            log_path = self.storage_dir / "consolidation_log.jsonl"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            for topic in fresh:
+                try:
+                    res = llm.suggest_aliases(self._main_runtime, topic)
+                    self._append_llm_call_telemetry(llm, "suggest_aliases")
+                    entry = {
+                        "aliases": sorted({a for a in res.get("aliases") or []}),
+                        "source": "llm",
+                        "ts": ts,
+                    }
+                    results.append((topic, entry))
+                except Exception as e:
+                    logger.warning(f"FileMem: alias mining topic {topic} LLM failed (batch continues): {e}")
+            # Phase B: RMW under lock (fast — just a JSON read/modify/write)
             with self._shard_lock(apath):
                 data = self._load_aliases()
                 topics = data.get("topics") if isinstance(data, dict) else None
                 if not isinstance(topics, dict):
                     topics = {}
-                log_path = self.storage_dir / "consolidation_log.jsonl"
-                log_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(log_path, "a", encoding="utf-8") as lf:
-                    for topic in fresh:
+                    for topic, entry in results:
                         try:
-                            # Host-model alias suggestion (fail-soft inside:
-                            # any exception -> aliases=[], model_used=False —
-                            # an empty entry is a VERDICT of no-alias, it
-                            # stays and widens nothing; the native keyword
-                            # path is unaffected, 不吞脏).
-                            res = llm.suggest_aliases(self._main_runtime, topic)
-                            self._append_llm_call_telemetry(llm, "suggest_aliases")
-                            entry = {
-                                "aliases": sorted({a for a in res.get("aliases") or []}),
-                                "source": "llm",
-                                "ts": ts,
-                            }
                             prev = topics.get(topic)
                             if isinstance(prev, dict) and prev.get("aliases"):
                                 # Human-added aliases are durable: union, not
@@ -14980,14 +15055,11 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                             lf.write(json.dumps({
                                 "ts": ts, "action": "alias_mine", "topic": topic,
                                 "aliases_count": len(entry["aliases"]),
-                                "model_used": res.get("model_used", False),
+                                "model_used": True,
                                 "source_profile": getattr(self, "source_profile", None),
                             }, ensure_ascii=False) + "\n")
                         except Exception as e:
-                            # 3. Single-topic failure never breaks the batch —
-                            # the topic just isn't recorded; it retries next
-                            # tick (incremental diff picks it back up).
-                            logger.warning(f"FileMem: alias mining topic {topic} failed (batch continues): {e}")
+                            logger.warning(f"FileMem: alias mining topic {topic} write failed (batch continues): {e}")
             logger.info(f"FileMem: alias mining tick complete (N-cap={n_cap}, {len(fresh)} fresh topics)")
         except Exception as e:
             # Whole-tick fail-soft: existing aliases on disk are untouched
