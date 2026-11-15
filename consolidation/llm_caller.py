@@ -50,12 +50,19 @@ logger = logging.getLogger("filemem.consolidation.llm_caller")
 # ── shared host-call face (module header: outside the per-EP audit segments) ──
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.+?)```", re.DOTALL | re.IGNORECASE)
+_THINK_RE = re.compile(r"<thinking[^>]*>.*?</thinking>|<reasoning[^>]*>.*?</reasoning>", re.DOTALL | re.IGNORECASE)
 
 
 def _strip_code_fences(text: str) -> str:
-    """The first fenced code block's body, or the stripped text when unfenced."""
-    match = _FENCE_RE.search(text or "")
-    return match.group(1).strip() if match else (text or "").strip()
+    """The first fenced code block's body, or the stripped text when unfenced.
+
+    Also strips <thinking>...</thinking> and <reasoning>...</reasoning> blocks
+    that reasoning models (e.g. agnes-2.5-flash) embed — those blocks may
+    contain { or } characters that would break downstream JSON parsing.
+    """
+    text = _THINK_RE.sub("", text or "").strip()
+    match = _FENCE_RE.search(text)
+    return match.group(1).strip() if match else text
 
 
 def _llm_text(response: Any) -> str:
