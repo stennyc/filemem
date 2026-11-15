@@ -45,6 +45,49 @@ File-based **memory provider plugin** for [Hermes Agent](https://hermes-agent.no
 
 Zero external dependencies (no Ollama, no Qdrant, no vector DB). Everything is plain JSON/Markdown on disk, local-first, with graceful degradation.
 
+
+## Installation
+
+### Linux
+
+```bash
+# Clone to Hermes plugin directory
+git clone https://github.com/stennyc/filemem.git ~/.hermes/plugins/filemem
+
+# Auto-install to all profiles that have it enabled in config.yaml:
+bash ~/.hermes/plugins/filemem/install.sh --all-profiles
+```
+
+### Windows (PowerShell)
+
+```powershell
+# Clone to both plugin directories (AppData + ~/.hermes)
+git clone https://stennyc@github.com/stennyc/filemem.git "C:\Users\$env:USERNAME\AppData\Local\hermes\plugins\filemem"
+& "C:\Users\$env:USERNAME\AppData\Local\hermes\plugins\filemem\install.ps1" -AllProfiles
+```
+
+### Enable in profile config
+
+Add `filemem` to `plugins.enabled` in the target profile's `config.yaml`:
+
+```yaml
+plugins:
+  enabled:
+  - filemem
+  - filemem
+  # ... other plugins
+```
+
+Then restart the Hermes gateway.
+
+### Dual-path note (Windows)
+
+Hermes on Windows stores plugins in two locations:
+- `C:\Users\<user>\AppData\Local\hermes\plugins\` (primary, loaded at runtime)
+- `~/.hermes/plugins/` (sync copy, used by some tools)
+
+The install scripts above copy to **both** locations automatically.
+
 ## Features
 
 | Area | What it does |

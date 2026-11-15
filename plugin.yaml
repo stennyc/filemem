@@ -3,6 +3,9 @@ version: 1.0.0
 description: File-based memory provider with semantic search and Demo integration
 author: stennyc
 license: AGPL-3.0-or-later
+python_dependencies:
+  - "psycopg2-binary"
+  - "PyYAML>=6.0"
 hooks:
   pre_llm_call: true
   post_llm_call: true
