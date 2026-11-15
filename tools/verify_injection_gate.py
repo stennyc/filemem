@@ -42,6 +42,7 @@ from pathlib import Path
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_DIR))
 
+from dep_bootstrap import _resolve_hermes_home  # noqa: E402
 import __init__ as fm  # noqa: E402  (plugin module; imports safely, no I/O)
 
 # Dynamic path resolution (mirrors build_graph.py / backfill_origin.py):
@@ -50,7 +51,7 @@ import __init__ as fm  # noqa: E402  (plugin module; imports safely, no I/O)
 # uses per-profile storage — every profile converges on this one shared tree,
 # so a CLI that naively used `$HERMES_HOME/filemem` would target the
 # per-profile path and silently miss the central rows.
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+HERMES_HOME = Path(_resolve_hermes_home())
 
 
 def _neutral_base() -> Path:

@@ -58,6 +58,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from dep_bootstrap import _resolve_hermes_home  # noqa: E402
 from typing import Any, Dict, List, Optional
 
 try:
@@ -286,8 +287,8 @@ def _default_store() -> Path:
     """The shared neutral store root (<hermes home>/filemem — the T5b
     'auto' root), resolved without hardcoding a host path: HERMES_HOME
     env when set, else ~/.hermes."""
-    home = os.environ.get("HERMES_HOME") or str(Path.home())
-    return Path(home) / "filemem"
+    from dep_bootstrap import _resolve_hermes_home
+    return Path(_resolve_hermes_home()) / "filemem"
 
 
 def main() -> int:

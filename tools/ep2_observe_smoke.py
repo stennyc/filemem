@@ -35,6 +35,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from dep_bootstrap import _resolve_hermes_home  # noqa: E402
 
 # Plugin root on sys.path so `import __init__` / `import consolidation` resolve
 # no matter how the tool is invoked (python tools/ep2_observe_smoke.py puts
@@ -217,7 +218,7 @@ def main():
     args = ap.parse_args()
 
     if args.check_live:
-        _check_live(Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+        _check_live(Path(_resolve_hermes_home())
                     / "filemem" if args.check_live == "-" else Path(args.check_live))
         return 0
 

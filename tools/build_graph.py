@@ -57,6 +57,7 @@ import time
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from dep_bootstrap import _resolve_hermes_home  # noqa: E402
 
 _PLUGIN_DIR = Path(__file__).resolve().parents[1]
 if str(_PLUGIN_DIR) not in sys.path:
@@ -121,7 +122,7 @@ _WINDOW_DAYS_DEFAULT = float(DECAY_DEFAULTS["search"]["graph_temporal_window_day
 def default_storage_root() -> Path:
     """Mirror the provider's auto tier: <base>/filemem where <base> is
     HERMES_HOME (or ~/.hermes) minus a trailing profiles/<name> segment."""
-    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    home = Path(_resolve_hermes_home())
     parts = [p for p in home.parts if p]
     if "profiles" in parts:
         idx = parts.index("profiles")

@@ -41,6 +41,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from dep_bootstrap import _resolve_hermes_home  # noqa: E402
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_DIR))
@@ -49,7 +50,7 @@ import __init__ as fm  # noqa: E402  (plugin module; import-time is I/O-free)
 
 # Dynamic path resolution (mirrors confirm_supersede.py / build_graph.py /
 # backfill_origin.py): HERMES_HOME env > ~/.hermes. No hardcoded paths.
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+HERMES_HOME = Path(_resolve_hermes_home())
 LIVE_STORE = HERMES_HOME / "filemem"
 
 # Lazy-prune streak: an alias recorded as 0-hit in this many CONSECUTIVE

@@ -32,11 +32,12 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from dep_bootstrap import _resolve_hermes_home  # noqa: E402
 
 # --- topology (N=1, resolved physical path — Reviewer path-resolution rule) ---
-# Mirror __init__.py:DEFAULT_MEMORY_DIR (dynamic per host, never hardcoded —
-# the old C:\Users\user\... pin broke on non-Windows hosts).
-STORAGE_ROOT = Path.home() / ".hermes" / "plugins" / "filemem" / "storage"
+# Mirror __init__.py:DEFAULT_MEMORY_DIR (dynamic per host, never hardcoded).
+_STORAGE_ROOT_BASE = Path(_resolve_hermes_home())
+STORAGE_ROOT = _STORAGE_ROOT_BASE / "plugins" / "filemem" / "storage"
 MEMORIES_DIR = STORAGE_ROOT / "memories"
 ARCHIVE_DIR = STORAGE_ROOT / "archive" / "p2-selftest-20260925"
 MANIFEST = ARCHIVE_DIR / "manifest.json"

@@ -37,6 +37,7 @@ from pathlib import Path
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_DIR))
 
+from dep_bootstrap import _resolve_hermes_home  # noqa: E402
 import __init__ as fm  # noqa: E402  (plugin module; import-time is I/O-free)
 
 
@@ -53,7 +54,7 @@ def _default_live_store() -> Path:
     every central row.  Mirror the provider's auto branch here so the default
     targets the same tree the host writes.  HERMES_HOME unset -> ~/.hermes.
     """
-    home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+    home = Path(_resolve_hermes_home())
     parts = [p for p in home.parts if p]
     # strip the trailing "profiles/<name>" tail ONLY when it really ends in
     # exactly that shape (same guard as the provider).

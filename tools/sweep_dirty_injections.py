@@ -53,6 +53,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from dep_bootstrap import _resolve_hermes_home  # noqa: E402
 from typing import Any, Dict, List, Optional
 
 # ── cross-process lock (verbatim copy of the plugin's _shard_lock protocol
@@ -282,8 +283,8 @@ def sweep(store: Path, *, dry_run: bool = True, yes: bool = False,
 
 
 def _default_store() -> Path:
-    home = os.environ.get("HERMES_HOME") or str(Path.home())
-    return Path(home) / "filemem"
+    from dep_bootstrap import _resolve_hermes_home
+    return Path(_resolve_hermes_home()) / "filemem"
 
 
 def main(argv: Optional[List[str]] = None) -> int:

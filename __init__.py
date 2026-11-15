@@ -39,6 +39,8 @@ _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
+from dep_bootstrap import _resolve_hermes_home  # noqa: E402  (cross-platform home resolver)
+
 from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
 
 # LLM 显式化◎ (t_32980f71): host main_runtime helper, plugin-side import only
@@ -67,8 +69,9 @@ def _utcnow() -> "datetime":
     """
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
-# Default paths
-DEFAULT_MEMORY_DIR = Path.home() / ".hermes" / "plugins" / "filemem" / "storage"
+# Default paths (auto-resolved — no hardcoded /root, no hardcoded C:/)
+_HERMES_HOME_RESOLVED = _resolve_hermes_home()
+DEFAULT_MEMORY_DIR = Path(_HERMES_HOME_RESOLVED) / "plugins" / "filemem" / "storage"
 DEFAULT_MEMORIES_DIR = DEFAULT_MEMORY_DIR / "memories"
 
 # Provider instance cache (solution 2: avoid recreating providers)
@@ -2921,7 +2924,7 @@ class FileMemProvider(MemoryProvider):
         # pre_llm_call 路径时 _is_subagent_session() 恒 False（fail-soft，
         # 退回现状不漏弹主 session footer）。
         self._last_platform: Optional[str] = None
-        self.hermetis_home = Path(kwargs.get("hermes_home", Path.home() / ".hermes"))
+        self.hermetis_home = Path(kwargs.get("hermes_home", _resolve_hermes_home()))
 
         # Setup directories — T5b config tier: auto-resolves to the shared
         # neutral root (<base>/filemem) unless an explicit storage_root
@@ -3371,7 +3374,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         path with a WARNING rather than silently writing a shared store to an
         unexpected location. Relocation (auto/explicit differs from legacy) is
         logged so a switch is never a silent re-target."""
-        legacy = Path(self.hermetis_home or Path.home() / ".hermes") / "plugins" / "filemem" / "storage"
+        legacy = Path(self.hermetis_home or _resolve_hermes_home()) / "plugins" / "filemem" / "storage"
         override = self._probe_storage_root_override()
 
         if override == "per_profile":
@@ -3386,7 +3389,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             return self.storage_dir
 
         # auto → neutral root
-        home = Path(self.hermetis_home or Path.home() / ".hermes")
+        home = Path(self.hermetis_home or _resolve_hermes_home())
         parts = [p for p in home.parts if p]
         # Strip the TRAILING "profiles/<name>" tail ONLY when the path
         # actually ENDS in "profiles/<name>" (i.e. "profiles" is followed by
@@ -4030,7 +4033,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             from tools.memory_tool import get_memory_dir
             return Path(get_memory_dir())
         except Exception:
-            return Path(self.hermetis_home or Path.home() / ".hermes") / "memories"
+            return Path(self.hermetis_home or _resolve_hermes_home()) / "memories"
 
     def _drain_host_store(self):
         """D6 seam: a host `MemoryStore` bound to the live memories dir (its
@@ -17950,7 +17953,7 @@ def _resolve_current_hermes_home() -> Path:
     Shared by register() (home-scoped cache key for multiplexed gateways) and
     _get_cached_provider (instance initialization) — one source of truth.
     """
-    home = Path.home() / ".hermes"
+    home = Path(_resolve_hermes_home())
     try:
         from hermes_constants import get_hermes_home
         resolved = get_hermes_home()

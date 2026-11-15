@@ -40,6 +40,7 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
+from dep_bootstrap import _resolve_hermes_home  # noqa: E402
 
 # Import the extractor from the plugin itself (single source of truth, same
 # shape as the test suite: plugin dir on sys.path, `__init__` top-level).
@@ -59,7 +60,7 @@ def default_storage_root() -> Path:
     """Mirror the provider's auto tier: <base>/filemem where <base> is
     HERMES_HOME (or ~/.hermes) minus a trailing profiles/<name> segment."""
     import os
-    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    home = Path(_resolve_hermes_home())
     parts = [p for p in home.parts if p]
     if "profiles" in parts:
         idx = parts.index("profiles")
