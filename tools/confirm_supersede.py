@@ -45,11 +45,11 @@ def _default_live_store() -> Path:
     default --store (ZERO I/O, no initialize(), no config read).
 
     The provider (host) runs with HERMES_HOME pointing at the ACTIVE profile
-    (e.g. /root/.hermes/profiles/coder) and auto-resolves its store to the
+    (e.g. <$HERMES_HOME>/profiles/coder) and auto-resolves its store to the
     NEUTRAL shared root: strip a trailing ``profiles/<name>`` segment, then
-    append ``/filemem``  ->  /root/.hermes/filemem.  A CLI that naively used
+    append ``/filemem``  ->  <$HERMES_HOME>/filemem.  A CLI that naively used
     ``$HERMES_HOME/filemem`` would land on the per-profile path
-    (/root/.hermes/profiles/coder/filemem, typically empty) and silently miss
+    (<$HERMES_HOME>/profiles/coder/filemem, typically empty) and silently miss
     every central row.  Mirror the provider's auto branch here so the default
     targets the same tree the host writes.  HERMES_HOME unset -> ~/.hermes.
     """

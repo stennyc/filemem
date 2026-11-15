@@ -192,14 +192,14 @@ _SCHEDULED_WAKE_PROMPT = (
 )
 
 # ── Tool routing guard (owner ruling 2026-11-06) ─────────────────────────────
-# filemem 数据面（中央存储 /root/.hermes/filemem/，所有 profile 共享同一份）的统一
+# filemem 数据面（中央存储 <$HERMES_HOME>/filemem/，所有 profile 共享同一份）的统一
 # 入口规矩。治本机制 = 把"记忆任务走 filemem_* 工具族、别 terminal 翻盘"同时冻结进
 #   (a) 每个 filemem 工具的 description 尾部（_FILEMEM_ROUTING_POINTER，短指针）
 #   (b) 每个 session 的 system prompt（_FILEMEM_TOOL_ROUTING_TEXT，长版判定信号）
 # 让 LLM 在 function-calling 面 + system 面都被钉死路由，不临场绕道 terminal。
-# 中央存储路径写死不解析（本机 = /root/.hermes/filemem/），给 LLM 一个具象锚点。
+# 中央存储路径写死不解析（本机 = <$HERMES_HOME>/filemem/），给 LLM 一个具象锚点。
 _FILEMEM_ROUTING_POINTER = (
-    " [ROUTING] filemem 数据面（中央存储 /root/.hermes/filemem/）统一入口："
+    " [ROUTING] filemem 数据面（中央存储 <$HERMES_HOME>/filemem/）统一入口："
     "记忆/草稿/复盘沉淀任务走 filemem_* 工具族，禁止用 terminal/execute_code 翻盘上该目录"
     "或手写 JSON 代替。"
     " 路由：读/检索→filemem_read/filemem_search；写→filemem_write；删/顶→filemem_delete/"
@@ -212,9 +212,9 @@ _FILEMEM_ROUTING_POINTER = (
 # 提供正确工具指导（对称 code_map_root_policy 模式），而非宿主层拦 terminal（拦不完、堵漏）。
 _FILEMEM_TOOL_ROUTING_TEXT = (
     "## filemem 工具路由规矩\n"
-    "filemem 是中央记忆存储（本机根目录 /root/.hermes/filemem/，所有 profile 共享同一份）。\n"
+    "filemem 是中央记忆存储（本机根目录 <$HERMES_HOME>/filemem/，所有 profile 共享同一份）。\n"
     "凡任务涉及【记忆 / 草稿 / 复盘沉淀 / 跨 session 延续 / 用户思维底座】，"
-    "一律走 filemem 工具族，禁止用 terminal/execute_code 翻盘上 /root/.hermes/filemem/ 或手写 JSON 文件代替：\n"
+    "一律走 filemem 工具族，禁止用 terminal/execute_code 翻盘上 <$HERMES_HOME>/filemem/ 或手写 JSON 文件代替：\n"
     "\n"
     "  读/检索记忆        → filemem_read / filemem_search\n"
     "  写新记忆          → filemem_write\n"
