@@ -26,3 +26,47 @@ provides_tools:
 - filemem_set_bringback
 - filemem_handoff_extract
 - filemem_scheduled
+
+# 2026-11-17: plugin-side config schema manifest — the central shared-memory
+# (PostgreSQL) connection, kbs-mirrored (filemem + kbs share one central
+# sharedmem store, so the template defaults match). The dashboard
+# plugin-settings panel writes these sm_* scalars to
+# plugins.entries.filemem.settings; shared_memory.py::_load_shared_memory_config
+# reads that panel layer first, then falls back to the nested .shared_memory
+# section (three-layer read, kbs parity).
+config_schema:
+  sm_enabled:
+    type: bool
+    default: true
+    label: "Shared memory enabled"
+    description: "中央 shared-memory 面开关。"
+  sm_agent_id:
+    type: str
+    default: "local"
+    label: "Agent ID"
+    description: "机器级 agent 标识（跨机 50 台 = 50 个 agent_id）。"
+  sm_token:
+    type: str
+    default: "local-dev-token-s2"
+    label: "Auth token"
+    description: "中央 PG 认证 token。"
+  sm_pg_host:
+    type: str
+    default: "127.0.0.1"
+    label: "PG host"
+  sm_pg_port:
+    type: int
+    default: 5432
+    label: "PG port"
+  sm_pg_db:
+    type: str
+    default: "sharedmem"
+    label: "PG database"
+  sm_pg_user:
+    type: str
+    default: "sharedmem"
+    label: "PG user"
+  sm_pg_password:
+    type: str
+    default: "0c34c975d21c44b55262ea10c2fa08cf"
+    label: "PG password"

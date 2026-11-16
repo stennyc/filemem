@@ -51,6 +51,25 @@ logger = logging.getLogger(__name__)
 # 连接用参数 (fail-soft, 每次调用都读 —— 不缓存, 避免 config 改动后旧连接)
 _MAX_CONNECT_ATTEMPTS = 1  # 不做重试风暴: 连不上就 no-op, 下次写再试
 
+# Gated PG-face auto-install (owner 2, 2026-11-17): per-process guard — the
+# config is re-read on EVERY shared-memory operation (by design, no cache),
+# so the installer trigger must fire at most once per process; the 6h
+# cooldown marker inside dep_bootstrap throttles across processes. The
+# trigger sits BEHIND the enabled-gate, so hosts that never enable PG pay
+# zero cost (no probe, no marker, no pip). Never raises.
+_PG_AUTOINSTALL_TRIGGERED = False
+
+
+def _maybe_trigger_pg_face_autoinstall() -> None:
+    global _PG_AUTOINSTALL_TRIGGERED
+    if _PG_AUTOINSTALL_TRIGGERED:
+        return
+    _PG_AUTOINSTALL_TRIGGERED = True
+    try:
+        dep_bootstrap.ensure_pg_face_deps_installed()
+    except Exception as e:
+        logger.debug("shared_memory: pg-face auto-install trigger skipped: %s", e)
+
 
 def _load_shared_memory_config() -> Optional[Dict[str, Any]]:
     """读 plugins.entries.filemem.shared_memory 段。
@@ -87,23 +106,48 @@ def _load_shared_memory_config() -> Optional[Dict[str, Any]]:
     try:
         entries = (parsed or {}).get("plugins", {}).get("entries", {})
         fm = entries.get("filemem") or {}
-        sm = fm.get("shared_memory")
-        if not isinstance(sm, dict) or not sm.get("enabled"):
+        settings = fm.get("settings") or {}
+        # Three read paths, in priority order (kbs parity):
+        # 1. Panel-saved scalar keys (.settings.sm_enabled, .settings.sm_agent_id, …)
+        #    — the plugin.yaml config_schema shape (independent fields).
+        # 2. Legacy .settings.shared_memory (dict) — intermediate shape.
+        # 3. Legacy .shared_memory (dict) — original direct-entry layout.
+        if "sm_enabled" in settings:
+            enabled = bool(settings.get("sm_enabled", True))
+            if not enabled:
+                return None
+            agent_id = str(settings.get("sm_agent_id") or "").strip()
+            token = str(settings.get("sm_token") or "")
+            pg = {
+                "host": str(settings.get("sm_pg_host") or ""),
+                "port": int(settings.get("sm_pg_port") or 5432),
+                "db": str(settings.get("sm_pg_db") or ""),
+                "user": str(settings.get("sm_pg_user") or ""),
+                "password": str(settings.get("sm_pg_password") or ""),
+            }
+        else:
+            sm = settings.get("shared_memory")
+            if not isinstance(sm, dict):
+                sm = fm.get("shared_memory")
+            if not isinstance(sm, dict) or not sm.get("enabled"):
+                return None
+            agent_id = str(sm.get("agent_id") or "").strip()
+            token = str(sm.get("token") or "")
+            pg_raw = sm.get("pg") or {}
+            pg = {
+                "host": str(pg_raw.get("host") or ""),
+                "port": int(pg_raw.get("port") or 5432),
+                "db": str(pg_raw.get("db") or ""),
+                "user": str(pg_raw.get("user") or ""),
+                "password": str(pg_raw.get("password") or ""),
+            }
+        if not agent_id or not pg["host"] or not pg["db"]:
             return None
-        pg = sm.get("pg") or {}
-        agent_id = str(sm.get("agent_id") or "").strip()
-        if not agent_id or not pg.get("host") or not pg.get("db"):
-            return None
+        _maybe_trigger_pg_face_autoinstall()  # 门禁在此: 只有 enabled 且配置完整才触发
         return {
             "agent_id": agent_id,
-            "token": str(sm.get("token") or ""),
-            "pg": {
-                "host": str(pg.get("host")),
-                "port": int(pg.get("port") or 5432),
-                "db": str(pg.get("db")),
-                "user": str(pg.get("user")),
-                "password": str(pg.get("password") or ""),
-            },
+            "token": token,
+            "pg": pg,
         }
     except Exception as e:
         logger.warning(f"shared_memory: config parse failed, no-op: {e}")
