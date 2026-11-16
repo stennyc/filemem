@@ -4524,10 +4524,23 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # FIRST non-trivial prefetch of this process lifetime. Keeps the
         # user-tail bytes stable across a session reopen. Fail-soft: any read
         # hiccup -> normal prefetch below.
+        # FRESH GATE (owner 2026-11-15): skip replay if this session is fresh
+        # — a fresh session must inject NOTHING on the auto face, including
+        # any stale snapshot from a prior run.
+        _is_fresh = False
         if not getattr(self, "_p3_replay_armed", False):
             self._p3_replay_armed = True
+            _bb_choice = self._get_bringback_choice(
+                getattr(self, "_turn_active_sid", None)
+                or getattr(self, "session_id", None)
+                or session_id)
+            if _bb_choice == "fresh":
+                _is_fresh = True
+                logger.info(
+                    f"FileMem: fresh mode for session={session_id} — "
+                    f"skipping P3 cold-start replay")
             _snap = self._load_injected_snapshot(session_id, query)
-            if _snap:
+            if _snap and not _is_fresh:
                 # Session-isolation fix (owner 2026-10-10, Fix 1): the frozen
                 # block must re-pass the P0-2 auto-face predicate at replay
                 # time — a cross-profile row that entered the pool before the
@@ -4662,10 +4675,13 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # (filemem_search / M4) is UNAFFECTED (fresh ≠ unretrievable; owner
         # 2026-10-10). Runs before the confirmed gate; a fresh session has no
         # auto-inject value to keep, so we short-circuit the pool here.
+        # NOTE: use the incoming session_id parameter first (authoritative),
+        # fall back to _turn_active_sid only if parameter is empty. This
+        # prevents stale _turn_active_sid from a prior session from causing
+        # us to read the wrong bringback configuration.
         _bb_choice = self._get_bringback_choice(
-            getattr(self, "_turn_active_sid", None)
-            or getattr(self, "session_id", None)
-            or session_id)
+            session_id or getattr(self, "_turn_active_sid", None)
+            or getattr(self, "session_id", None))
         if _bb_choice == "fresh" and results:
             results = []
         if results:
@@ -13976,7 +13992,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         choice (including 'fresh') NEVER makes an old session unretrievable
         (owner invariant: 全新 ≠ 失联)."""
         sid = args.get("session_id") or getattr(self, "session_id", None)
-        choice = args.get("choice", "clean_start")
+        choice = args.get("choice", "fresh")
         valid = ("bring_back", "clean_start", "fresh", "topic_mismatch")
         if choice not in valid:
             return json.dumps({"success": False,
