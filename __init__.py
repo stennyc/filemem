@@ -7786,6 +7786,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
 
         _distill_target = None
         _probe_target = None
+        _defer_bg_reclassify = None  # ②+②a: (content, sid) deferred to bg
         # t_090d6f3d: pre-lock, budget-gated host-LLM reclassify of a regex
         # `fact`-miss (spike-3 hybrid). `_detect_type` is the PURE regex
         # verdict (zero LLM); when it lands on `fact` the item is a strong-
@@ -7796,16 +7797,32 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # resolved the same way, pre-lock, and executed post-lock). Fail-soft:
         # no runtime / over-cap / any host failure keeps the regex `fact`
         # verdict (never blocks the save).
+        # ②+②a (owner 2026-11-17): on the ADJUDICATION confirm path
+        # (source == "confirmed_draft") the reclassify is the ONLY LLM call on
+        # the model's tool-loop hot path (filemem_review_drafts confirm). To
+        # keep that path zero-blocking we DEFER it to a bg daemon thread: the
+        # row lands in the PURE-regex shard synchronously (the settled verdict
+        # is in the pool before the tool returns) and the bg thread
+        # advisory-stamps metadata.llm_suggested_type if the LLM upgrades.
+        # All OTHER sources keep the pre-existing SYNCHRONOUS reclassify
+        # (unchanged behavior) — the offload is scoped to the adjudication
+        # path the owner asked about.
         _regex_type = self._detect_type(content)
         _type_source = "regex"
         if _regex_type == "fact":
             _sid = getattr(self, "_turn_active_sid", None) or self.session_id or "default"
-            _llm_type = self._reclassify_type_llm(content, _sid)
-            if _llm_type:
-                mem_type = _llm_type
-                _type_source = "llm"
-            else:
+            if source == "confirmed_draft":
+                # ②+②a: land the regex shard synchronously; defer the LLM
+                # reclassify to a bg thread (advisory-stamp on upgrade).
                 mem_type = "fact"
+                _defer_bg_reclassify = (content, _sid)
+            else:
+                _llm_type = self._reclassify_type_llm(content, _sid)
+                if _llm_type:
+                    mem_type = _llm_type
+                    _type_source = "llm"
+                else:
+                    mem_type = "fact"
         else:
             mem_type = _regex_type
         with self._lock:
@@ -8085,6 +8102,19 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                                 f"(title={_marker.get('title')!r})")
             except Exception as e:
                 logger.warning(f"FileMem: plan-probe failed (row already saved): {e}")
+
+        # ②+②a: the adjudication confirm path's deferred LLM reclassify now
+        # runs on a bg daemon thread (zero-blocking the model's tool loop).
+        # The row already landed in the PURE-regex shard (the settled verdict
+        # is in the pool before the tool returned); on an upgrade the bg
+        # thread advisory-stamps metadata.llm_suggested_type (single-shard
+        # RMW, no cross-shard move). Fail-soft: a spawn hiccup / no-runtime /
+        # over-cap leaves the row on the regex verdict (the upgrade is
+        # non-load-bearing audit-trail — never blocks, never loses the row).
+        if _defer_bg_reclassify is not None and _return_id:
+            _defer_content, _defer_sid = _defer_bg_reclassify
+            self._spawn_bg_reclassify_advisory(
+                mem_type, _return_id, _defer_content, _defer_sid)
 
         if source == "auto":
             self._session_save_count += 1
@@ -8431,6 +8461,20 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 except Exception as _jt_e:
                     logger.debug(f"FileMem: failure-flush thread join skipped: {_jt_e}")
             self._failure_flush_threads = []
+        # ②+②a: join any in-flight bg reclassify advisory-stamp threads so a
+        # daemon-thread truncation at process exit cannot drop a stamp mid-
+        # RMW (a bounded join; each thread is one reclassify + one single-
+        # shard RMW, the 10s cap per thread is generous, a hung thread is
+        # left to die with the process — the advisory stamp is best-effort,
+        # the row already landed on the regex shard so nothing is lost).
+        _rc_ths = getattr(self, "_reclassify_threads", None)
+        if isinstance(_rc_ths, list):
+            for _th in _rc_ths:
+                try:
+                    _th.join(timeout=10)
+                except Exception as _jt_e:
+                    logger.debug(f"FileMem: bg-reclassify thread join skipped: {_jt_e}")
+            self._reclassify_threads = []
         logger.info("FileMemory: shutdown complete")
 
     def on_pre_compress(self, messages: List[Dict], *, session_id: str = "") -> List[Dict]:
@@ -8697,6 +8741,100 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # LLM agreed with fact / returned an invalid verdict / said plan ->
         # no override.
         return None
+
+    def _spawn_bg_reclassify_advisory(self, mem_type: str, row_id: str,
+                                     content: str, sid: str) -> None:
+        """②+②a: off the adjudication confirm path's ONLY LLM (the fact-miss
+        reclassify) onto a bg daemon thread so the model's tool-call stays
+        zero-blocking.
+
+        Runs ``_reclassify_type_llm`` (budget-gated + fail-soft, the SAME
+        gate as the sync face — the bg thread shares the instance's
+        ``_type_classify_budget``, so the per-session cap holds across both
+        paths). On an LLM upgrade it advisory-stamps the just-landed row's
+        ``metadata.llm_suggested_type`` (a single-shard RMW — no cross-shard
+        move, no deadlock surface). The row already landed with the regex
+        verdict, so a miss / over-cap / no-runtime / spawn hiccup all leave
+        it there (the upgrade is non-load-bearing audit-trail: never blocks,
+        never loses the row).
+
+        Thread handles are tracked (bounded, cap 8 — the oldest are
+        long-finished so the cap trims dead handles) + joined at
+        ``shutdown()`` (a daemon thread would otherwise be killed mid-stamp
+        at process exit, losing the advisory stamp — mirroring
+        ``_failure_flush_threads``). In-host we prefer the host's
+        ``spawn_context_thread`` (contextvar-bound daemon, keeps the host
+        main_runtime ctx + the in-memory ``_pending_confirm`` panel in THIS
+        process — the whole point of ② over a subprocess); the plain-daemon
+        fallback covers standalone / test-fixture use where the host import
+        is absent (there ``_main_runtime`` is None so the reclassify
+        self-skips -> zero LLM cost, the thread is a no-op).
+        """
+        def _run() -> None:
+            try:
+                t = self._reclassify_type_llm(content, sid)
+                if not t:
+                    return  # miss / over-cap / no runtime: regex verdict stands
+                self._advisory_stamp_suggested_type(mem_type, row_id, t)
+            except Exception as e:
+                logger.warning(
+                    f"FileMem: bg reclassify advisory-stamp failed ({e}); "
+                    f"row keeps the regex verdict")
+        try:
+            from agent.memory_provider import spawn_context_thread as _spawn_ct
+            _th = _spawn_ct(_run, name=f"filemem-bg-reclassify-{sid}")
+        except Exception:
+            import threading as _th_mod
+            _th = _th_mod.Thread(
+                target=_run, name=f"filemem-bg-reclassify-{sid}", daemon=True)
+        _th.start()
+        _threads = getattr(self, "_reclassify_threads", None)
+        if not isinstance(_threads, list):
+            _threads = []
+            self._reclassify_threads = _threads
+        _threads.append(_th)
+        if len(_threads) > 8:
+            del _threads[:len(_threads) - 8]
+
+    def _advisory_stamp_suggested_type(self, mem_type: str, row_id: str,
+                                       suggested_type: str) -> None:
+        """②+②a single-shard RMW: stamp ``metadata.llm_suggested_type`` on the
+        just-landed row. ADVISORY ONLY — the row physically stays in the
+        regex shard; the LLM's specific-shard verdict is recorded for the read
+        side to use if it wants, but no cross-shard move happens (no 2-shard
+        RMW, no deadlock surface). Idempotent: a row that's gone / already
+        stamped is a no-op (never re-creates). Under that ONE shard's lock
+        (single direction, consistent with the other LLM-face stamp sites);
+        the audit append runs AFTER the shard lock is released (thread lock ->
+        shard lock -> audit, single direction, never the reverse)."""
+        mem_file = self.memories_dir / f"{mem_type}.json"
+        with self._shard_lock(mem_file):
+            items = self._read_memories_file(mem_file)
+            stamped = False
+            for it in items:
+                if str(it.get("id")) == str(row_id):
+                    it.setdefault("metadata", {})["llm_suggested_type"] = suggested_type
+                    it["updated_at"] = _utcnow().isoformat()
+                    stamped = True
+                    break
+            if not stamped:
+                return  # row gone / moved since the save: no-op
+            with open(mem_file, "w", encoding="utf-8") as f:
+                json.dump(items, f, ensure_ascii=False, indent=2)
+        # Audit (append-only, OUTSIDE the shard lock — consistent ordering).
+        try:
+            self._append_consolidation_event({
+                "ts": _utcnow().isoformat(),
+                "action": "bg_reclassify_advisory_stamp",
+                "memory_id": str(row_id),
+                "shard": mem_type,
+                "suggested": suggested_type,
+                "source_profile": getattr(self, "source_profile", None),
+            })
+        except Exception as _aud_e:
+            logger.debug(
+                f"FileMem: bg reclassify audit write failed ({_aud_e}); "
+                f"stamp already landed on disk")
 
     def _refine_draft_llm(self, content: str) -> tuple:
         """2026-11-08 (①): budget-gated host-LLM refine of a fresh draft.
