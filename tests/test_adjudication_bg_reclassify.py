@@ -120,6 +120,10 @@ def _make_provider(tmp: pathlib.Path, source_profile: str = "default") -> FileMe
     # ②+②a budget (mirrors the provider's real default: 5/session).
     p._type_classify_limit = 5
     p._type_classify_budget = {}
+    # pin the THREAD path (the pre-2026-11-17 spec this suite encodes): the
+    # subprocess-first default (owner 2026-11-17 ruling, code_map parity) is
+    # covered by test_adjudication_bg_reclassify_subprocess.py
+    p._reclassify_subprocess = False
     return p
 
 

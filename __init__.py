@@ -3040,6 +3040,17 @@ class FileMemProvider(MemoryProvider):
         if isinstance(_lps, int) and _lps >= 0:
             self._type_classify_limit = _lps
 
+        # 2026-11-17 (owner ruling): the adjudication reclassify offload
+        # runs in a CHILD PROCESS by default (code_map subprocess-build
+        # parity, 666fdbf — the main_runtime snapshot is an explicit
+        # JSON-serializable dict, the panel is never touched by this path,
+        # and the single-shard RMW already serializes cross-process via
+        # <shard>.json.lock). reclassify_subprocess=false = clean rollback
+        # to the in-process daemon-thread path (f12c8b9).
+        _rcsp = _mt.get("reclassify_subprocess")
+        if isinstance(_rcsp, bool):
+            self._reclassify_subprocess = _rcsp
+
         # 2026-11-08 (①): apply the decay memory_draft_refine block to the
         # draft-refine budget knob (default 3) — a user-tunable
         # llm_per_session overrides it; 0 / enable=False = clean rollback to
@@ -8463,18 +8474,11 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             self._failure_flush_threads = []
         # ②+②a: join any in-flight bg reclassify advisory-stamp threads so a
         # daemon-thread truncation at process exit cannot drop a stamp mid-
-        # RMW (a bounded join; each thread is one reclassify + one single-
-        # shard RMW, the 10s cap per thread is generous, a hung thread is
-        # left to die with the process — the advisory stamp is best-effort,
-        # the row already landed on the regex shard so nothing is lost).
-        _rc_ths = getattr(self, "_reclassify_threads", None)
-        if isinstance(_rc_ths, list):
-            for _th in _rc_ths:
-                try:
-                    _th.join(timeout=10)
-                except Exception as _jt_e:
-                    logger.debug(f"FileMem: bg-reclassify thread join skipped: {_jt_e}")
-            self._reclassify_threads = []
+        # 2026-11-17: bounded quiesce of the ②+②a bg reclassify handles —
+        # the daemon threads + the child processes (a hung handle is left
+        # to die with the process — the advisory stamp is best-effort, the
+        # row already landed on the regex shard so nothing is lost).
+        self._quiesce_bg_reclassify()
         logger.info("FileMemory: shutdown complete")
 
     def on_pre_compress(self, messages: List[Dict], *, session_id: str = "") -> List[Dict]:
@@ -8762,14 +8766,38 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         long-finished so the cap trims dead handles) + joined at
         ``shutdown()`` (a daemon thread would otherwise be killed mid-stamp
         at process exit, losing the advisory stamp — mirroring
-        ``_failure_flush_threads``). In-host we prefer the host's
-        ``spawn_context_thread`` (contextvar-bound daemon, keeps the host
-        main_runtime ctx + the in-memory ``_pending_confirm`` panel in THIS
-        process — the whole point of ② over a subprocess); the plain-daemon
-        fallback covers standalone / test-fixture use where the host import
-        is absent (there ``_main_runtime`` is None so the reclassify
+        ``_failure_flush_threads``). 2026-11-17 (owner ruling): the thread
+        is now the fail-soft FALLBACK — the offload prefers a CHILD PROCESS
+        (``_start_reclassify_process``, code_map subprocess-build parity,
+        666fdbf: the main_runtime snapshot is an explicit JSON-serializable
+        dict, the panel is never touched by this path, and the single-shard
+        RMW already serializes cross-process via ``<shard>.json.lock``).
+        The thread itself prefers the host's ``spawn_context_thread``
+        (contextvar-bound daemon, keeps the host main_runtime ctx in THIS
+        process); the plain-daemon fallback covers standalone / test-
+        fixture use where the host import is absent (there ``_main_runtime`` is None so the reclassify
         self-skips -> zero LLM cost, the thread is a no-op).
         """
+        # 2026-11-17 (owner ruling): SUBPROCESS-FIRST — a fresh python runs
+        # the LLM call + advisory stamp isolated from this process (the
+        # code_map fire-and-forget posture, 666fdbf). ANY spawn-degrade
+        # (no host tree, non-JSON snapshot, over-cap, Popen hiccup) falls
+        # through to the thread path below: the work is never lost to a
+        # spawn failure, only the isolation is abandoned.
+        if getattr(self, "_reclassify_subprocess", True):
+            _proc = self._start_reclassify_process(mem_type, row_id, content, sid)
+            if _proc is not None:
+                _procs = getattr(self, "_reclassify_processes", None)
+                if not isinstance(_procs, list):
+                    _procs = []
+                    self._reclassify_processes = _procs
+                _procs.append(_proc)
+                if len(_procs) > 8:
+                    del _procs[:len(_procs) - 8]
+                logger.info(
+                    f"FileMem: bg reclassify offloaded to child process "
+                    f"pid={_proc.pid} (shard={mem_type} row={row_id})")
+                return
         def _run() -> None:
             try:
                 t = self._reclassify_type_llm(content, sid)
@@ -8795,6 +8823,121 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         _threads.append(_th)
         if len(_threads) > 8:
             del _threads[:len(_threads) - 8]
+
+    def _start_reclassify_process(self, mem_type: str, row_id: str,
+                                  content: str, sid: str):
+        """2026-11-17 (owner ruling): spawn the adjudication reclassify in a
+        CHILD python (code_map subprocess-build parity, 666fdbf).
+
+        Protocol: argv carries only the shard + row id; the payload (the row
+        content + the EXPLICIT main_runtime dict snapshot + the host tree)
+        rides STDIN as one JSON line — secrets never appear on the argv /
+        ps surface. The child runs the on-disk llm_caller + the on-disk
+        advisory-stamp method under the EXISTING cross-process
+        <shard>.json.lock (0-lost-update RMW), fail-visible on stderr.
+
+        Budget: the parent pre-gates the per-session cap here; the slot is
+        reserved ONLY after a successful Popen, so a Popen hiccup (the
+        caller's thread fallback) still finds an intact budget and can run
+        the LLM in-process (the work is never lost, only isolated away).
+
+        Returns the Popen handle (registered + reaped by the caller /
+        ``_quiesce_bg_reclassify``), or None on ANY spawn-degrade (the
+        caller falls back to the in-process thread path): over-cap, no
+        main_runtime snapshot, no host tree (the ``_reclassify_host_tree``
+        attribute override is the test seam; in-host it auto-resolves via
+        the importable ``agent`` package), missing entry file, or a
+        non-JSON-serializable payload.
+        """
+        limit = getattr(self, "_type_classify_limit", 5)
+        if not isinstance(limit, int) or limit <= 0:
+            return None
+        budget = getattr(self, "_type_classify_budget", None)
+        if not isinstance(budget, dict):
+            budget = {}
+            self._type_classify_budget = budget
+        if budget.get(sid, 0) >= limit:
+            logger.info(f"FileMem: type-classify budget hit ({sid} >= "
+                        f"{limit}), keeping regex fact verdict (no spawn)")
+            return None
+        snapshot = self._live_main_runtime()
+        if not isinstance(snapshot, dict) or not snapshot:
+            return None  # no runtime: a child could do nothing (thread self-skips too)
+        host_tree = getattr(self, "_reclassify_host_tree", None)
+        if host_tree is None:
+            try:
+                import agent as _agent_pkg
+                host_tree = str(Path(_agent_pkg.__file__).resolve().parent.parent)
+            except Exception:
+                host_tree = None  # standalone / host absent: the thread self-skips
+        if host_tree is None:
+            return None
+        entry = Path(__file__).resolve().parent / "reclassify_subprocess_entry.py"
+        if not entry.exists():
+            logger.warning("FileMem: reclassify subprocess entry missing; "
+                           "thread fallback")
+            return None
+        payload = {
+            "storage_dir": str(getattr(self, "storage_dir", "")),
+            "shard": mem_type,
+            "row_id": str(row_id),
+            "session_id": sid,
+            "source_profile": getattr(self, "source_profile", None),
+            "content": content,
+            "main_runtime": snapshot,
+            "host_tree": host_tree,
+        }
+        try:
+            json.dumps(payload, ensure_ascii=False)  # JSON gate: non-serializable -> thread
+        except Exception as e:
+            logger.warning(f"FileMem: reclassify subprocess payload not "
+                           f"JSON-safe ({e}); thread fallback")
+            return None
+        try:
+            _p = subprocess.Popen(
+                [sys.executable, str(entry), "--shard", str(mem_type),
+                 "--row", str(row_id)],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=None, text=True,
+                cwd=str(Path(__file__).resolve().parent))
+        except Exception as e:
+            logger.warning(f"FileMem: reclassify subprocess spawn hiccup "
+                           f"({e}); thread fallback")
+            return None
+        budget[sid] = budget.get(sid, 0) + 1  # reserve AFTER a live Popen
+        try:
+            _p.stdin.write(json.dumps(payload, ensure_ascii=False))
+            _p.stdin.close()
+        except Exception:
+            try:
+                _p.kill()
+            except Exception:
+                pass
+            return None
+        return _p
+
+    def _quiesce_bg_reclassify(self) -> None:
+        """Bounded quiesce of the ②+②a bg reclassify handles (2026-11-17:
+        the daemon threads + the child processes). A hung handle is left to
+        die with the process — the advisory stamp is best-effort, the row
+        already landed on the regex shard so nothing is lost (mirrors the
+        _failure_flush_threads quiesce posture)."""
+        _rc_ths = getattr(self, "_reclassify_threads", None)
+        if isinstance(_rc_ths, list):
+            for _th in _rc_ths:
+                try:
+                    _th.join(timeout=10)
+                except Exception as _jt_e:
+                    logger.debug(f"FileMem: bg-reclassify thread join skipped: {_jt_e}")
+            self._reclassify_threads = []
+        _rc_ps = getattr(self, "_reclassify_processes", None)
+        if isinstance(_rc_ps, list):
+            for _pp in _rc_ps:
+                try:
+                    _pp.wait(timeout=10)
+                except Exception as _pw_e:
+                    logger.debug(f"FileMem: bg-reclassify process wait skipped: {_pw_e}")
+            self._reclassify_processes = []
 
     def _advisory_stamp_suggested_type(self, mem_type: str, row_id: str,
                                        suggested_type: str) -> None:
