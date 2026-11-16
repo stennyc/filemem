@@ -123,3 +123,159 @@ def ensure_pg_dep_paths() -> None:
     for site in _find_dep_dirs():
         if os.path.isdir(site) and site not in sys.path:
             sys.path.append(site)
+
+
+# ---------------------------------------------------------------------------
+# Gated PG-face auto-install (owner option 2, 2026-11-17)
+#
+# filemem's CORE face is stdlib-only — zero pip deps. The ONLY third-party
+# deps the whole plugin can ever need are the OPTIONAL PG shared-memory face
+# (shared_memory.py): psycopg2 (driver) + a yaml parser (ruamel.yaml
+# preferred, PyYAML fallback — either satisfies the parse chain). This block
+# is the kbs-parity gated auto-installer for exactly that pair:
+#
+#   - TRIGGER GATE: nothing here runs unless shared_memory._load_shared_memory_config
+#     has read the plugins.entries.filemem shared-memory section AND its
+#     enabled-gate passed — hosts that never enable PG pay zero cost
+#     (no probe, no marker, no pip; owner requirement).
+#   - INSTALL TARGET: the RUNNING interpreter (sys.executable -m pip), so the
+#     wheels persist in its site-packages and the NEXT boot takes the fast
+#     path (kbs 8ac1211 precedent); dep_bootstrap's splice model also keeps
+#     resolving deps that live in the Hermes-managed venv.
+#   - SPLIT CALLS: one pip invocation per missing package — a psycopg2
+#     wheel-build failure must not block pyyaml (kbs first-cut lesson).
+#   - 6h COOLDOWN MARKER under $HERMES_HOME (per-plugin, not shared with
+#     kbs): an attempt (success OR failure) throttles retries against
+#     flapping network.
+#   - FAIL-SOFT: the trigger never raises; the local file face is byte-
+#     unchanged no matter what the installer does.
+# ---------------------------------------------------------------------------
+_PG_FACE_DEPS = (("psycopg2", "psycopg2-binary"), ("yaml", "pyyaml"))
+_PG_AUTOINSTALL_COOLDOWN_HOURS = 6.0
+_PG_PIP_TIMEOUT_S = 240
+_PG_MARKER_NAME = ".filemem_pg_autoinstall.json"
+
+
+def _pg_exe_key() -> str:
+    """Interpreter identity for marker scoping: an install that satisfies ONE
+    interpreter must not throttle ANOTHER's — the marker is keyed per
+    sys.executable, because pip installs into the running interpreter's own
+    site-packages (2026-11-17 live run: a marker written by the dev venv
+    blocked the gateway interpreter's own needed install for 6h)."""
+    if sys.executable:
+        return os.path.normcase(os.path.abspath(sys.executable))
+    return "unknown"
+
+
+def _pg_marker_path() -> Path:
+    return Path(_resolve_hermes_home()) / _PG_MARKER_NAME
+
+
+def _pg_missing_probe() -> list:
+    """(module, pip_name) pairs whose module is not importable right now.
+    find_spec exceptions count as missing (hostile interpreter -> the
+    installer gets a chance, fail-soft)."""
+    missing = []
+    for module, pip_name in _PG_FACE_DEPS:
+        try:
+            if importlib.util.find_spec(module) is None:
+                missing.append((module, pip_name))
+        except (ImportError, ValueError, ModuleNotFoundError):
+            missing.append((module, pip_name))
+    return missing
+
+
+def _pg_run_pip(pip_name: str, timeout: int = _PG_PIP_TIMEOUT_S):
+    """One split pip install into the running interpreter. Returns
+    (ok: bool, detail: str); never raises."""
+    import subprocess
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", pip_name],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if proc.returncode == 0:
+            return True, "ok"
+        return False, f"rc={proc.returncode} {proc.stderr.strip()[-200:]}"
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _pg_thread_factory(target, name: str):
+    """Seam for tests (synchronous runner); production = daemon thread so
+    the call face never blocks on pip."""
+    import threading
+    t = threading.Thread(target=target, name=name, daemon=True)
+    t.start()
+    return t
+
+
+def _pg_read_marker() -> dict:
+    """Marker = {exe_key: {"ts", "packages", "ok"}}. Legacy top-level shape
+    ({"ts": ...}, pre-per-interpreter scoping) reads back as {} -> its
+    shared entry is intentionally dropped (the next attempt rewrites the
+    file in the new shape)."""
+    try:
+        data = json.loads(_pg_marker_path().read_text())
+    except Exception:
+        return {}
+    if not isinstance(data, dict) or "ts" in data:
+        return {}
+    return data
+
+
+def _pg_write_marker(ts: float, packages, ok) -> None:
+    """Merge under the CURRENT interpreter's key (other interpreters'
+    entries survive untouched)."""
+    try:
+        data = _pg_read_marker()
+        data[_pg_exe_key()] = {"ts": ts, "packages": packages, "ok": ok}
+        _pg_marker_path().write_text(json.dumps(data))
+    except Exception:
+        pass  # marker is throttling sugar, never fatal
+
+
+def ensure_pg_face_deps_installed(cooldown_hours: float | None = None) -> dict:
+    """Gated auto-install for the optional PG face. See the section docstring
+    above for the gate/cooldown/fail-soft contract. Returns
+    {missing, triggered, reason}:
+      reason in {'present', 'cooldown', 'installed', 'installing', 'pip_failed'}.
+    NEVER raises (the local face must be unaffected by the optional
+    installer, whatever it does)."""
+    out = {"missing": [], "triggered": False, "reason": "present"}
+    try:
+        import time
+        missing = _pg_missing_probe()
+        if not missing:
+            return out
+        out["missing"] = [m for m, _ in missing]
+        cooldown = (_PG_AUTOINSTALL_COOLDOWN_HOURS if cooldown_hours is None
+                    else cooldown_hours)
+        entry = _pg_read_marker().get(_pg_exe_key())
+        if entry and time.time() - entry.get("ts", 0.0) < cooldown * 3600:
+            out["reason"] = "cooldown"
+            return out
+        now = time.time()
+        # record the attempt time BEFORE starting (anti-storm); the job
+        # below rewrites the marker with the outcome
+        _pg_write_marker(now, [p for _, p in missing], None)
+
+        def _job():
+            oks = []
+            for _module, pip_name in missing:
+                ok, _detail = _pg_run_pip(pip_name, _PG_PIP_TIMEOUT_S)
+                oks.append(ok)
+            _pg_write_marker(now, [p for _, p in missing], all(oks))
+
+        _pg_thread_factory(_job, "filemem-pg-deps")
+        out["triggered"] = True
+        done = _pg_read_marker().get(_pg_exe_key())
+        ok = done.get("ok") if done else None
+        out["reason"] = ("pip_failed" if ok is False
+                         else "installed" if ok is True else "installing")
+    except Exception:
+        out["triggered"] = False
+        out["reason"] = "error"
+    return out
