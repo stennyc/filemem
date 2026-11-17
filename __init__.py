@@ -518,6 +518,42 @@ def _is_kanban_task_prompt(content: Optional[str]) -> bool:
     return _KANBAN_TASK_BODY_MARKER in s
 
 
+# P0-1(f) user meta-discourse about the system itself (owner 2026-11-17,
+# the "问了又问" re-ask loop, root-cause layer #5): a user turn that
+# COMPLAINS / interrogates the host memory system's own behavior — e.g.
+# "filemem 为何还是相同待裁决的草稿，问了又问？" — is not a durable
+# environmental fact. It is the loop's own fuel: the complaint re-mentions
+# the very topics it re-surfaces, so auto-catch re-captures it as a fresh
+# L0 draft row and the [记忆报告] panel re-asks it. Double-feature detector
+# (single source, pure rule + stdlib, zero LLM, never raises): BOTH a
+# system-self-reference AND a complaint/repetition framing must hit.
+# Precision invariants: a clean fact that merely MENTIONS the system
+# ("filemem 和 kbs 依赖安装改成 code_map 式自动安装方式") misses the
+# framing feature and keeps passing (zero 误杀); a generic complaint without
+# system markers ("怎么老是忘事") misses the reference feature and passes
+# (precision-first, the owner's F2 posture).
+_META_SYSTEM_MARKERS = (
+    "记忆报告", "待裁决", "已裁决", "裁决", "草稿", "召回", "重捕获",
+    "auto-catch", "filemem", "kbs", "hermes",
+)
+_META_COMPLAINT_MARKERS = (
+    "为何", "为什么", "怎么老是", "老是", "又问", "重复问",
+    "无限次数", "无限重复", "烦",
+)
+
+
+def _is_meta_system_complaint(content: Optional[str]) -> bool:
+    """P0-1(f): TRUE iff the content is a user meta-discourse complaint ABOUT
+    the host memory system itself (double feature: _META_SYSTEM_MARKERS AND
+    _META_COMPLAINT_MARKERS both hit). Fail-safe: non-str / blank -> False
+    (a garbage row is the other reject legs' job, never this one's)."""
+    s = content if isinstance(content, str) else ""
+    if not s:
+        return False
+    return (any(m in s for m in _META_SYSTEM_MARKERS)
+            and any(m in s for m in _META_COMPLAINT_MARKERS))
+
+
 def _is_relay_block(content: Optional[str]) -> bool:
     """P1: single-source relay-block detector (write ingress + read fold).
 
@@ -634,11 +670,12 @@ def ingress_reject_class(content: Optional[str],
     classes. Returns the reject-class string
     (``host_instruction_block`` / ``raw_tool_output`` /
     ``whole_task_prompt`` / ``host_relay_block`` /
-    ``whole_kanban_task_prompt`` / ``structural_opener``)
+    ``whole_kanban_task_prompt`` / ``structural_opener`` /
+    ``meta_system_complaint``)
     when the content must NOT enter the memory pool, else None to pass.
-    Order (a)->(b)->(b2)->(c)->(d)->(e)->None. Pure rule + stdlib re/len, zero
-    LLM; never raises on any input (the caller's fail-open contract is
-    enforced upstream).
+    Order (a)->(b)->(b2)->(c)->(d)->(e)->(f)->None. Pure rule + stdlib
+    re/len, zero LLM; never raises on any input (the caller's fail-open
+    contract is enforced upstream).
 
     P0-3 (写侧 ingress 切同表): the ``raw_tool_output`` leg (b) is now
     「3 键恒活 (the code default — ``_looks_like_tool_dump`` + the
@@ -716,6 +753,20 @@ def ingress_reject_class(content: Optional[str],
     # shape the card slipped through (a)(b)(c)).
     if _is_kanban_task_prompt(s):
         return "whole_kanban_task_prompt"
+    # (f) user meta-discourse about the system itself (owner 2026-11-17, the
+    # "问了又问" loop root-cause #5): a turn that complains/interrogates the
+    # memory system's own behavior ("filemem 为何...问了又问？") is not a
+    # durable environmental fact — it re-mentions the very topics it
+    # re-surfaces, so auto-catch keeps re-capturing it. Double-feature
+    # detector _is_meta_system_complaint (single source, zero LLM): system-
+    # self-reference AND complaint framing must BOTH hit; a clean fact that
+    # merely MENTIONS the system keeps passing (zero 误杀), and a generic
+    # complaint without system markers passes (precision-first). After (e),
+    # before return None: zero cross-interaction ((f)'s texts carry no (a)
+    # head prefix, no (b)/(b2) tool-dump/structural opener, no (c) step-
+    # numbering, and are not (d)/(e) relay/kanban shapes).
+    if _is_meta_system_complaint(s):
+        return "meta_system_complaint"
     return None
 
 
