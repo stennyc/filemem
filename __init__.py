@@ -4285,7 +4285,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         (_decided_eff_floor): the owner's min_shared stands for long sigs
         (>= 27 tokens) and drops to min_len//3 (never below 3) for short
         ones, so reworded short-topic variants are caught without loosening
-        the F2 ruling on long CJK topics. Any error -> None (ask, don't
+        the F2 ruling on long CJK topics. Rows stamped ``superseded_by`` by a
+        later opposite adjudication (verdict override, 2026-11-17) are
+        skipped — the newest adjudication governs (audit-kept on disk).
+        Any error -> None (ask, don't
         silently suppress — the 宁多问不可崩 posture). The ledger is small and
         bounded, so a re-read per call is cheap on the hot path."""
         dl = self._decided_ledger_cfg()
@@ -4303,6 +4306,11 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         try:
             for row in rows:
                 if not isinstance(row, dict) or row.get("verdict") not in verdicts:
+                    continue
+                # verdict override: a row superseded by a LATER adjudication
+                # of the same topic stays on disk (audit) but is INACTIVE —
+                # the newest adjudication governs (owner ruling 2026-11-17).
+                if row.get("superseded_by"):
                     continue
                 rrow_sig = set(str(t) for t in row.get("sig") or [])
                 if not rrow_sig:
@@ -4323,10 +4331,14 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         it does not duplicate). The fold floor is RELATIVE
         (_decided_eff_floor), symmetric with _is_topic_decided: short rewords
         fold into the decided row, long-distinct topics still need the
-        owner's min_shared. Writers serialize on the shard lock and write
-        atomically (temp + os.replace) so concurrent readers never see a torn
-        file. Fail-soft: a write hiccup never raises into the verdict path
-        (the verdict itself is already decided)."""
+        owner's min_shared. VERDICT OVERRIDE: this newer adjudication also
+        supersedes ACTIVE rows of a different verdict that overlap the same
+        topic — they are STAMPED (superseded_by/superseded_ts, kept on disk
+        for audit, zero raw deletion) and the reader skips them, so the
+        latest adjudication is the effective one. Writers serialize on the
+        shard lock and write atomically (temp + os.replace) so concurrent
+        readers never see a torn file. Fail-soft: a write hiccup never
+        raises into the verdict path (the verdict itself is already decided)."""
         dl = self._decided_ledger_cfg()
         sig = self._topic_sig(content)
         p = self._decided_ledger_path()
@@ -4362,6 +4374,11 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                             row["content"] = snippet
                             row["ts"] = ts
                             row["fp"] = fp
+                            # a fold REACTIVATES a previously superseded row
+                            # (the topic was re-adjudicated to this verdict —
+                            # the newest adjudication governs again):
+                            row.pop("superseded_by", None)
+                            row.pop("superseded_ts", None)
                             folded = True
                             break
                     if not folded:
@@ -4369,6 +4386,25 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                             "fp": fp, "sig": sorted(sig), "content": snippet,
                             "verdict": verdict, "ts": ts, "profile": sp or "",
                         })
+                    # verdict override (owner ruling 2026-11-17): this NEWER
+                    # adjudication supersedes ACTIVE rows of a DIFFERENT
+                    # verdict that overlap the same topic (effective floor).
+                    # Rows are NEVER deleted (audit chain, zero raw deletion)
+                    # — they get a superseded_by pointer (+superseded_ts) and
+                    # the reader (_is_topic_decided) skips stamped rows, so
+                    # the LATEST adjudication is the effective one. The
+                    # pointer targets `fp`: the active row (folded or freshly
+                    # appended) carries this content hash after the write.
+                    for row in rows:
+                        if not isinstance(row, dict) or row.get("superseded_by"):
+                            continue
+                        if row.get("verdict") == verdict:
+                            continue
+                        rrow_sig = set(str(t) for t in row.get("sig") or [])
+                        if rrow_sig and len(sig & rrow_sig) >= _decided_eff_floor(
+                                min_shared, len(sig), len(rrow_sig)):
+                            row["superseded_by"] = fp
+                            row["superseded_ts"] = ts
                     # bound the ledger (keep the newest 400) so a long-lived
                     # shared store never grows without limit.
                     if len(rows) > 400:
