@@ -51,7 +51,11 @@
     "salience_decay_age_days": 30,
     "recall_audit_interval_min": 60,
     "log_rotate_lines": 5000,
-    "log_keep_tail_lines": 500
+    "log_keep_tail_lines": 500,
+    "decided_ledger": {
+      "enable": true,
+      "min_shared": 3
+    }
   },
   "aliases": {
     "min_term_freq": 3,

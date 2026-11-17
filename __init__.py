@@ -1015,6 +1015,37 @@ _TOPIC_GUARD_DEFAULT_THRESHOLD = 0.1
 # 闸的 fail-soft 只认这个类 + 兜底 Exception —— 注入类使失败路径无歧义）。
 _TOPIC_GUARD_INJECT_EXC: Optional[type] = None
 
+# Decided-ledger (2026-11-17, root-fix for the "adjudicated topic re-asks"
+# loop): a deterministic topic-signature for FUZZY same-topic matching
+# (reworded near-synonyms) WITHOUT an LLM. Mirrors the recurring_min_shared_
+# tokens idiom — a reworded topic shares a handful of key tokens, not a high
+# ratio, so the match gate keys on a DISTINCT-token floor, not a Jaccard
+# ratio. _topic_signature() is the pure token set; the provider's
+# _is_topic_decided() applies the floor.
+_TOPIC_LATIN_RE = re.compile(r"[a-z0-9][a-z0-9_\-]{2,}")
+
+
+def _topic_signature(text: Any) -> "frozenset[str]":
+    """Deterministic topic token set: lowercased latin word tokens (len>=3)
+    + CJK unigrams + consecutive-CJK bigrams. Zero LLM. Empty on
+    non-str / blank input (fail-safe: garbage never matches, never raises)."""
+    if not isinstance(text, str):
+        return frozenset()
+    lowered = text.lower()
+    if not lowered.strip():
+        return frozenset()
+    toks = set(_TOPIC_LATIN_RE.findall(lowered))
+    prev_cjk: Optional[str] = None
+    for ch in lowered:
+        if "\u4e00" <= ch <= "\u9fff":
+            toks.add("c" + ch)
+            if prev_cjk is not None:
+                toks.add("b" + prev_cjk + ch)
+            prev_cjk = ch
+        else:
+            prev_cjk = None
+    return frozenset(toks)
+
 
 def _topic_overlap_gate(prev_topic: Any, cur_topic: Any,
                         decay_cfg: Optional[Dict[str, Any]] = None,
@@ -3878,6 +3909,17 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     if (_drain_dedup_match(self._drain_row_profile(it))
                             and self._drain_fingerprint(it.get("content", "")) == fp):
                         return "dup"
+                # Decided-ledger write-guard (2026-11-17): an explicitly
+                # DISCARDED topic must not re-land a fresh pool row even in a
+                # reworded variant — the exact-fp dedup above only catches
+                # byte-identical repeats, so a reworded variant evaded it and
+                # kept re-accumulating duplicate rows. "dup" = safe to delete
+                # the md entry without a new pool row. CONFIRM verdicts do NOT
+                # block the write (a genuine re-statement may still land; its
+                # re-ask is already suppressed by _push_pending_confirm).
+                if self._is_topic_decided(content, verdicts=("discard",)) \
+                        == "discard":
+                    return "dup"
                 # NEW row — mirror the _save_memory auto-row stamping EXACTLY
                 # (so the rest of the pipeline treats it uniformly) + the D5
                 # drain category + an audit drain_fp.
@@ -4104,6 +4146,159 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         if sp in (None, ""):
             sp = row.get("source_profile") if isinstance(row, dict) else None
         return None if sp in (None, "") else str(sp)
+
+    # ── Decided-ledger: cross-session "already adjudicated, never re-ask" ───
+    # Root-fix (2026-11-17) for the re-ask loop. A topic, once confirmed or
+    # discarded via filemem_review_drafts, is recorded here so a re-landed /
+    # re-extracted REWORDED variant does NOT re-enqueue into a new session's
+    # pending-confirm (no re-ask) and does NOT re-land a duplicate pool row.
+    # Global (cross-session / cross-profile) — the ledger lives in the shared
+    # neutral store and keys on topic-signature overlap, not exact content.
+
+    @staticmethod
+    def _topic_sig(content: Any) -> "frozenset[str]":
+        """Public (test-facing) wrapper over the module-level
+        _topic_signature(). Deterministic, zero LLM, empty on garbage."""
+        return _topic_signature(content)
+
+    def _decided_ledger_cfg(self) -> Dict[str, Any]:
+        """The consolidation.decided_ledger knob block (fail-soft: default on,
+        a missing/malformed block falls back to the code-side defaults)."""
+        cfg = getattr(self, "_decay", None)
+        block = (cfg.get("consolidation") if isinstance(cfg, dict) else None) \
+            or {}
+        dl = block.get("decided_ledger") if isinstance(block, dict) else None
+        dl = dl if isinstance(dl, dict) else {}
+        enabled = dl.get("enable", True) is not False
+        try:
+            min_shared = int(dl.get("min_shared", 3))
+        except (TypeError, ValueError):
+            min_shared = 3
+        if min_shared < 1:
+            min_shared = 1
+        return {"enable": enabled, "min_shared": min_shared}
+
+    def _decided_ledger_path(self) -> Optional[Path]:
+        """storage_dir/ledgers/decided.json (global shared store). None when
+        there is no storage_dir (a fixture shell) — the gate degrades to
+        no-suppression and never raises into the hot paths."""
+        sd = getattr(self, "storage_dir", None)
+        if sd is None:
+            return None
+        try:
+            sd = Path(sd)
+        except Exception:
+            return None
+        return sd / "ledgers" / "decided.json"
+
+    def _load_decided(self) -> List[Dict[str, Any]]:
+        """Read the decided ledger (fail-soft: missing / corrupt -> []). The
+        writer is atomic (temp + os.replace), so a plain lock-free read can
+        never see a torn file. A bad read only UNDER-suppresses (legacy
+        re-ask), never crashes or wrongly suppresses — the safe direction for
+        a soft notice face."""
+        p = self._decided_ledger_path()
+        if p is None or not p.exists():
+            return []
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        return data if isinstance(data, list) else []
+
+    def _is_topic_decided(self, content: Any,
+                          verdicts: Tuple[str, ...] = ("confirm", "discard")) \
+            -> Optional[str]:
+        """Fail-CLOSED same-topic check: return the verdict of the best-
+        overlapping decided row (>= min_shared distinct topic tokens AND
+        verdict in `verdicts`), else None. Any error -> None (ask, don't
+        silently suppress — the 宁多问不可崩 posture). The ledger is small and
+        bounded, so a re-read per call is cheap on the hot path."""
+        dl = self._decided_ledger_cfg()
+        if not dl["enable"]:
+            return None
+        sig = self._topic_sig(content)
+        if len(sig) < 2:
+            return None
+        rows = self._load_decided()
+        if not rows:
+            return None
+        min_shared = dl["min_shared"]
+        best_shared = 0
+        best_verdict: Optional[str] = None
+        try:
+            for row in rows:
+                if not isinstance(row, dict) or row.get("verdict") not in verdicts:
+                    continue
+                rrow_sig = set(str(t) for t in row.get("sig") or [])
+                if not rrow_sig:
+                    continue
+                shared = len(sig & rrow_sig)
+                if shared >= min_shared and shared > best_shared:
+                    best_shared = shared
+                    best_verdict = row.get("verdict")
+        except Exception:
+            return None
+        return best_verdict
+
+    def _record_topic_decided(self, content: Any, verdict: str) -> None:
+        """Upsert a decided-topic row (dedup by overlapping topic signature —
+        a reworded variant of an already-decided topic UPDATES the same row,
+        it does not duplicate). Writers serialize on the shard lock and write
+        atomically (temp + os.replace) so concurrent readers never see a torn
+        file. Fail-soft: a write hiccup never raises into the verdict path
+        (the verdict itself is already decided)."""
+        dl = self._decided_ledger_cfg()
+        sig = self._topic_sig(content)
+        p = self._decided_ledger_path()
+        if p is None or not sig or verdict not in ("confirm", "discard"):
+            return
+        try:
+            min_shared = dl["min_shared"]
+            fp = self._content_hash(content if isinstance(content, str) else "")
+            snippet = (content[:120] if isinstance(content, str) else "")
+            sp = getattr(self, "source_profile", None)
+            ts = _utcnow().isoformat()
+            with self._lock:
+                with self._shard_lock(p):
+                    try:
+                        p.parent.mkdir(parents=True, exist_ok=True)
+                    except Exception:
+                        pass
+                    try:
+                        data = json.loads(p.read_text(encoding="utf-8"))
+                        rows = data if isinstance(data, list) else []
+                    except Exception:
+                        rows = []
+                    # fold into an overlapping row of the SAME verdict.
+                    folded = False
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        rrow_sig = set(str(t) for t in row.get("sig") or [])
+                        if rrow_sig and row.get("verdict") == verdict and \
+                                len(sig & rrow_sig) >= min_shared:
+                            row["sig"] = sorted(rrow_sig | set(sig))
+                            row["content"] = snippet
+                            row["ts"] = ts
+                            row["fp"] = fp
+                            folded = True
+                            break
+                    if not folded:
+                        rows.append({
+                            "fp": fp, "sig": sorted(sig), "content": snippet,
+                            "verdict": verdict, "ts": ts, "profile": sp or "",
+                        })
+                    # bound the ledger (keep the newest 400) so a long-lived
+                    # shared store never grows without limit.
+                    if len(rows) > 400:
+                        rows = rows[-400:]
+                    tmp = p.with_name(p.name + ".tmp")
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(rows, f, ensure_ascii=False, indent=2)
+                    os.replace(str(tmp), str(p))
+        except Exception as e:
+            logger.warning(f"FileMem: decided-ledger upsert failed: {e}")
 
     def _load_config(self, kwargs: Dict[str, Any]) -> None:
         """Load configuration."""
@@ -6274,6 +6469,16 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         if self._no_popup_gate(content, kind=kind, salience=None,
                                skip_id=item_id):
             return
+        # Decided-ledger (2026-11-17, root-fix): a topic the user already
+        # adjudicated (confirm/discard) must NOT be re-enqueued when a reworded
+        # variant re-lands — this is the "adjudicated topic re-asks" loop.
+        # fail-closed: any error -> enqueue as today (宁多问不可崩), never
+        # crash the turn and never silently drop a NOT-decided topic.
+        try:
+            if self._is_topic_decided(content):
+                return
+        except Exception:
+            pass
         pc = getattr(self, "_pending_confirm", None)
         if not isinstance(pc, dict):
             return
@@ -14036,6 +14241,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     # T3③: audit snapshot BEFORE the destructive write — the
                     # promoted rows are preserved in the append-only chain.
                     self._audit_drafts_review("confirm", owner, confirmed_items, tfile.name)
+                    for _d in confirmed_items:
+                        self._record_topic_decided(_d.content, "confirm")
                     # Drop confirmed rows from the file; keep un-confirmed ones.
                     self._write_draft_file(tfile, kept)
                     return json.dumps({
@@ -14051,6 +14258,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     discarded_items = [d for d in drafts if not (memory_id and d.id != memory_id)]
                     # T3③: snapshot dropped content into the audit chain.
                     self._audit_drafts_review("discard", owner, discarded_items, tfile.name)
+                    for _d in discarded_items:
+                        self._record_topic_decided(_d.content, "discard")
                     self._write_draft_file(tfile, kept)
                     discarded = len(drafts) - len(kept)
                     return json.dumps({
@@ -14122,6 +14331,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     self._audit_drafts_review(
                         "confirm", cur_sid, confirmed_items,
                         f"drafts_{cur_sid}.json")
+                    for _d in confirmed_items:
+                        self._record_topic_decided(_d.content, "confirm")
                     self._session_drafts[cur_sid] = kept
                     self._save_session_drafts()
                     # P2 (reviewer 10-09): a partial (memory_id) confirm
@@ -14134,6 +14345,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     self._audit_drafts_review(
                         "discard", cur_sid, cur_drafts,
                         f"drafts_{cur_sid}.json")
+                    for _d in cur_drafts:
+                        self._record_topic_decided(_d.content, "discard")
                     self._session_drafts[cur_sid] = []
                     self._save_session_drafts()
                     self._consume_pending_confirm(
@@ -14218,6 +14431,9 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                                 # target path (owner-scoped audit row).
                                 self._audit_drafts_review(
                                     action, owner, disposed_items, df.name)
+                                for _d in disposed_items:
+                                    self._record_topic_decided(
+                                        getattr(_d, "content", ""), action)
                             self._write_draft_file(df, kept)
                 if action == "confirm":
                     return json.dumps({

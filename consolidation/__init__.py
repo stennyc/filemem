@@ -230,7 +230,17 @@ DECAY_DEFAULTS = {
                      # disabled (fail-soft — the log keeps growing, data
                      # is never deleted by default).
                      "log_rotate_lines": 5000,
-                     "log_keep_tail_lines": 500},
+                     "log_keep_tail_lines": 500,
+                     # Decided-ledger (2026-11-17 root-fix): the cross-session
+                     # "already adjudicated, never re-ask" topic-suppression
+                     # ledger (ledgers/decided.json). enable=false = full
+                     # rollback to legacy re-asks. min_shared = the distinct-
+                     # topic-token floor (mirrors recurring_min_shared_tokens):
+                     # a reworded variant of a decided topic sharing >= this
+                     # many tokens is treated as the SAME topic, so it is NOT
+                     # re-enqueued (no re-ask) and a DISCARDED variant is NOT
+                     # re-landed as a duplicate pool row.
+                     "decided_ledger": {"enable": True, "min_shared": 3}},
     # EP-3: alias-mining knobs (deterministic local alias table — the LLM
     # face rides the host main-model path with zero model/provider config
     # keys; a separate budget parallel to
