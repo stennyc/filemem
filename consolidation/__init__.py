@@ -240,7 +240,7 @@ DECAY_DEFAULTS = {
                      # many tokens is treated as the SAME topic, so it is NOT
                      # re-enqueued (no re-ask) and a DISCARDED variant is NOT
                      # re-landed as a duplicate pool row.
-                     "decided_ledger": {"enable": True, "min_shared": 3}},
+                     "decided_ledger": {"enable": True, "min_shared": 9}},
     # EP-3: alias-mining knobs (deterministic local alias table — the LLM
     # face rides the host main-model path with zero model/provider config
     # keys; a separate budget parallel to

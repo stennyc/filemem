@@ -54,7 +54,7 @@
     "log_keep_tail_lines": 500,
     "decided_ledger": {
       "enable": true,
-      "min_shared": 3
+      "min_shared": 9
     }
   },
   "aliases": {

@@ -307,3 +307,28 @@ def test_decided_ledger_knob_parity():
     assert dd["decided_ledger"]["enable"] is True
     assert dd["decided_ledger"]["min_shared"] >= 2, \
         "min_shared must be a sane distinct-token floor (>=2)"
+
+
+# ── T7: the min_shared floor separates reworded-same-topic from CJK noise ──
+# F2 regression: the old floor of 3 over-suppressed UNRELATED generic-CJK
+# topics (e.g. a DB-timezone fact sharing only a handful of common single
+# chars with a decided row). The shipped floor (9) kills that false positive.
+
+
+def test_min_shared_floor_separates_generic_cjk_noise(tmp_path):
+    UNRELATED = ("数据库 时区 能不能 改成 东八区 并 重启 迁移 任务 "
+                 "加 索引 优化 查询")   # shares 6 distinct tokens with TOPIC_X
+    # shipped default floor (9): the unrelated generic topic is NOT suppressed;
+    # the reworded same-topic variant still is.
+    p = _make_provider(tmp_path, min_shared=9)
+    p._record_topic_decided(TOPIC_X, "discard")
+    assert p._is_topic_decided(UNRELATED, verdicts=("discard",)) is None, \
+        "unrelated generic-CJK topic must NOT be over-suppressed at the default floor"
+    assert p._is_topic_decided(TOPIC_X_VARIANT, verdicts=("discard",)) == "discard", \
+        "reworded same-topic variant must still be suppressed at the default floor"
+    # the old floor (3) is exactly where the bug lived: the same unrelated
+    # topic (shared=6 >= 3) WAS wrongly suppressed. Locks that 9 is the lever.
+    p3 = _make_provider(tmp_path / "p3", min_shared=3)
+    p3._record_topic_decided(TOPIC_X, "discard")
+    assert p3._is_topic_decided(UNRELATED, verdicts=("discard",)) == "discard", \
+        "at min_shared=3 the unrelated topic IS (wrongly) suppressed — the F2 bug"
