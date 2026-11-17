@@ -1047,6 +1047,25 @@ def _topic_signature(text: Any) -> "frozenset[str]":
     return frozenset(toks)
 
 
+def _decided_eff_floor(min_shared: int, sig_len: int, row_len: int) -> int:
+    """Effective distinct-token floor for ONE decided-ledger comparison.
+
+    Relative floor (owner ruling 2026-11-17): an absolute min_shared is
+    unreachable for short mixed-script sigs (the github-token case: a
+    reworded variant shares ~6 tokens, below the 9 the F2 ruling set to kill
+    CJK false-positives). For short sigs the floor drops to min_len//3
+    (never below the absolute 3, so a 1-2 token coincidence can never
+    suppress a DISTINCT topic); at the 27-token hand-off and above the
+    owner's floor stands untouched:
+
+        eff = min(min_shared, max(3, min(sig_len, row_len) // 3))
+
+    The legacy min_shared=3 knob (rollback) evaluates to the constant 3 —
+    byte-identical to the pre-change absolute behavior.
+    """
+    return min(min_shared, max(3, min(sig_len, row_len) // 3))
+
+
 def _topic_overlap_gate(prev_topic: Any, cur_topic: Any,
                         decay_cfg: Optional[Dict[str, Any]] = None,
                         threshold: Optional[float] = None) -> bool:
@@ -4210,8 +4229,12 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                           verdicts: Tuple[str, ...] = ("confirm", "discard")) \
             -> Optional[str]:
         """Fail-CLOSED same-topic check: return the verdict of the best-
-        overlapping decided row (>= min_shared distinct topic tokens AND
-        verdict in `verdicts`), else None. Any error -> None (ask, don't
+        overlapping decided row (>= the effective floor AND verdict in
+        `verdicts`), else None. The floor is RELATIVE per comparison
+        (_decided_eff_floor): the owner's min_shared stands for long sigs
+        (>= 27 tokens) and drops to min_len//3 (never below 3) for short
+        ones, so reworded short-topic variants are caught without loosening
+        the F2 ruling on long CJK topics. Any error -> None (ask, don't
         silently suppress — the 宁多问不可崩 posture). The ledger is small and
         bounded, so a re-read per call is cheap on the hot path."""
         dl = self._decided_ledger_cfg()
@@ -4234,7 +4257,9 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 if not rrow_sig:
                     continue
                 shared = len(sig & rrow_sig)
-                if shared >= min_shared and shared > best_shared:
+                if shared >= _decided_eff_floor(min_shared, len(sig),
+                                                 len(rrow_sig)) \
+                        and shared > best_shared:
                     best_shared = shared
                     best_verdict = row.get("verdict")
         except Exception:
@@ -4244,7 +4269,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
     def _record_topic_decided(self, content: Any, verdict: str) -> None:
         """Upsert a decided-topic row (dedup by overlapping topic signature —
         a reworded variant of an already-decided topic UPDATES the same row,
-        it does not duplicate). Writers serialize on the shard lock and write
+        it does not duplicate). The fold floor is RELATIVE
+        (_decided_eff_floor), symmetric with _is_topic_decided: short rewords
+        fold into the decided row, long-distinct topics still need the
+        owner's min_shared. Writers serialize on the shard lock and write
         atomically (temp + os.replace) so concurrent readers never see a torn
         file. Fail-soft: a write hiccup never raises into the verdict path
         (the verdict itself is already decided)."""
@@ -4277,7 +4305,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                             continue
                         rrow_sig = set(str(t) for t in row.get("sig") or [])
                         if rrow_sig and row.get("verdict") == verdict and \
-                                len(sig & rrow_sig) >= min_shared:
+                                len(sig & rrow_sig) >= _decided_eff_floor(
+                                    min_shared, len(sig), len(rrow_sig)):
                             row["sig"] = sorted(rrow_sig | set(sig))
                             row["content"] = snippet
                             row["ts"] = ts
