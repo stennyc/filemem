@@ -47,7 +47,7 @@ config_schema:
     description: "机器级 agent 标识（跨机 50 台 = 50 个 agent_id）。"
   sm_token:
     type: str
-    default: "local-67a09bdf6d0c68e8-s4"
+    default: "${SM_TOKEN}"
     label: "Auth token"
     description: "中央 PG 认证 token。"
   sm_pg_host:
@@ -68,7 +68,7 @@ config_schema:
     label: "PG user"
   sm_pg_password:
     type: str
-    default: "c44dafef06869c6f96ad3f9432cf3eb0"
+    default: "${SM_PG_PASSWORD}"
     label: "PG password"
   sm_pg_sslmode:
     type: str

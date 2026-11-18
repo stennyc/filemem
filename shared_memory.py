@@ -144,6 +144,9 @@ def _load_shared_memory_config() -> Optional[Dict[str, Any]]:
                 "password": str(pg_raw.get("password") or ""),
                 "sslmode": str(pg_raw.get("sslmode") or "prefer"),
             }
+        token = _resolve_env_placeholder(token)
+        for _k in ("host", "db", "user", "password", "sslmode"):
+            pg[_k] = _resolve_env_placeholder(pg[_k])
         if not agent_id or not pg["host"] or not pg["db"]:
             return None
         _maybe_trigger_pg_face_autoinstall()  # 门禁在此: 只有 enabled 且配置完整才触发
@@ -155,6 +158,21 @@ def _load_shared_memory_config() -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.warning(f"shared_memory: config parse failed, no-op: {e}")
         return None
+
+
+def _resolve_env_placeholder(v: Any) -> Any:
+    """模板占位符 ${VAR} -> os.environ[VAR] (owner 定案 2026-11-18, 公开仓
+    模板不带活凭据, 改环境变量注入): 公开仓库模板默认值是
+    ${SM_TOKEN} / ${SM_PG_PASSWORD}; 活配置持真实值 (无 ${} 模式, 原样
+    通过)。占位符未设 env -> 空串, 失败方向安全: 中央门关, 本地面
+    零影响。"""
+    if isinstance(v, str):
+        import os
+        import re
+        m = re.fullmatch(r"\s*\$\{([A-Z][A-Z0-9_]*)\}\s*", v)
+        if m:
+            return os.environ.get(m.group(1), "")
+    return v
 
 
 def _read_config_yaml_text() -> Optional[str]:

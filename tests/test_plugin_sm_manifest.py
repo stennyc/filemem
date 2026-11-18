@@ -24,12 +24,12 @@ sys.path.insert(0, str(PLUGIN_DIR))
 SM_FIELDS = [
     ("sm_enabled", "bool", True),
     ("sm_agent_id", "str", "local"),
-    ("sm_token", "str", "local-67a09bdf6d0c68e8-s4"),
+    ("sm_token", "str", "${SM_TOKEN}"),
     ("sm_pg_host", "str", "127.0.0.1"),
     ("sm_pg_port", "int", 5432),
     ("sm_pg_db", "str", "sharedmem"),
     ("sm_pg_user", "str", "sharedmem"),
-    ("sm_pg_password", "str", "c44dafef06869c6f96ad3f9432cf3eb0"),
+    ("sm_pg_password", "str", "${SM_PG_PASSWORD}"),
     ("sm_pg_sslmode", "str", "prefer"),
 ]
 
@@ -380,3 +380,60 @@ def test_pg_conn_passes_sslmode_kwarg():
                     "user": "u", "password": "p"})
     assert calls[0]["sslmode"] == "require"
     assert calls[1]["sslmode"] == "prefer"
+
+
+# ---------------------------------------------------------------------------
+# Template placeholders (owner ruling 2026-11-18, item 4): the public-repo
+# manifest ships ${SM_TOKEN} / ${SM_PG_PASSWORD}; a live config keeps real
+# values (no ${} -> passthrough, byte-identical). Unset env -> "" (safe
+# direction: central door closed, local face untouched).
+# ---------------------------------------------------------------------------
+
+_PANEL_CFG_PLACEHOLDERS = _PANEL_CFG_TEXT.replace(
+    "sm_token: tok-x\n", "sm_token: ${SM_TOKEN}\n", 1,
+).replace(
+    "sm_pg_password: pw-x\n", "sm_pg_password: ${SM_PG_PASSWORD}\n", 1,
+)
+
+
+def test_env_placeholder_token_password_resolved(monkeypatch):
+    sm = _import_shared_memory()
+    monkeypatch.setenv("SM_TOKEN", "tok-live")
+    monkeypatch.setenv("SM_PG_PASSWORD", "pw-live")
+    with _with_fake_config_yaml(sm, _PANEL_CFG_PLACEHOLDERS):
+        cfg = sm._load_shared_memory_config()
+    assert cfg is not None
+    assert cfg["token"] == "tok-live"
+    assert cfg["pg"]["password"] == "pw-live"
+
+
+def test_env_placeholder_unset_yields_empty(monkeypatch):
+    sm = _import_shared_memory()
+    monkeypatch.delenv("SM_TOKEN", raising=False)
+    monkeypatch.delenv("SM_PG_PASSWORD", raising=False)
+    with _with_fake_config_yaml(sm, _PANEL_CFG_PLACEHOLDERS):
+        cfg = sm._load_shared_memory_config()
+    assert cfg is not None  # gate only requires agent_id/host/db
+    assert cfg["token"] == ""
+    assert cfg["pg"]["password"] == ""
+
+
+def test_env_placeholder_partial_pattern_passthrough():
+    """A live value that merely CONTAINS ${...} is not a placeholder —
+    only a full-match ${VAR} resolves (prevents accidental env lookups)."""
+    sm = _import_shared_memory()
+    text = _PANEL_CFG_TEXT.replace("sm_token: tok-x\n", "sm_token: abc${SM_TOKEN}def\n", 1)
+    with _with_fake_config_yaml(sm, text):
+        cfg = sm._load_shared_memory_config()
+    assert cfg is not None
+    assert cfg["token"] == "abc${SM_TOKEN}def"
+
+
+def test_live_value_passthrough_unchanged():
+    """Real (non-placeholder) values flow through byte-identical — the
+    existing live configs are untouched by the placeholder feature."""
+    sm = _import_shared_memory()
+    with _with_fake_config_yaml(sm, _PANEL_CFG_TEXT):
+        cfg = sm._load_shared_memory_config()
+    assert cfg["token"] == "tok-x"
+    assert cfg["pg"]["password"] == "pw-x"
