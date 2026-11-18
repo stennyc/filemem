@@ -393,7 +393,8 @@ def test_import_audit_build_graph():
                      .read_text(encoding="utf-8"))
     allowed = {"argparse", "hashlib", "json", "os", "sys", "re", "time",
                "datetime", "pathlib", "collections", "typing", "__future__",
-               "math", "threading", "unittest", "search_index", "consolidation"}
+               "math", "threading", "unittest", "search_index", "consolidation",
+               "dep_bootstrap"}
     bad = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -405,7 +406,7 @@ def test_import_audit_build_graph():
     # search_index.py must REMAIN stdlib-only after the graph axis landed
     tree2 = ast.parse(Path(search_index.__file__).read_text(encoding="utf-8"))
     stdlib_only = {"math", "re", "json", "pathlib", "collections", "typing",
-                   "datetime", "__future__"}
+                   "datetime", "__future__", "os", "threading"}
     bad2 = []
     for node in ast.walk(tree2):
         if isinstance(node, ast.Import):

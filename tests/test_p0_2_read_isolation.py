@@ -230,7 +230,7 @@ def test_auto_recall_max_caps_results():
     # Isolate the cap logic: stub the read face to return the 6, enable cap=3.
     p._decay["search"]["auto_recall_max"] = 3
     p.search_memories = lambda *a, **k: list(full)
-    p._set_bringback_choice("s-p02-test", "clean_start")
+    p._set_bringback_choice("s-cap", "clean_start")
     ctx = p.prefetch("deploynote", session_id="s-cap", confidence=0.5)
     assert p._last_recall.count == 3, \
         f"auto_recall_max=3 should inject 3 rows, got {p._last_recall.count}"
@@ -250,7 +250,7 @@ def test_auto_recall_max_zero_disables_cap():
 
     p._decay["search"]["auto_recall_max"] = 0
     p.search_memories = lambda *a, **k: list(full)
-    p._set_bringback_choice("s-p02-test", "clean_start")
+    p._set_bringback_choice("s-cap0", "clean_start")
     ctx = p.prefetch("caprow", session_id="s-cap0", confidence=0.5)
     assert p._last_recall.count == 4, \
         f"auto_recall_max=0 should disable the cap, got {p._last_recall.count}"
@@ -417,7 +417,7 @@ def test_prefetch_passes_profile_scope_to_search():
 
     # The auto face actually cut the cross row from the injected content:
     p2 = _make_provider(tmp, source_profile="default")
-    p2._set_bringback_choice("s-p02-test", "clean_start")
+    p2._set_bringback_choice("s-int2", "clean_start")
     ctx = p2.prefetch("wired", session_id="s-int2", confidence=0.5)
     assert "wired self profile deploy note" in ctx, \
         f"same-profile row must inject on the auto face, got {ctx!r}"

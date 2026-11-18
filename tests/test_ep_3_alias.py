@@ -486,7 +486,11 @@ def test_cli_zero_llm_zero_hardcoded_paths():
     for banned in ("openai", "anthropic", "httpx", "requests"):
         assert banned not in src
     assert not re.search(r'["\'](/root|/usr/local|C:\\\\)', src)
-    assert 'os.environ.get("HERMES_HOME"' in src
+    # HERMES_HOME resolution: either direct env-var read or via dep_bootstrap
+    # (upstream refactored to dep_bootstrap._resolve_hermes_home in 6041faf)
+    assert ('os.environ.get("HERMES_HOME"' in src
+            or '_resolve_hermes_home' in src), \
+        "must resolve HERMES_HOME via env var or dep_bootstrap"
 
 
 # ── CLI：--list 只读 / --add / --remove / --prune 确定性 + 审计 ────────────

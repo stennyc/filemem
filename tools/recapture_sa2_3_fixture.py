@@ -41,9 +41,11 @@ import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+PLUGIN_DIR = Path(__file__).resolve().parents[1]
+if str(PLUGIN_DIR) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_DIR))
 from dep_bootstrap import _resolve_hermes_home  # noqa: E402
 
-PLUGIN_DIR = Path(__file__).resolve().parents[1]
 FIXTURE = PLUGIN_DIR / "tests" / "fixtures" / "sa2_3_golden_queries.json"
 LIVE_STORE = Path(_resolve_hermes_home()) / "filemem"
 

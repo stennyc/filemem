@@ -32,6 +32,9 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+_PLUGIN_DIR = Path(__file__).resolve().parents[1]
+if str(_PLUGIN_DIR) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_DIR))
 from dep_bootstrap import _resolve_hermes_home  # noqa: E402
 
 # --- topology (N=1, resolved physical path — Reviewer path-resolution rule) ---

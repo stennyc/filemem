@@ -35,14 +35,13 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
-from dep_bootstrap import _resolve_hermes_home  # noqa: E402
-
 # Plugin root on sys.path so `import __init__` / `import consolidation` resolve
 # no matter how the tool is invoked (python tools/ep2_observe_smoke.py puts
 # tools/ — not the plugin root — on sys.path[0]). stdlib-only.
 _PLUGIN_DIR = Path(__file__).resolve().parents[1]
 if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
+from dep_bootstrap import _resolve_hermes_home  # noqa: E402
 
 # Built-in clean-facts example: one topic, three resolvable memory ids. This is
 # the "clean observation source" the live raw_pending currently lacks (its 64

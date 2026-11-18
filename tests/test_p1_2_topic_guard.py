@@ -94,7 +94,7 @@ def _make_provider(tmp: pathlib.Path, sid: str = CUR_SID,
     p._llm_ctx = None
     p._last_recall = None
     import contextlib
-    p._shard_lock = lambda pth: contextlib.suppress()
+    p._shard_lock = lambda pth, *a, **kw: contextlib.suppress()
     return p
 
 

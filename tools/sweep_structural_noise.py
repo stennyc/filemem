@@ -58,6 +58,9 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+PLUGIN_DIR_DEFAULT = Path(__file__).resolve().parents[1]
+if str(PLUGIN_DIR_DEFAULT) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_DIR_DEFAULT))
 from dep_bootstrap import _resolve_hermes_home  # noqa: E402
 from typing import Any, Dict, List, Optional
 
@@ -70,7 +73,6 @@ try:
 except ImportError:  # pragma: no cover - Linux
     msvcrt = None
 
-PLUGIN_DIR_DEFAULT = Path(__file__).resolve().parents[1]
 ARCHIVE_SWEEP_PREFIX = "structural_sweep_"
 
 # the P4 structural primitive — SAME frozenset the plugin root

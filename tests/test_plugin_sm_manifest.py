@@ -15,9 +15,12 @@ from contextlib import contextmanager
 import pytest
 import yaml
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _os_detect import resolve_kbs_dir  # noqa: E402
+
 HERE = pathlib.Path(__file__).resolve().parent
 PLUGIN_DIR = HERE.parent
-KBS_DIR = PLUGIN_DIR.parent / "kbs"
+KBS_DIR = resolve_kbs_dir()  # OS-portable: finds kbs or knowledge-base-search
 sys.path.insert(0, str(PLUGIN_DIR))
 
 # (field, type, default) — must match kbs's config_schema exactly.
@@ -49,6 +52,8 @@ def test_sm_manifest_parity_with_kbs():
     """filemem + kbs share one central store, so the manifest field set,
     types, and template defaults are identical (a real value set in the
     panel overrides these fallbacks)."""
+    if KBS_DIR is None:
+        pytest.skip("kbs / knowledge-base-search plugin not installed on this host")
     fm = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8"))["config_schema"]
     kbs = yaml.safe_load((KBS_DIR / "plugin.yaml").read_text(encoding="utf-8"))["config_schema"]
     assert set(fm) == set(kbs), f"field-set drift vs kbs: {set(fm) ^ set(kbs)}"

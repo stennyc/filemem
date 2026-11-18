@@ -472,6 +472,7 @@ def test_init_top_level_import_audit():
         "time",  # S1b F4/F5 throttle timers (_audit_tick_skip/_audit_recall)
         "uuid",  # P1-3/P2 audit trace_id + dedup ledger (_audit_explicit_search/_dedup_ledger)
         "subprocess",  # production default reconcile verifiers (git cat-file / rev-parse / pytest runner)
+        "dep_bootstrap",  # cross-platform HERMES_HOME resolver (6041faf)
     }
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.Import):

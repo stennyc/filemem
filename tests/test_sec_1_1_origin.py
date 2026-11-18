@@ -399,10 +399,10 @@ def test_tool_stdlib_only_import_audit():
         pytest.skip("requires Python 3.10+ (sys.stdlib_module_names)")
     tool = _PLUGIN_ROOT / "tools" / "backfill_origin.py"
     all_imports = _all_imports(tool)
-    external = all_imports - set(sys.stdlib_module_names) - {"__init__"}
+    external = all_imports - set(sys.stdlib_module_names) - {"__init__", "dep_bootstrap"}
     assert not external, f"non-stdlib, non-plugin imports in backfill tool: {external}"
     top = _top_level_imports(tool)
-    assert top <= set(sys.stdlib_module_names) | {"__init__"}, \
+    assert top <= set(sys.stdlib_module_names) | {"__init__", "dep_bootstrap"}, \
         f"top-level non-stdlib imports: {top - set(sys.stdlib_module_names)}"
 
 

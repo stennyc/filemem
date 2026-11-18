@@ -431,12 +431,13 @@ def test_tool_stdlib_only_import_audit():
         pytest.skip("requires Python 3.10+ (sys.stdlib_module_names)")
     tool = _PLUGIN_ROOT / "tools" / "backfill_occurred_at.py"
     all_imports = _all_imports(tool)
-    external = all_imports - set(sys.stdlib_module_names) - {"__init__"}
+    # dep_bootstrap is a local plugin module (same category as __init__).
+    external = all_imports - set(sys.stdlib_module_names) - {"__init__", "dep_bootstrap"}
     assert not external, f"non-stdlib, non-plugin imports in backfill tool: {external}"
     # The tool's module-scope block must be pure stdlib — importing the tool
     # must not drag the host agent face in by itself.
     top = _top_level_imports(tool)
-    assert top <= set(sys.stdlib_module_names) | {"__init__"}, \
+    assert top <= set(sys.stdlib_module_names) | {"__init__", "dep_bootstrap"}, \
         f"top-level non-stdlib imports: {top - set(sys.stdlib_module_names)}"
 
 
@@ -450,7 +451,8 @@ def test_plugin_top_level_import_audit():
     plugin = _PLUGIN_ROOT / "__init__.py"
     top = _top_level_imports(plugin)
     allowed = (set(sys.stdlib_module_names)
-               | {"agent", "hermes_cli", "consolidation", "msvcrt", "fcntl"})
+               | {"agent", "hermes_cli", "consolidation", "msvcrt", "fcntl",
+                  "dep_bootstrap"})
     bad = top - allowed
     assert not bad, f"plugin top-level imports outside the allowlist: {bad}"
 

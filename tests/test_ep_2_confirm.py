@@ -472,7 +472,11 @@ def test_cli_zero_llm_imports():
         assert banned not in src
     # 零硬编码路径（同 sibling 工具风格）
     assert not re.search(r'[\'"](/root|/usr/local|C:\\\\)', src)
-    assert 'os.environ.get("HERMES_HOME"' in src
+    # HERMES_HOME resolution: either direct env-var read or via dep_bootstrap
+    # (upstream refactored to dep_bootstrap._resolve_hermes_home in 6041faf)
+    assert ('os.environ.get("HERMES_HOME"' in src
+            or '_resolve_hermes_home' in src), \
+        "must resolve HERMES_HOME via env var or dep_bootstrap"
 
 
 # ── 11. 三态 schema round-trip（无损）───────────────────────────────────────

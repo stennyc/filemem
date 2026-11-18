@@ -40,14 +40,13 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
+_PLUGIN_DIR = Path(__file__).resolve().parents[1]
+if str(_PLUGIN_DIR) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_DIR))
 from dep_bootstrap import _resolve_hermes_home  # noqa: E402
 
 # Import the extractor from the plugin itself (single source of truth, same
 # shape as the test suite: plugin dir on sys.path, `__init__` top-level).
-_PLUGIN_DIR = Path(__file__).resolve().parents[1]
-if str(_PLUGIN_DIR) not in sys.path:
-    sys.path.insert(0, str(_PLUGIN_DIR))
-
 # Deliberate local import: after the sys.path insert above this resolves to
 # the plugin module; the audit gate (tests) sees stdlib-only module-level
 # imports here (json/hashlib/argparse/...), the rest is function-level.

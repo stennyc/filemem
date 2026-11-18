@@ -57,11 +57,10 @@ import time
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from dep_bootstrap import _resolve_hermes_home  # noqa: E402
-
 _PLUGIN_DIR = Path(__file__).resolve().parents[1]
 if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
+from dep_bootstrap import _resolve_hermes_home  # noqa: E402
 
 # Deliberate local imports: after the sys.path insert above these resolve
 # to plugin modules; module-level AUDITABLE imports stay stdlib-only

@@ -16,47 +16,23 @@ Cross-host discovery order (first existing wins, all are appended):
      next to `plugins/` (true on this Windows layout; also the macOS/Linux
      `~/.hermes` layout when hermes-agent is vendored alongside the plugins).
   2. the Linux system path the test files already assume.
+
+OS-awareness: delegates the discovery to `_os_detect.inject_agent_path()`,
+which probes all known roots without assuming a single OS layout.
 """
 import sys
 from pathlib import Path
 
-_here = Path(__file__).resolve()
-_candidates = []
-# 1. hermes-home relative (this file is <hermes-home>/plugins/filemem/tests/…)
-try:
-    _hermes_home = _here.parents[3]
-    _candidates.append(_hermes_home / "hermes-agent")
-except IndexError:
-    pass
-# 2. the Linux system install path the individual test files already insert.
-_candidates.append(Path("/usr/local/lib/hermes-agent"))
+# Make the shared OS-detect helpers importable (tests/ is already on sys.path
+# at conftest time because pytest adds the rootdir).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-_added = False
-for _c in _candidates:
-    try:
-        if (_c / "agent" / "memory_provider.py").is_file():
-            _p = str(_c)
-            if _p not in sys.path:
-                sys.path.insert(0, _p)
-                _added = True
-    except Exception:
-        # path probing must never break collection of the other tests.
-        continue
+from _os_detect import inject_agent_path  # noqa: E402
 
-# ALSO export it into the environment: subprocess-based tests
-# (test_s4_lifespan dual-process, test_sec_1_3_audit concurrent-prefetch,
-# test_handoff_extract trace-replay, …) spawn a fresh interpreter that does
-# NOT inherit a parent-process `sys.path.insert`. Setting PYTHONPATH makes the
-# child interpreters resolve `agent` too. Idempotent + fail-soft.
-import os as _os
-if _added:
-    for _p in list(sys.path):
-        if (_os.path.isdir(_os.path.join(_p, "agent"))
-                and _os.path.isfile(_os.path.join(_p, "agent", "memory_provider.py"))):
-            _existing = _os.environ.get("PYTHONPATH", "")
-            if _p not in _existing.split(_os.pathsep):
-                _os.environ["PYTHONPATH"] = (_p + _os.pathsep + _existing).rstrip(_os.pathsep)
-            break
+# Run the discovery; fail-soft — if no location is found, sys.path is unchanged
+# and the legacy per-module errors stand (documented above).
+inject_agent_path()
+
 # NOTE: intentionally do NOT import `agent` here — the test modules import it
 # after this runs; forcing the import at conftest time would surface a
 # missing-dep error for `agent`'s own transitive imports as a conftest failure

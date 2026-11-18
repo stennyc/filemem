@@ -41,10 +41,9 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from dep_bootstrap import _resolve_hermes_home  # noqa: E402
-
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_DIR))
+from dep_bootstrap import _resolve_hermes_home  # noqa: E402
 
 import __init__ as fm  # noqa: E402  (plugin module; import-time is I/O-free)
 

@@ -105,7 +105,7 @@ def _make_provider(tmp: Path, sid: str = "s_cur",
     p._turn_foreign = False
     p._turn_active_sid = ""
     import contextlib
-    p._shard_lock = lambda pth: contextlib.suppress()
+    p._shard_lock = lambda pth, *a, **kw: contextlib.suppress()
     return p
 
 
