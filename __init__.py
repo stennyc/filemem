@@ -4279,8 +4279,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
     def _is_topic_decided(self, content: Any,
                           verdicts: Tuple[str, ...] = ("confirm", "discard")) \
             -> Optional[str]:
-        """Fail-CLOSED same-topic check: return the verdict of the best-
-        overlapping decided row (>= the effective floor AND verdict in
+        """Fail-CLOSED same-topic check: return the verdict of the NEWEST (ts)
+        floor-matching decided row (>= the effective floor AND verdict in
         `verdicts`), else None. The floor is RELATIVE per comparison
         (_decided_eff_floor): the owner's min_shared stands for long sigs
         (>= 27 tokens) and drops to min_len//3 (never below 3) for short
@@ -4301,7 +4301,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         if not rows:
             return None
         min_shared = dl["min_shared"]
-        best_shared = 0
+        best_ts = ""
         best_verdict: Optional[str] = None
         try:
             for row in rows:
@@ -4317,10 +4317,19 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     continue
                 shared = len(sig & rrow_sig)
                 if shared >= _decided_eff_floor(min_shared, len(sig),
-                                                 len(rrow_sig)) \
-                        and shared > best_shared:
-                    best_shared = shared
-                    best_verdict = row.get("verdict")
+                                                 len(rrow_sig)):
+                    ts = row.get("ts") or ""
+                    # NEWEST-TS GOVERNS (B, 2026-11-17): among floor-matching
+                    # active rows, the most recent adjudication is effective.
+                    # Enforced DIRECTLY (not only via superseded_by stamps),
+                    # so a stale active confirm that a newer discard should
+                    # have superseded — but the stamp is missing or predates
+                    # the fix — cannot re-open the "adjudicated topic re-asks"
+                    # loop. A floor-matching row is, by construction, the same
+                    # topic (reworded); its latest ts is the user's last word.
+                    if ts >= best_ts:
+                        best_ts = ts
+                        best_verdict = row.get("verdict")
         except Exception:
             return None
         return best_verdict
