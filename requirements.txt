@@ -6,12 +6,14 @@
 #     关闭（本地数据面不受影响），但每次 initialize 会打一条 WARNING。
 #   - PyYAML: 解析 config.yaml 的 shared_memory 段（宿主已有则 no-op）。
 #
-# 宿主加载 plugin 时【不会】自动装依赖（Hermes 设计立场：缺 driver 时优雅
-# 降级，不强装）。所以新环境首次启用中央池门时，请显式跑一次：
+# 宿主加载 plugin 时【gated 自动装】(2026-11-17 起, dep_bootstrap):
+# 只有 shared_memory 配置段读到且 enabled 门禁通过后, 才对缺的包各发一次
+# pip install (split calls, 6h cooldown marker, fail-soft 不阻塞本地面)。
+# 无 yaml 解释器 (host tools-python) 读 sm_* 面板形态靠 _parse_shared_memory_minimal
+# 兜底 (2026-11-18 补齐), 门禁通过即触发自动安装; 若该解释器连 pip 模块都
+# 没有 (tools-python 现状), 自动安装会 pip_failed, 仍需手动跑一次:
 #   <当前解释器> -m pip install -r requirements.txt
-# 例如本机 host tools-python:
-#   /root/.hermes/tools/python-3.14.9+20261021-linux-x64/bin/python3 \
-#     -m pip install -r requirements.txt
+#   (或 uv pip install --python <解释器> -r requirements.txt)
 
 psycopg2-binary
 PyYAML

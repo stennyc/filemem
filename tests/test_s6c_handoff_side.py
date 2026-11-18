@@ -279,8 +279,9 @@ class TestReconcileLocalToCentral:
         class _FakeCur:
             def __init__(self): self.rows = []
             def execute(self, sql, params=None):
-                if "SELECT id FROM memories" in sql:
-                    self.rows = [("task_1",)]
+                if "FROM memories" in sql:
+                    from datetime import datetime
+                    self.rows = [("task_1", datetime(2026, 10, 23, 10, 0, 0))]
                 else:
                     pushed_ids.append(params[0])  # upsert_memory_row 第一参 = id
             def fetchall(self): return self.rows
@@ -317,8 +318,9 @@ class TestReconcileLocalToCentral:
         class _FakeCur:
             def __init__(self): self.rows = []
             def execute(self, sql, params=None):
-                if "SELECT id FROM memories" in sql:
-                    self.rows = [("fact_1",)]  # 中央已有 fact_1
+                if "FROM memories" in sql:
+                    from datetime import datetime
+                    self.rows = [("fact_1", datetime(2026, 10, 23, 10, 0, 0))]  # 中央与本地同刻
                 else:
                     pushed.append(1)
             def fetchall(self): return self.rows
@@ -346,6 +348,76 @@ class TestReconcileLocalToCentral:
         with mock.patch.object(sm, "_load_shared_memory_config", lambda: None):
             r = sm.reconcile_local_to_central(p)
         assert r["status"] == "skipped" and r["pushed"] == 0
+
+    # -- 2026-11-18 timestamp-drift extension -------------------------------
+    # Local re-stamp paths (bg reclassify / decay / plan-advance) refresh a
+    # row's updated_at WITHOUT firing the write-push hook, so the central
+    # copy silently lags. The boot reconcile now heals that too: the
+    # re-push diff is (id missing from central) OR (local updated_at newer
+    # than central's) — still idempotent (same content/version re-upsert).
+
+    def _reconcile_with_central(self, sm, p, rows, cfg):
+        """Run reconcile against a fake central holding `rows`
+        (id -> updated_at datetime). Returns (result, pushed_ids)."""
+        pushed = []
+
+        class _FakeCur:
+            def __init__(self): self.rows = []
+            def execute(self, sql, params=None):
+                if "FROM memories" in sql:
+                    self.rows = list(rows.items())
+                else:
+                    pushed.append(params[0])
+            def fetchall(self): return self.rows
+            def fetchone(self): return None
+            def close(self): pass
+        class _FakeConn:
+            def __init__(self): self._cur = _FakeCur()
+            def cur(self): return self._cur
+            def commit(self): pass
+            def close(self): pass
+
+        with mock.patch.object(sm, "_PgConn", lambda c: _FakeConn()):
+            with mock.patch.object(sm, "_central_auth"):
+                with mock.patch.object(sm, "_load_shared_memory_config",
+                                       lambda: cfg):
+                    r = sm.reconcile_local_to_central(p)
+        return r, pushed
+
+    def test_reconcile_repushes_timestamp_drift(self, tmp_path):
+        """Central holds the row but with an OLDER updated_at than local
+        (a re-stamp happened after the last push) -> re-pushed."""
+        import shared_memory as sm
+        from datetime import datetime
+        p = self._provider_with_rows(tmp_path, [
+            {"id": "fact_1", "type": "fact", "content": "a", "level": "L0",
+             "updated_at": "2026-10-23T11:00:00", "created_at": "2026-10-23T10:00:00",
+             "metadata": {"shared_version": 1}},
+        ])
+        cfg = _cfg()
+        p._shared_mem_cfg = cfg
+        r, pushed = self._reconcile_with_central(
+            sm, p, {"fact_1": datetime(2026, 10, 23, 10, 0, 0)}, cfg)
+        assert r["status"] == "ok"
+        assert pushed == ["fact_1"], "local-ahead row must be re-pushed"
+        assert r["missing"] == 1 and r["pushed"] == 1
+
+    def test_reconcile_central_newer_no_repush(self, tmp_path):
+        """Central updated_at >= local (in-sync or central ahead — the
+        last-push-wins no-pull design) -> zero re-push, idempotent."""
+        import shared_memory as sm
+        from datetime import datetime
+        p = self._provider_with_rows(tmp_path, [
+            {"id": "fact_1", "type": "fact", "content": "a", "level": "L0",
+             "updated_at": "2026-10-23T09:00:00", "created_at": "2026-10-23T08:00:00",
+             "metadata": {"shared_version": 1}},
+        ])
+        cfg = _cfg()
+        p._shared_mem_cfg = cfg
+        r, pushed = self._reconcile_with_central(
+            sm, p, {"fact_1": datetime(2026, 10, 23, 10, 0, 0)}, cfg)
+        assert r["status"] == "ok" and r.get("reason") == "in-sync"
+        assert pushed == [] and r["pushed"] == 0
 
     def test_plan_rows_also_pushed_via_five_shard_scan(self, tmp_path):
         """Q2: plan 行走 5 shard 全量推中央 (中央 memories 表存 plan, 不建独立 plans 表)."""

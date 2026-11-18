@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 import threading
 from pathlib import Path
@@ -44,7 +45,7 @@ from pathlib import Path
 import dep_bootstrap
 
 dep_bootstrap.ensure_pg_dep_paths()
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -195,21 +196,36 @@ def _read_config_yaml_text() -> Optional[str]:
 
 
 def _parse_shared_memory_minimal(raw: str) -> Dict[str, Any]:
-    """纯文本最小解析: 只提取 plugins.entries.filemem.shared_memory 段。
+    """纯文本最小解析: 只提取 plugins.entries.filemem 的共享内存配置。
 
-    逐行扫, 跟踪缩进 (plugins: -> entries: -> filemem: -> shared_memory:),
-    共享段内取标量键 (enabled/agent_id/token) 和 pg: 子块的五键。
-    pg 块可能是 anchor 定义 (pg: &id001) — 取值键正常取; alias (pg: *id001)
-    在 filemem 段不会出现 (filemem 是 &id001 的定义处)。"""
+    两种配置形态 (panel / legacy 写路径都产):
+      1. panel 标量形态: filemem.settings.sm_* — 8 字段 manifest (kbs 同构),
+         dashboard 插件设置面板写入处 (2026-11-17 sm_* manifest 定稿)。
+      2. legacy 嵌套形态: filemem.shared_memory {enabled, agent_id, token, pg{...}}。
+    逐行扫, 跟踪缩进 (plugins: -> entries: -> filemem: -> settings:/shared_memory:),
+    配置块内取标量键 (sm_enabled 归一为 bool — 字符串 'false' 在 loader 的
+    bool() 下会被误读为 enabled), pg 子块的五键原样取。pg 块可能是 anchor 定义
+    (pg: &id001) — 取值键正常取; alias (pg: *id001) 在 filemem 段不会出现
+    (filemem 是 &id001 的定义处)。
+
+    2026-11-18 补形态 1: 旧解析只认形态 2 — 宿主解释器缺 yaml 库时, 面板落盘的
+    sm_* 形态被读成"配置缺", enabled 门禁静默关闭, 而 PG face 自动安装
+    (dep_bootstrap, 门禁=配置读成功后才触发) 死锁: 无 yaml -> 解析器读不到 sm_*
+    -> 门禁 no-op -> 永不装 pyyaml -> 永久盲。"""
     import re
     sm_block: Dict[str, Any] = {}
+    settings_block: Dict[str, Any] = {}
     pg_block: Dict[str, Any] = {}
     in_plugins = in_entries = in_filemem = False
-    in_sm = in_pg = False
+    in_sm = in_pg = in_settings = False
     _sm_indent = 0
+    _settings_indent = 0
     _entries_indent = 0
     _SM_KEYS = {"enabled", "agent_id", "token"}
     _PG_KEYS = {"host", "port", "db", "user", "password"}
+    _SM_PANEL_KEYS = {"sm_enabled", "sm_agent_id", "sm_token",
+                      "sm_pg_host", "sm_pg_port", "sm_pg_db",
+                      "sm_pg_user", "sm_pg_password"}
 
     def _scalar(v: str):
         s = v.strip()
@@ -240,7 +256,22 @@ def _parse_shared_memory_minimal(raw: str) -> Dict[str, Any]:
         if not m:
             continue
         indent, key, rest = len(m.group(1)), m.group(2), m.group(3)
+        # 2026-11-18: panel 标量块 (settings.sm_*)。浅于 settings 块的行
+        # 关块后【落回下方 in_sm 检查】(同一行可能是 legacy shared_memory:
+        # 的块头); 同缩进的非 sm_* 键 (embedding_model 等) 跳过不关块。
+        if in_settings:
+            if indent < _settings_indent:
+                in_settings = False
+            elif key in _SM_PANEL_KEYS and rest.strip():
+                settings_block[key] = _scalar(rest)
+                continue
+            else:
+                continue
         if not in_sm:
+            if key == "settings" and not rest.strip():
+                in_settings = True
+                _settings_indent = indent
+                continue
             if key == "shared_memory" and not rest.strip():
                 in_sm = True
                 _sm_indent = indent
@@ -264,10 +295,16 @@ def _parse_shared_memory_minimal(raw: str) -> Dict[str, Any]:
         # leaving shared_memory
         if indent <= _sm_indent and key not in _SM_KEYS and key != "pg":
             break
-    if not in_sm:
+    # 两种形态可同时存在 (panel 层优先 — loader 先查 sm_enabled):
+    fm_block: Dict[str, Any] = {}
+    if settings_block:
+        fm_block["settings"] = settings_block
+    if in_sm:
+        sm_block.setdefault("pg", pg_block)
+        fm_block["shared_memory"] = sm_block
+    if not fm_block:
         return {}
-    sm_block.setdefault("pg", pg_block)
-    return {"plugins": {"entries": {"filemem": {"shared_memory": sm_block}}}}
+    return {"plugins": {"entries": {"filemem": fm_block}}}
 
 
 def _ensure_pg_dep_paths() -> None:
@@ -533,11 +570,45 @@ def _all_local_row_ids(memories_dir) -> List[str]:
     return ids
 
 
+def _all_local_rows_ts(memories_dir) -> List[Tuple[str, str]]:
+    """本地全 shard (id, updated_at) 对 (2026-11-18 reconcile 时间戳漂移腿用).
+    5 shard 全扫含 plan; updated_at 缺 -> 空串 (视为最早, 必落后 -> 若中央
+    有同行则不触发重推, 行为安全)。"""
+    rows: List[Tuple[str, str]] = []
+    for mem_type in ("fact", "preference", "decision", "task", "plan"):
+        mem_file = Path(memories_dir) / f"{mem_type}.json"
+        if not mem_file.exists():
+            continue
+        try:
+            with open(mem_file, "r", encoding="utf-8") as f:
+                for it in json.load(f):
+                    rows.append((it["id"], it.get("updated_at") or ""))
+        except Exception:
+            continue
+    return rows
+
+
+def _norm_ts(v: Any) -> str:
+    """秒级墙钟归一 (reconcile 漂移判定): str() -> 'T'->' ' -> 去小数 ->
+    [:19]。本地 shard updated_at 是 ISO 串 (可带 +08:00 尾巴), 中央读回是
+    datetime (psycopg2, session tz) — 两者都归一成 'YYYY-MM-DD HH:MM:SS'
+    可直接比 (session 墙钟; 若 PG session tz 与宿主差整小时, 最坏情况 =
+    同行被幂等重推一次, 无数据损失)。"""
+    return re.sub(r"\.\d+", "", str(v or "").replace("T", " "))[:19]
+
+
 def reconcile_local_to_central(provider) -> Dict[str, Any]:
-    """Q1 启动对账腿: provider initialize 后跑一次, 本地全 shard 行 vs 中央差集
-    补推 (幂等, 只推本地有中央无的, 不重推已在中央的). 根除"重启/宕机期间
-    auto-catch 没 fire 的缺口". 50 agent 规模控频: 每 host 生命周期一次由调用方
-    flag 守 (filemem initialize / kb _svc() 语义), 本函数只做差集 + 补推.
+    """Q1 启动对账腿: provider initialize 后跑一次, 本地全 shard 行 vs 中央
+    差集补推 (幂等, 只推需要推的, 不重推已在中央且本地不更新的). 根除
+    "重启/宕机期间 auto-catch 没 fire 的缺口". 50 agent 规模控频: 每 host
+    生命周期一次由调用方 flag 守 (filemem initialize / kb _svc() 语义),
+    本函数只做差集 + 补推.
+
+    2026-11-18 差集扩到【时间戳漂移】: 差集 = (id 中央无) 或 (本地
+    updated_at 新于中央的)。re-stamp 路径 (bg reclassify / decay /
+    plan-advance) 刷新本地行的 updated_at 但不 fire 写钩子, 中央副本静默
+    滞后 — 启动对账每生命周期自愈一次 (幂等 upsert, 同内容/同 version 重推
+    无害). 中央比本地新的行 (last-push-wins, 无拉腿) 不重推。
 
     返回 {"status": "ok"|"skipped", "missing": n, "pushed": n}.
     语义约定 (调用方 flag 控频依据, 与 kb 对账腿一致):
@@ -554,13 +625,15 @@ def reconcile_local_to_central(provider) -> Dict[str, Any]:
         agent_id = cfg["agent_id"]
         _central_auth(conn, agent_id, cfg.get("token", ""))
         cur = conn.cur()
-        # 查中央已有行 id (只取 id, 不取 content — 差集判定够用)
+        # 查中央已有行 (id + updated_at — 漂移判定要中央侧墙钟; 仍不取
+        # content, 差集判定够用, 中央行绝不进本地)
         cur.execute(
-            "SELECT id FROM memories WHERE agent_id = %s", (agent_id,))
-        central_ids = {r[0] for r in cur.fetchall()}
-        # 本地全 shard 行 id
-        local_ids = _all_local_row_ids(provider.memories_dir)
-        missing = [rid for rid in local_ids if rid not in central_ids]
+            "SELECT id, updated_at FROM memories WHERE agent_id = %s", (agent_id,))
+        central_ts = {r[0]: _norm_ts(r[1]) for r in cur.fetchall()}
+        # 本地全 shard (id, updated_at): 差集 = 中央缺 或 本地更新 (drift)
+        local_rows = _all_local_rows_ts(provider.memories_dir)
+        missing = [rid for rid, lts in local_rows
+                   if rid not in central_ts or _norm_ts(lts) > central_ts[rid]]
         if not missing:
             return {"status": "ok", "missing": 0, "pushed": 0,
                     "reason": "in-sync"}
