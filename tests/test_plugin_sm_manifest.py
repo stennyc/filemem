@@ -24,12 +24,12 @@ sys.path.insert(0, str(PLUGIN_DIR))
 SM_FIELDS = [
     ("sm_enabled", "bool", True),
     ("sm_agent_id", "str", "local"),
-    ("sm_token", "str", "local-dev-token-s2"),
+    ("sm_token", "str", "local-67a09bdf6d0c68e8-s4"),
     ("sm_pg_host", "str", "127.0.0.1"),
     ("sm_pg_port", "int", 5432),
     ("sm_pg_db", "str", "sharedmem"),
     ("sm_pg_user", "str", "sharedmem"),
-    ("sm_pg_password", "str", "0c34c975d21c44b55262ea10c2fa08cf"),
+    ("sm_pg_password", "str", "c44dafef06869c6f96ad3f9432cf3eb0"),
 ]
 
 
