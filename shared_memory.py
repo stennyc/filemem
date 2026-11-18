@@ -376,14 +376,24 @@ def _central_auth(conn, agent_id: str, token: str) -> None:
     """中央层 token 硬约束 (owner S4 拍 (a)): push 前调
     require_agent(agent_id, sha256(token))。token_hash 不入行数据
     (memories 不存 token), 只做调用时校验; 中央 RAISE ->
-    _TokenRejected (客户端语义"拒", 非"连不上"), 本地写仍 fail-soft。"""
+    _TokenRejected (客户端语义"拒", 非"连不上"), 本地写仍 fail-soft。
+
+    2026-11-18 安全复盘 F7: 异常分诊 — 只有中央 RAISE 语义
+    (pgcode P0001, unknown/revoked token) 转 _TokenRejected ("拒" =
+    配置性错误, 调用方置 flag 不重试); 连接级瞬断 (OperationalError/
+    InterfaceError) 原样向上抛, 落调用方的泛 except -> fail-soft
+    'skipped' (不置 flag, 下次 initialize 重试) — 旧代码把所有异常
+    一律转"拒", PG 闪断会让 reconcile 本生命周期静默放弃。日志
+    侧截断 str(e) 防中央异常原文外溢。"""
     import hashlib
     token_hash = hashlib.sha256((token or "").encode("utf-8")).hexdigest()
     cur = conn.cur()
     try:
         cur.execute("SELECT require_agent(%s, %s)", (agent_id, token_hash))
     except Exception as e:
-        raise _TokenRejected(str(e)) from e
+        if getattr(e, "pgcode", None) == "P0001":
+            raise _TokenRejected(str(e)[:200]) from e
+        raise  # 瞬断/DB 级错误 -> 调用方 fail-soft 腿 (不置 flag)
 
 
 # ── 行 -> 中央列 映射 (version 走 metadata.shared_version, 仅防重放) ──────

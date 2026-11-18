@@ -419,6 +419,101 @@ class TestReconcileLocalToCentral:
         assert r["status"] == "ok" and r.get("reason") == "in-sync"
         assert pushed == [] and r["pushed"] == 0
 
+    # -- 2026-11-18 security retro F7: transient vs rejected ----------------
+    # _central_auth must NOT classify a transient PG connection hiccup as
+    # "token rejected": 'rejected' is the config-error semantic that tells
+    # the caller to set its no-retry flag; a blip must stay fail-soft
+    # 'skipped' so the next initialize retries.
+
+    def test_central_auth_p0001_raises_token_rejected(self):
+        """A central RAISE (pgcode P0001, unknown/revoked token) still
+        maps to _TokenRejected."""
+        import shared_memory as sm
+        import psycopg2
+
+        class _Err(Exception):
+            pgcode = "P0001"
+
+            def __init__(self, msg="agent local token rejected (unknown or revoked)"):
+                super().__init__(msg)
+
+        class _FakeCur:
+            def execute(self, sql, params=None):
+                raise _Err()
+
+        class _FakeConn:
+            def cur(self): return _FakeCur()
+            def commit(self): pass
+            def close(self): pass
+
+        with mock.patch.object(sm, "_PgConn", lambda c: _FakeConn()):
+            try:
+                sm._central_auth(_FakeConn(), "local", "tok")
+                assert False, "expected _TokenRejected"
+            except sm._TokenRejected:
+                pass
+
+    def test_central_auth_operational_error_not_rejected(self, tmp_path):
+        """A transient OperationalError (PG blip) propagates as-is — NOT
+        wrapped in _TokenRejected — so callers stay on the fail-soft leg."""
+        import shared_memory as sm
+        import psycopg2
+
+        class _FakeCur:
+            def execute(self, sql, params=None):
+                raise psycopg2.OperationalError("connection to server lost")
+
+        class _FakeConn:
+            def cur(self): return _FakeCur()
+            def commit(self): pass
+            def close(self): pass
+
+        with mock.patch.object(sm, "_PgConn", lambda c: _FakeConn()):
+            try:
+                sm._central_auth(_FakeConn(), "local", "tok")
+                assert False, "expected OperationalError"
+            except sm._TokenRejected:
+                assert False, "transient hiccup must NOT be 'token rejected'"
+            except psycopg2.OperationalError:
+                pass
+
+    def test_reconcile_transient_failure_stays_skipped_no_flag(self, tmp_path):
+        """reconcile on a transient auth-leg failure returns status='skipped'
+        (fail-soft, caller does NOT set the no-retry flag), not 'rejected'."""
+        import shared_memory as sm
+        import psycopg2
+        p = self._provider_with_rows(tmp_path, [
+            {"id": "fact_1", "type": "fact", "content": "a", "level": "L0",
+             "updated_at": "2026-10-23T10:00:00", "created_at": "2026-10-23T10:00:00",
+             "metadata": {"shared_version": 1}},
+        ])
+        cfg = _cfg()
+
+        class _FakeCur:
+            def execute(self, sql, params=None):
+                raise psycopg2.OperationalError("server closed the connection unexpectedly")
+
+        class _FakeConn:
+            def __init__(self):
+                try:
+                    import psycopg2 as _pg
+                    _PgConnOrig = sm._PgConn
+                except Exception:
+                    _PgConnOrig = None
+                self._cur = _FakeCur()
+            def cur(self): return self._cur
+            def commit(self): pass
+            def close(self): pass
+
+        with mock.patch.object(sm, "_PgConn", lambda c: _FakeConn()):
+            # _central_auth is reached via the patched _PgConn; it will RAISE
+            # OperationalError (F7: no longer mislabeled 'rejected').
+            with mock.patch.object(sm, "_load_shared_memory_config", lambda: cfg):
+                r = sm.reconcile_local_to_central(p)
+        assert r["status"] == "skipped", f"transient failure must stay fail-soft skipped, got {r}"
+        assert "fail-soft" in r.get("reason", "")
+        assert r["pushed"] == 0
+
     def test_plan_rows_also_pushed_via_five_shard_scan(self, tmp_path):
         """Q2: plan 行走 5 shard 全量推中央 (中央 memories 表存 plan, 不建独立 plans 表)."""
         import shared_memory as sm
