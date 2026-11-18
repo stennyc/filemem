@@ -586,10 +586,28 @@ def take_handoff(cfg: Dict[str, Any], task_ref: str) -> Optional[Dict[str, Any]]
         conn.close()
 
 
+def _shard_scan_types() -> tuple:
+    """全 shard 扫描类型面. 宿主 MEMORY_TYPES (fact/preference/decision/
+    task/plan/scheduled) 是单一事实源 — 对账腿推中央的行面必须跟宿主写
+    路径落盘的 shard 面一致, 否则 scheduled.json 的行对账腿永远扫不到
+    (2026-11-19 复盘: 5-shard 硬编码 vs 宿主 6-shard 失配, active 侧
+    1384 行 vs archive 侧 500 行全漏). 宿主不可导入 (boot 时序) 时兜底
+    6 元组 (与 __init__.py L137 MEMORY_TYPES 值同步, 改它处必同步此)."""
+    try:
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import importlib
+        init_mod = importlib.import_module("__init__")
+        return tuple(init_mod.MEMORY_TYPES)
+    except Exception:
+        return ("fact", "preference", "decision", "task", "plan", "scheduled")
+
+
 def _all_local_row_ids(memories_dir) -> List[str]:
-    """本地全 shard 行 id (门 1 全量沉淀对账用). 5 shard 全扫含 plan."""
+    """本地全 shard 行 id (门 1 全量沉淀对账用). 6 shard 全扫含 plan/scheduled."""
     ids = []
-    for mem_type in ("fact", "preference", "decision", "task", "plan"):
+    for mem_type in _shard_scan_types():
         mem_file = Path(memories_dir) / f"{mem_type}.json"
         if not mem_file.exists():
             continue
@@ -604,10 +622,10 @@ def _all_local_row_ids(memories_dir) -> List[str]:
 
 def _all_local_rows_ts(memories_dir) -> List[Tuple[str, str]]:
     """本地全 shard (id, updated_at) 对 (2026-11-18 reconcile 时间戳漂移腿用).
-    5 shard 全扫含 plan; updated_at 缺 -> 空串 (视为最早, 必落后 -> 若中央
-    有同行则不触发重推, 行为安全)。"""
+    6 shard 全扫含 plan/scheduled; updated_at 缺 -> 空串 (视为最早, 必落后
+    -> 若中央有同行则不触发重推, 行为安全)。"""
     rows: List[Tuple[str, str]] = []
-    for mem_type in ("fact", "preference", "decision", "task", "plan"):
+    for mem_type in _shard_scan_types():
         mem_file = Path(memories_dir) / f"{mem_type}.json"
         if not mem_file.exists():
             continue
@@ -729,8 +747,8 @@ def _push_locked(provider, cfg: Dict[str, Any], new_row_ids: List[str]) -> Dict[
 
 
 def _read_local_row(memories_dir: Path, rid: str) -> Optional[Dict[str, Any]]:
-    """从 5 shard 按 id 找到本地行 (写路径刚落盘, 必在)。"""
-    for mem_type in ("fact", "preference", "decision", "task", "plan"):
+    """从全 shard 按 id 找到本地行 (写路径刚落盘, 必在)。"""
+    for mem_type in _shard_scan_types():
         mem_file = memories_dir / f"{mem_type}.json"
         if not mem_file.exists():
             continue
@@ -755,7 +773,7 @@ def backfill_versions(memories_dir: Path) -> int:
     原地原子写 (tmp+os.replace)。返回补的行数。"""
     import os
     touched = 0
-    for mem_type in ("fact", "preference", "decision", "task", "plan"):
+    for mem_type in _shard_scan_types():
         mem_file = memories_dir / f"{mem_type}.json"
         if not mem_file.exists():
             continue

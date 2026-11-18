@@ -402,6 +402,22 @@ class TestReconcileLocalToCentral:
         assert pushed == ["fact_1"], "local-ahead row must be re-pushed"
         assert r["missing"] == 1 and r["pushed"] == 1
 
+        # 2026-11-19: scheduled shard 失配复盘 — 宿主 MEMORY_TYPES 含 scheduled,
+        # 对账腿扫描面必须跟宿主写路径落盘面一致 (scheduled.json 的行可被
+        # 对账腿捡到并推中央), 否则 scheduled 行永远漏推. (p2 复用 p1 的
+        # tmp_path -> fact_1 也在, 两者都推; 断言重点是 sched_1 被捡到.)
+        p2 = self._provider_with_rows(tmp_path, [
+            {"id": "sched_1", "type": "scheduled", "content": "s", "level": "L0",
+             "updated_at": "2026-10-23T11:00:00", "created_at": "2026-10-23T10:00:00",
+             "metadata": {"shared_version": 1}},
+        ])
+        p2._shared_mem_cfg = cfg
+        r2, pushed2 = self._reconcile_with_central(
+            sm, p2, {}, cfg)
+        assert "sched_1" in pushed2, (
+            "scheduled row must be picked up by full-shard scan, "
+            f"got: {pushed2}")
+
     def test_reconcile_central_newer_no_repush(self, tmp_path):
         """Central updated_at >= local (in-sync or central ahead — the
         last-push-wins no-pull design) -> zero re-push, idempotent."""
