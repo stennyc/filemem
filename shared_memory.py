@@ -703,6 +703,31 @@ def reconcile_local_to_central(provider) -> Dict[str, Any]:
         conn.close()
 
 
+def _js(v: Any) -> Any:
+    """本地 ISO 串 -> 可入 PG 的值. 正常路径原样透传 (byte 级不变);
+    脏值兜底 (2026-11-19): 解析失败的坏串 (例: '%f' strftime 占位符字面
+    写进 task.json 的 4 行) 截 [:19] 归一, PG timestamptz 吃 'YYYY-MM-DD
+    HH:MM:SS' — 截掉的尾巴本来就是小数/时区, 不丢信息。空值 -> None。"""
+    if v is None:
+        return None
+    if not isinstance(v, str):
+        # datetime (理论上不会到 — 本地 shard 全是 ISO 串) -> isoformat;
+        # 其他标量原样透传 (byte 级不变)。
+        from datetime import datetime as _dt2
+        if isinstance(v, _dt2):
+            return v.isoformat()
+        return v
+    s = v.strip()
+    if not s:
+        return None
+    from datetime import datetime
+    try:
+        datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return s[:19]
+    return s
+
+
 def _push_locked(provider, cfg: Dict[str, Any], new_row_ids: List[str]) -> Dict[str, Any]:
     conn = _PgConn(cfg["pg"])
     try:
@@ -727,9 +752,6 @@ def _push_locked(provider, cfg: Dict[str, Any], new_row_ids: List[str]) -> Dict[
             d = _row_to_rowdict(rowmap)
             # 本地行的 updated_at/created_at 是 ISO 字符串 (filemem 约定);
             # metadata jsonb 推中央前做一次 json 序列化兜底 (datetime 保险)。
-            def _js(v):
-                from datetime import datetime as _dt2
-                return _dt2(v).isoformat() if isinstance(v, _dt2) else v
             cur.execute(
                 "SELECT upsert_memory_row(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (d["id"], d["mem_type"], d["content"], d["level"], d["confirmed"],

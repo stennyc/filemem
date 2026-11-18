@@ -435,6 +435,19 @@ class TestReconcileLocalToCentral:
         assert r["status"] == "ok" and r.get("reason") == "in-sync"
         assert pushed == [] and r["pushed"] == 0
 
+    def test_js_malformed_ts_normalized(self, tmp_path):
+        """2026-11-19 脏值兜底: task.json 里 '%f' strftime 占位符字面写进
+        updated_at 的 4 行 — 旧内联 _js 原样透传 -> PG timestamp 解析炸
+        -> 整个 reconcile fail-soft no-op (586 行全推不上去). 新 _js:
+        fromisoformat 失败的坏串截 [:19] ('YYYY-MM-DD HH:MM:SS', PG 可吃),
+        正常 ISO 串 byte 级原样透传 (owner 字节级不变验收指标不破)."""
+        import shared_memory as sm
+        assert sm._js("2026-11-06T04:31:04.123456") == "2026-11-06T04:31:04.123456"
+        assert sm._js("2026-11-06 04:31:04") == "2026-11-06 04:31:04"
+        assert sm._js("2026-11-06T04:31:04.%f") == "2026-11-06T04:31:04"
+        assert sm._js("") is None
+        assert sm._js(None) is None
+
     # -- 2026-11-18 security retro F7: transient vs rejected ----------------
     # _central_auth must NOT classify a transient PG connection hiccup as
     # "token rejected": 'rejected' is the config-error semantic that tells
