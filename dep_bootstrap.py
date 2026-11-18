@@ -149,9 +149,26 @@ def ensure_pg_dep_paths() -> None:
 #     flapping network.
 #   - FAIL-SOFT: the trigger never raises; the local file face is byte-
 #     unchanged no matter what the installer does.
+#
+# 2026-11-18 security retro F3 (supply chain + marker hardening):
+#   - _PG_FACE_DEPS carries EXACT == version pins (proven on this host's
+#     dev-venv: psycopg2-binary 2.9.13 / pyyaml 6.0.3 on py3.14) — a
+#     floating install into the RUNNING gateway interpreter is a standing
+#     PyPI supply-chain RCE surface; pins make the fetched artifact
+#     auditable (same version the owner's venv already runs).
+#   - marker writes are atomic (tmp + os.replace): two interpreters racing
+#     the shared marker JSON no longer lose each other's updates.
+#   - ok=None (in-flight / killed mid-pip) takes a SHORT retry window
+#     (10 min), not the 6h anti-storm window — a killed install must not
+#     waste the interpreter for 6h (2026-11-18 live 19:46 run).
+#   - marker exe key normalizes python3(.exe) -> python(.exe) in the same
+#     dir: one logical interpreter launched under two names must not
+#     double-trigger under two marker keys.
 # ---------------------------------------------------------------------------
-_PG_FACE_DEPS = (("psycopg2", "psycopg2-binary"), ("yaml", "pyyaml"))
+_PG_FACE_DEPS = (("psycopg2", "psycopg2-binary==2.9.13"),
+                 ("yaml", "pyyaml==6.0.3"))
 _PG_AUTOINSTALL_COOLDOWN_HOURS = 6.0
+_PG_INPROGRESS_RETRY_MINUTES = 10.0
 _PG_PIP_TIMEOUT_S = 240
 _PG_MARKER_NAME = ".filemem_pg_autoinstall.json"
 
@@ -161,9 +178,19 @@ def _pg_exe_key() -> str:
     interpreter must not throttle ANOTHER's — the marker is keyed per
     sys.executable, because pip installs into the running interpreter's own
     site-packages (2026-11-17 live run: a marker written by the dev venv
-    blocked the gateway interpreter's own needed install for 6h)."""
+    blocked the gateway interpreter's own needed install for 6h).
+
+    2026-11-18 F3: normalize the two common exe names of ONE logical
+    interpreter (python3.exe/python3 launched alongside python.exe/python in
+    the same dir) to a single key — pre-fix they double-triggered."""
     if sys.executable:
-        return os.path.normcase(os.path.abspath(sys.executable))
+        exe = os.path.normcase(os.path.abspath(sys.executable))
+        d, b = os.path.dirname(exe), os.path.basename(exe)
+        for _i3, _i1 in (("python3.exe", "python.exe"), ("python3", "python")):
+            if b == _i3:
+                exe = os.path.normcase(os.path.join(d, _i1))
+                break
+        return exe
     return "unknown"
 
 
@@ -186,8 +213,10 @@ def _pg_missing_probe() -> list:
 
 
 def _pg_run_pip(pip_name: str, timeout: int = _PG_PIP_TIMEOUT_S):
-    """One split pip install into the running interpreter. Returns
-    (ok: bool, detail: str); never raises."""
+    """One split pip install into the running interpreter. `pip_name` is a
+    pip REQUIREMENT spec (2026-11-18 F3: == pinned, e.g.
+    'psycopg2-binary==2.9.13' — the fetched artifact must match the
+    audited version). Returns (ok: bool, detail: str); never raises."""
     import subprocess
     try:
         proc = subprocess.run(
@@ -228,13 +257,28 @@ def _pg_read_marker() -> dict:
 
 def _pg_write_marker(ts: float, packages, ok) -> None:
     """Merge under the CURRENT interpreter's key (other interpreters'
-    entries survive untouched)."""
+    entries survive untouched). 2026-11-18 F3: atomic write (tmp +
+    os.replace) — a plain write_text lost updates when two interpreters
+    raced the shared marker file mid-write."""
     try:
         data = _pg_read_marker()
         data[_pg_exe_key()] = {"ts": ts, "packages": packages, "ok": ok}
-        _pg_marker_path().write_text(json.dumps(data))
+        p = _pg_marker_path()
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(data))
+        os.replace(str(tmp), str(p))
     except Exception:
         pass  # marker is throttling sugar, never fatal
+
+
+def _pg_entry_cooldown_hours(entry: dict) -> float:
+    """Marker cooldown by OUTCOME (2026-11-18 F3): success/failure keep the
+    6h anti-storm window; ok=None (in flight / process killed mid-pip)
+    retries after the short window instead of wasting the interpreter for
+    6h."""
+    if entry.get("ok") is None:
+        return _PG_INPROGRESS_RETRY_MINUTES / 60.0
+    return _PG_AUTOINSTALL_COOLDOWN_HOURS
 
 
 def ensure_pg_face_deps_installed(cooldown_hours: float | None = None) -> dict:
@@ -251,12 +295,14 @@ def ensure_pg_face_deps_installed(cooldown_hours: float | None = None) -> dict:
         if not missing:
             return out
         out["missing"] = [m for m, _ in missing]
-        cooldown = (_PG_AUTOINSTALL_COOLDOWN_HOURS if cooldown_hours is None
-                    else cooldown_hours)
         entry = _pg_read_marker().get(_pg_exe_key())
-        if entry and time.time() - entry.get("ts", 0.0) < cooldown * 3600:
-            out["reason"] = "cooldown"
-            return out
+        if entry:
+            cooldown = _pg_entry_cooldown_hours(entry)
+            if cooldown_hours is not None:
+                cooldown = min(cooldown, cooldown_hours)
+            if time.time() - entry.get("ts", 0.0) < cooldown * 3600:
+                out["reason"] = "cooldown"
+                return out
         now = time.time()
         # record the attempt time BEFORE starting (anti-storm); the job
         # below rewrites the marker with the outcome
