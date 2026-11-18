@@ -30,11 +30,12 @@ SM_FIELDS = [
     ("sm_pg_db", "str", "sharedmem"),
     ("sm_pg_user", "str", "sharedmem"),
     ("sm_pg_password", "str", "c44dafef06869c6f96ad3f9432cf3eb0"),
+    ("sm_pg_sslmode", "str", "prefer"),
 ]
 
 
 def test_plugin_yaml_declares_sm_manifest():
-    """The manifest carries all 8 sm_* fields with the right types + defaults."""
+    """The manifest carries all 9 sm_* fields with the right types + defaults."""
     data = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8"))
     schema = data.get("config_schema")
     assert schema is not None, "plugin.yaml must declare a config_schema block"
@@ -259,7 +260,8 @@ def test_loader_yamlless_interpreter_reads_panel_sm_shape():
     assert cfg["agent_id"] == "agent-x"
     assert cfg["token"] == "tok-x"
     assert cfg["pg"] == {"host": "10.0.0.5", "port": 6432, "db": "sharedmem",
-                         "user": "sharedmem", "password": "pw-x"}
+                         "user": "sharedmem", "password": "pw-x",
+                         "sslmode": "prefer"}
     assert trig.called, "enabled-gate pass must reach the PG-face auto-install trigger"
 
 
@@ -273,3 +275,108 @@ def test_loader_yamlless_interpreter_sm_disabled_returns_none():
             mock.patch.object(sm, "_maybe_trigger_pg_face_autoinstall") as trig:
         assert sm._load_shared_memory_config() is None
     assert not trig.called
+
+
+# ---------------------------------------------------------------------------
+# F4 client TLS (2026-11-18): sm_pg_sslmode flows panel -> loader -> legacy
+# pg dict -> psycopg2.connect. Default "prefer" keeps every existing device
+# byte-identical (libpq default); a live config sets "require".
+# ---------------------------------------------------------------------------
+
+_PANEL_CFG_SSLMODE = _PANEL_CFG_TEXT.replace(
+    "sm_pg_password: pw-x\n",
+    "sm_pg_password: pw-x\n        sm_pg_sslmode: require\n",
+    1,
+)
+
+
+def test_reader_panel_sm_sslmode_require():
+    sm = _import_shared_memory()
+    with _with_fake_config_yaml(sm, _PANEL_CFG_SSLMODE):
+        cfg = sm._load_shared_memory_config()
+    assert cfg is not None
+    assert cfg["pg"]["sslmode"] == "require"
+
+
+def test_reader_sslmode_defaults_to_prefer():
+    sm = _import_shared_memory()
+    cfg_yaml = (
+        "plugins:\n  entries:\n    filemem:\n"
+        "      settings:\n"
+        "        sm_enabled: true\n"
+        "        sm_agent_id: agent-x\n"
+        "        sm_pg_host: 10.0.0.5\n"
+        "        sm_pg_db: sharedmem\n"
+    )
+    with _with_fake_config_yaml(sm, cfg_yaml):
+        cfg = sm._load_shared_memory_config()
+    assert cfg is not None
+    assert cfg["pg"]["sslmode"] == "prefer"
+
+
+def test_reader_legacy_nested_pg_sslmode():
+    sm = _import_shared_memory()
+    cfg_yaml = (
+        "plugins:\n  entries:\n    filemem:\n"
+        "      shared_memory:\n"
+        "        enabled: true\n"
+        "        agent_id: legacy-agent\n"
+        "        pg:\n"
+        "          host: 127.0.0.1\n"
+        "          db: sharedmem\n"
+        "          user: sharedmem\n"
+        "          sslmode: verify-full\n"
+    )
+    with _with_fake_config_yaml(sm, cfg_yaml):
+        cfg = sm._load_shared_memory_config()
+    assert cfg is not None
+    assert cfg["pg"]["sslmode"] == "verify-full"
+
+
+def test_minimal_parser_panel_sslmode_key():
+    sm = _import_shared_memory()
+    out = sm._parse_shared_memory_minimal(_PANEL_CFG_SSLMODE)
+    settings = out["plugins"]["entries"]["filemem"]["settings"]
+    assert settings["sm_pg_sslmode"] == "require"
+
+
+def test_minimal_parser_legacy_pg_sslmode_key():
+    sm = _import_shared_memory()
+    text = (
+        "plugins:\n  entries:\n    filemem:\n"
+        "      shared_memory:\n"
+        "        enabled: true\n"
+        "        agent_id: legacy-agent\n"
+        "        pg:\n"
+        "          host: 127.0.0.1\n"
+        "          db: sharedmem\n"
+        "          sslmode: verify-ca\n"
+    )
+    out = sm._parse_shared_memory_minimal(text)
+    sm_block = out["plugins"]["entries"]["filemem"]["shared_memory"]
+    assert sm_block["pg"]["sslmode"] == "verify-ca"
+
+
+def test_pg_conn_passes_sslmode_kwarg():
+    """_PgConn must forward sslmode to psycopg2.connect; a pg dict without
+    it (older config shape) must default to 'prefer'."""
+    from unittest import mock
+    sm = _import_shared_memory()
+    calls = []
+
+    class _FakeConn:
+        autocommit = False
+
+    def _fake_connect(**kw):
+        calls.append(kw)
+        return _FakeConn()
+
+    fake_mod = mock.Mock()
+    fake_mod.connect = _fake_connect
+    with mock.patch.dict(sys.modules, {"psycopg2": fake_mod}):
+        sm._PgConn({"host": "h", "port": 5432, "db": "d",
+                    "user": "u", "password": "p", "sslmode": "require"})
+        sm._PgConn({"host": "h", "port": 5432, "db": "d",
+                    "user": "u", "password": "p"})
+    assert calls[0]["sslmode"] == "require"
+    assert calls[1]["sslmode"] == "prefer"

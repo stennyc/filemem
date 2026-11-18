@@ -70,3 +70,8 @@ config_schema:
     type: str
     default: "c44dafef06869c6f96ad3f9432cf3eb0"
     label: "PG password"
+  sm_pg_sslmode:
+    type: str
+    default: "prefer"
+    label: "PG sslmode"
+    description: "libpq sslmode (2026-11-18 F4 TLS): prefer/require/verify-ca/verify-full. 默认 prefer = 旧行为不变; 活配置设 require 走 TLS。"

@@ -125,6 +125,7 @@ def _load_shared_memory_config() -> Optional[Dict[str, Any]]:
                 "db": str(settings.get("sm_pg_db") or ""),
                 "user": str(settings.get("sm_pg_user") or ""),
                 "password": str(settings.get("sm_pg_password") or ""),
+                "sslmode": str(settings.get("sm_pg_sslmode") or "prefer"),
             }
         else:
             sm = settings.get("shared_memory")
@@ -141,6 +142,7 @@ def _load_shared_memory_config() -> Optional[Dict[str, Any]]:
                 "db": str(pg_raw.get("db") or ""),
                 "user": str(pg_raw.get("user") or ""),
                 "password": str(pg_raw.get("password") or ""),
+                "sslmode": str(pg_raw.get("sslmode") or "prefer"),
             }
         if not agent_id or not pg["host"] or not pg["db"]:
             return None
@@ -204,7 +206,8 @@ def _parse_shared_memory_minimal(raw: str) -> Dict[str, Any]:
       2. legacy 嵌套形态: filemem.shared_memory {enabled, agent_id, token, pg{...}}。
     逐行扫, 跟踪缩进 (plugins: -> entries: -> filemem: -> settings:/shared_memory:),
     配置块内取标量键 (sm_enabled 归一为 bool — 字符串 'false' 在 loader 的
-    bool() 下会被误读为 enabled), pg 子块的五键原样取。pg 块可能是 anchor 定义
+    bool() 下会被误读为 enabled), pg 子块的六键原样取 (host/port/db/user/
+    password/sslmode)。pg 块可能是 anchor 定义
     (pg: &id001) — 取值键正常取; alias (pg: *id001) 在 filemem 段不会出现
     (filemem 是 &id001 的定义处)。
 
@@ -222,10 +225,10 @@ def _parse_shared_memory_minimal(raw: str) -> Dict[str, Any]:
     _settings_indent = 0
     _entries_indent = 0
     _SM_KEYS = {"enabled", "agent_id", "token"}
-    _PG_KEYS = {"host", "port", "db", "user", "password"}
+    _PG_KEYS = {"host", "port", "db", "user", "password", "sslmode"}
     _SM_PANEL_KEYS = {"sm_enabled", "sm_agent_id", "sm_token",
                       "sm_pg_host", "sm_pg_port", "sm_pg_db",
-                      "sm_pg_user", "sm_pg_password"}
+                      "sm_pg_user", "sm_pg_password", "sm_pg_sslmode"}
 
     def _scalar(v: str):
         s = v.strip()
@@ -347,6 +350,7 @@ class _PgConn:
         self._conn = psycopg2.connect(
             host=pg["host"], port=int(pg["port"]), dbname=pg["db"],
             user=pg["user"], password=pg["password"],
+            sslmode=str(pg.get("sslmode") or "prefer"),
             connect_timeout=5,
         )
         self._conn.autocommit = False
