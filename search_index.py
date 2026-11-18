@@ -31,7 +31,32 @@ import math
 import re
 from collections import Counter
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+import os
+import threading
+
+
+# ── 2026-11-18 P0 read-side axis cache (owner-approved zero-recall-diff) ─
+# The auto-inject face (pre_llm_call) rebuilt the whole BM25 index on
+# EVERY search (~100ms+ once CJK n-gram fanout lands), and re-parsed
+# the graph statics per call. This cache keys on the caller-supplied
+# corpus signature + the filtered pool's id tuple + the graph file key:
+# same key ⇒ corpus byte-identical ⇒ the cached axis math is
+# byte-identical too (BM25/doc-lengths and graph adjacency+token-sets
+# are pure functions of that corpus). In-memory only — no persistence,
+# so no new staleness vector. Ops kill-switch + canary A/B leg:
+# FILEMEM_PERF_CACHE=off (or 0/false) disables every filemem read-side
+# cache (axis cache, aliases, graph file, episodic incremental leg).
+_PERF_CACHE_ENV = "FILEMEM_PERF_CACHE"
+_AXIS_CACHE_MAX = 2
+_AXIS_CACHE: Dict[Any, Dict[str, Any]] = {}
+_AXIS_CACHE_LOCK = threading.Lock()
+
+
+def perf_cache_enabled() -> bool:
+    """Env gate for the P0 read-side caches (see the block above)."""
+    return os.environ.get(_PERF_CACHE_ENV, "on").strip().lower() \
+        not in ("off", "0", "false")
 
 __all__ = ["is_cjk_char", "tokenize", "BM25Index", "rrf_fuse",
            "rank_decay_axis", "graph_axis_rank", "graph_axis_stub",
@@ -107,8 +132,13 @@ class BM25Index:
     item["content"] (+ item.get("topic") for the knowledge layer);
     `rank(query)` returns the FULL pool order (zero-score items at the tail,
     ties by pool position — deterministic) so the axis is a total ordering,
-    which RRF is defined over. Rebuilt on every search: the corpus is
-    <430 items, in-memory build stays within the perf budget (see test)."""
+    which RRF is defined over. Pre-2026-11-18: rebuilt on every
+    search ("the corpus is <430 items, within the perf budget" —
+    the budget assumption broke on CJK n-gram fanout: ~110ms/search
+    on the live 432-row corpus). Now build_search_axes accepts a
+    corpus signature and reuses this instance per signature; the
+    legacy no-sig call still builds fresh (byte-identical result,
+    old cost)."""
 
     def __init__(self, k1: float = 1.2, b: float = 0.75):
         self.k1, self.b = float(k1), float(b)
@@ -206,7 +236,35 @@ def _add_adj(adjacency: Dict[str, Dict[str, str]], src: str, dst: str,
         d[dst] = kind
 
 
-def graph_axis_rank(graph: Optional[Dict], query: str, pool: List[Dict]) -> List[int]:
+def _graph_static(graph: Optional[Dict], pool: List[Dict]):
+    """The QUERY-INDEPENDENT half of _graph_scores: the adjacency map
+    (O(E) edge walk, B'-1b max-coef semantics preserved verbatim from
+    the original inline build) + per-pool-position content token-sets
+    + node-id strings. Pure function of (graph, pool) => cacheable
+    under a corpus+graph signature; the per-query work shrinks to the
+    intersection walk. Returns (adjacency, tok_sets, nids)."""
+    adjacency: Dict[str, Dict[str, str]] = {}
+    if graph:
+        edges = graph.get("edges")
+        if isinstance(edges, list):
+            for e in edges:
+                if not isinstance(e, dict):
+                    continue  # fail-soft: skip a corrupt edge, keep the rest
+                src, dst = str(e.get("src") or ""), str(e.get("dst") or "")
+                if not src or not dst:
+                    continue
+                _kind = str(e.get("kind") or "")
+                _coef = _GRAPH_NEIGHBOR_KIND_COEF.get(
+                    _kind, _GRAPH_NEIGHBOR_DEFAULT_COEF)
+                _add_adj(adjacency, src, dst, _kind, _coef)
+                _add_adj(adjacency, dst, src, _kind, _coef)
+    tok_sets = [set(tokenize(item.get("content"))) for item in pool]
+    nids = [str(item.get("id") or "") for item in pool]
+    return adjacency, tok_sets, nids
+
+
+def graph_axis_rank(graph: Optional[Dict], query: str, pool: List[Dict],
+                    static: Optional[Tuple] = None) -> List[int]:
     """SA2-4: the graph 1-hop expansion axis over the RRF pool (deterministic,
     zero LLM, pure stdlib).
 
@@ -223,7 +281,7 @@ def graph_axis_rank(graph: Optional[Dict], query: str, pool: List[Dict]) -> List
     """
     if not pool:
         return []
-    scores, hit_ids = _graph_scores(graph, query, pool)
+    scores, hit_ids = _graph_scores(graph, query, pool, static=static)
     # EMPTY SIGNAL RULE: a degenerate graph term (no adjacency / no query
     # tokens / no hits) yields an empty order, which RRF treats as all-zeros
     # (the SA2-3 two-axis fail-soft gate, spec SA2-4/4).
@@ -233,7 +291,7 @@ def graph_axis_rank(graph: Optional[Dict], query: str, pool: List[Dict]) -> List
 
 
 def _graph_scores(graph: Optional[Dict], query: str,
-                  pool: List[Dict]):
+                  pool: List[Dict], static: Optional[Tuple] = None):
     """C1-M2 shared graph-axis scoring core (B'-1b). Returns
     ``(scores, hit_ids)`` where ``scores[i]`` is the graph-axis score
     (0.0 / 1.0 for a content-token HIT / 0.2~0.5 for a 1-hop NEIGHBOR,
@@ -250,38 +308,25 @@ def _graph_scores(graph: Optional[Dict], query: str,
     scores = [0.0] * len(pool)
     if not pool:
         return scores, set()
-    # B'-1b: adjacency maps node -> {neighbor: kind}; the 1-hop neighbor
-    # score is weighted by the connecting edge kind (max-coef kind wins).
-    adjacency: Dict[str, Dict[str, str]] = {}
-    if graph:
-        edges = graph.get("edges")
-        if isinstance(edges, list):
-            for e in edges:
-                if not isinstance(e, dict):
-                    continue  # fail-soft: skip a corrupt edge, keep the rest
-                src, dst = str(e.get("src") or ""), str(e.get("dst") or "")
-                if not src or not dst:
-                    continue
-                _kind = str(e.get("kind") or "")
-                _coef = _GRAPH_NEIGHBOR_KIND_COEF.get(
-                    _kind, _GRAPH_NEIGHBOR_DEFAULT_COEF)
-                _add_adj(adjacency, src, dst, _kind, _coef)
-                _add_adj(adjacency, dst, src, _kind, _coef)
+    if static is not None:
+        # P0-F1/F3: precomputed (adjacency, tok_sets, nids) — same
+        # values _graph_static() would compute now; zero re-tokenize.
+        adjacency, tok_sets, nids = static
+    else:
+        adjacency, tok_sets, nids = _graph_static(graph, pool)
     qtoks = set(tokenize(query))
     if not qtoks or not adjacency:
         return scores, set()  # empty graph / empty query = all-zeros term
     hit_ids = set()
-    for i, item in enumerate(pool):
-        nid = str(item.get("id") or "")
+    for i, nid in enumerate(nids):
         if not nid or nid not in adjacency:
             continue
-        if qtoks & set(tokenize(item.get("content"))):
+        if qtoks & tok_sets[i]:
             scores[i] = 1.0
             hit_ids.add(nid)
     if not hit_ids:
         return scores, hit_ids
-    for i, item in enumerate(pool):
-        nid = str(item.get("id") or "")
+    for i, nid in enumerate(nids):
         if nid and nid not in hit_ids:
             # B'-1b: among this node's neighbors that are hits, take the
             # HIGHEST-coefficient edge kind and scale the base neighbor
@@ -300,7 +345,8 @@ def _graph_scores(graph: Optional[Dict], query: str,
 
 
 def graph_marginal_neighbors(graph: Optional[Dict], query: str,
-                             pool: List[Dict]) -> int:
+                             pool: List[Dict],
+                             static: Optional[Tuple] = None) -> int:
     """C1-M2 diagnostic (observability only, NOT part of RRF fusion): the
     number of pool items whose ONLY reason to be graph-ranked is a 1-hop
     NEIGHBOR edge — a non-HIT item carrying a positive graph score. This is
@@ -308,7 +354,7 @@ def graph_marginal_neighbors(graph: Optional[Dict], query: str,
     alone would not have surfaced. Direct HITs (content-token overlap) are
     EXCLUDED because a BM25 axis can already reach them. Returns 0 when the
     graph axis is empty (fail-soft: no graph / no hits / empty pool)."""
-    scores, hit_ids = _graph_scores(graph, query, pool)
+    scores, hit_ids = _graph_scores(graph, query, pool, static=static)
     # neighbors are exactly the items with a positive-but-not-1.0 graph
     # score (HITs are 1.0, neighbors are in (0, 0.5]). Counting the
     # strictly-positive, non-1.0 band isolates the marginal neighbor set.
@@ -352,19 +398,59 @@ def bm25_ranked_score(rank_lists: List[List[int]], pool_size: int,
 def build_search_axes(pool: List[Dict], query: str,
                       decay: Optional[Dict] = None,
                       graph: Optional[Dict] = None,
-                      now: Optional[datetime] = None) -> List[float]:
+                      now: Optional[datetime] = None,
+                      corpus_sig: Optional[tuple] = None,
+                      graph_key: Optional[tuple] = None) -> List[float]:
     """One-stop host entry: build the bm25 + decay + graph axes over `pool`,
     fuse, normalize -> per-position [0,1] scores. `graph` = the loaded
     graph.json dict (or None = fail-soft two-axis behavior).
 
-    F2: `now` pins the decay axis anchor (None = wall-clock, legacy)."""
+    F2: `now` pins the decay axis anchor (None = wall-clock, legacy).
+
+    2026-11-18 P0-F1/F3: `corpus_sig` + `graph_key` opt the caller IN to the
+    read-side axis cache — the BM25 instance and the query-independent graph
+    statics (adjacency + per-position token-sets) are reused while the key
+    is stable; the DECAY AXIS ALWAYS RERUNS (time-dependent, by design).
+    `corpus_sig=None` (legacy callers, tests) = fresh build every call,
+    byte-identical results at the old cost. Cache is in-memory only and
+    gated by perf_cache_enabled() (FILEMEM_PERF_CACHE=off = legacy cost)."""
     decay = decay or {}
     cfg = decay.get("search") or {}
-    idx = BM25Index(k1=float(cfg.get("bm25_k1", 1.2)),
-                    b=float(cfg.get("bm25_b", 0.75))).build(pool)
+    k1, b = float(cfg.get("bm25_k1", 1.2)), float(cfg.get("bm25_b", 0.75))
+    idx: Optional[BM25Index] = None
+    static = None
+    if corpus_sig is not None and perf_cache_enabled():
+        # Key = corpus identity (the D1 pool signature: per-file
+        # mtime+size) + the FILTERED pool's row ids (a window/mem_type
+        # slice over the same corpus is a DIFFERENT pool) + graph file
+        # key + bm25 params. Same key ⇒ byte-identical corpus ⇒ byte-
+        # identical axis math.
+        key = (corpus_sig, tuple(str(it.get("id")) for it in pool),
+               graph_key, k1, b)
+        with _AXIS_CACHE_LOCK:
+            entry = _AXIS_CACHE.get(key)
+            if entry is not None:
+                idx, static = entry["idx"], entry["static"]
+        if idx is None:  # miss: build + store (bounded LRU)
+            idx = BM25Index(k1=k1, b=b).build(pool)
+            static = _graph_static(graph, pool) if graph else None
+            with _AXIS_CACHE_LOCK:
+                _AXIS_CACHE[key] = {"idx": idx, "static": static}
+                if len(_AXIS_CACHE) > _AXIS_CACHE_MAX:
+                    for _old in list(_AXIS_CACHE)[:len(_AXIS_CACHE) - _AXIS_CACHE_MAX]:
+                        del _AXIS_CACHE[_old]
+    else:
+        idx = BM25Index(k1=k1, b=b).build(pool)
     axes: List[List[int]] = [idx.rank(query)]
     axes.append(rank_decay_axis(pool, lam=float(decay.get("lambda_days", 0.05)),
                                 salience_boost=float(decay.get("salience_boost", 1.2)),
                                 now=now))
-    axes.append(graph_axis_stub(graph, query, pool))
+    if graph:
+        # static=None (legacy path) → graph_axis_rank recomputes inline,
+        # byte-identical to the pre-cache behavior.
+        axes.append(graph_axis_rank(graph, query, pool, static=static))
+    else:
+        # EMPTY SIGNAL RULE (via the stub's legacy contract): no graph =>
+        # empty RRF term = all-zeros, the two-axis fail-soft behavior.
+        axes.append([])
     return bm25_ranked_score(axes, len(pool))

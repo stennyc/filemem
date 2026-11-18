@@ -305,7 +305,9 @@ def test_search_index_stdlib_import_audit():
     """Import audit: search_index.py may only import stdlib (SA2 hard
     constraint: zero external deps, zero LLM)."""
     tree = ast.parse(Path(search_index.__file__).read_text(encoding="utf-8"))
-    allowed = {"math", "re", "json", "pathlib", "collections", "typing", "datetime", "__future__"}
+    allowed = {"math", "re", "json", "pathlib", "collections", "typing", "datetime", "__future__",
+               # 2026-11-18 P0 read-side axis cache (still pure stdlib):
+               "os", "threading"}
     non_stdlib = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):

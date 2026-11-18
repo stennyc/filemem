@@ -2395,6 +2395,46 @@ def injection_gate_decision(item, injection_cfg) -> "tuple[str, Optional[str]]":
     return ("allow", None)
 
 
+# ── 2026-11-18 P0 read-side caches (owner-approved zero-recall-diff) ─────
+# Env kill-switch + canary A/B leg: FILEMEM_PERF_CACHE=off (or 0/false)
+# disables every filemem read-side cache (axis cache, aliases, graph file,
+# episodic incremental leg) — the hot face falls back to the legacy
+# per-call rebuild at the old cost, byte-identical results.
+def _perf_cache_enabled() -> bool:
+    return os.environ.get("FILEMEM_PERF_CACHE", "on").strip().lower() \
+        not in ("off", "0", "false")
+
+
+def _episodic_only_sig_delta(old_sig: Optional[tuple], new_sig: Optional[tuple],
+                             episodic_dir) -> bool:
+    """True iff EVERY signature part that changed between old_sig and
+    new_sig is an episodic shard file under `episodic_dir` (the per-turn
+    session-append case the incremental leg targets). Everything else —
+    a memories/knowledge part moved, a part appeared/vanished outside the
+    episodic dir, or a 'corpus-scan-failed' bust tuple — forces the full
+    rebuild (byte-identical to pre-cache behavior). Pure stat metadata:
+    zero content read."""
+    if not isinstance(old_sig, tuple) or not isinstance(new_sig, tuple):
+        return False
+    # the fail-soft bust tuple is the FLAT ("corpus-scan-failed", ts) pair
+    # (_corpus_signature's OSEA leg) — never an episodic delta
+    for sig in (old_sig, new_sig):
+        if isinstance(sig, tuple) and len(sig) == 2 \
+                and isinstance(sig[0], str) \
+                and sig[0].startswith("corpus-scan-failed"):
+            return False
+    try:
+        root = str(episodic_dir).replace("/", os.sep) + os.sep
+    except Exception:
+        return False
+    old_map = {part[0]: (part[1], part[2]) for part in old_sig}
+    new_map = {part[0]: (part[1], part[2]) for part in new_sig}
+    changed = [path for path in set(old_map) | set(new_map)
+               if old_map.get(path) != new_map.get(path)]
+    return bool(changed) and all(
+        str(path).replace("/", os.sep).startswith(root) for path in changed)
+
+
 class MemoryItem:
     """A single memory item with tiered storage.
 
@@ -10354,15 +10394,45 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
     # MISSING file or CORRUPT JSON returns None -> build_search_axes
     # degrades to the two-axis SA2-3 behavior (fail-soft gate; a bad
     # graph must never break the host turn).
+    def _graph_file_key(self) -> Optional[tuple]:
+        """(path, mtime_ns, size) of graph.json — the axes-cache graph leg:
+        a background rebuild lands a new mtime ⇒ key miss ⇒ the cached
+        graph statics rebuild. None = no graph file (two-axis fail-soft
+        leg). Fail-soft: any stat hiccup -> None (cache simply bypassed).
+        2026-11-18 P0-F3."""
+        p = Path(getattr(self, "storage_dir", None) or "") / "graph.json" \
+            if getattr(self, "storage_dir", None) else None
+        if p is None:
+            return None
+        try:
+            st = p.stat()
+            return (str(p), st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
     def _load_graph(self) -> Optional[Dict[str, Any]]:
         p = Path(getattr(self, "storage_dir", None) or "") / "graph.json" \
             if getattr(self, "storage_dir", None) else None
         if p is None or not p.is_file():
             return None
+        # 2026-11-18 P0-F3: mtime+size gate — a steady graph.json costs one
+        # stat per search instead of a full JSON parse. The gate can only
+        # shorten the read; same file bytes ⇒ same dict ⇒ zero recall diff.
+        # Corrupt/non-dict reads are NEVER cached (re-read every call, as
+        # today); FILEMEM_PERF_CACHE=off bypasses the gate.
+        key = self._graph_file_key()
+        cached = getattr(self, "_graph_file_cache", None)
+        if key is not None and _perf_cache_enabled() \
+                and cached is not None and cached[0] == key:
+            return cached[1]
         try:
             with open(p, encoding="utf-8") as f:
                 g = json.load(f)
-            return g if isinstance(g, dict) else None
+            if isinstance(g, dict):
+                if key is not None:
+                    self._graph_file_cache = (key, g)
+                return g
+            return None
         except (json.JSONDecodeError, OSError):
             return None  # corrupt graph = no graph, not a crash
 
@@ -10604,10 +10674,27 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         table must never break the search path — 不炸宿主). Shape:
         {"topics": {<canonical_topic>: {"aliases": [...], "source":
         "llm|human", "ts": ...}}, "ts": ...} — absent keys are tolerated by
-        every consumer (the table is read through .get)."""
+        every consumer (the table is read through .get).
+
+        2026-11-18 P0-F2: mtime+size gate — the alias table is written only
+        by the low-frequency LLM mining face, yet the read face paid a full
+        263KB JSON parse on every search. Same content ⇒ same parse ⇒ zero
+        recall diff; a mining write lands a new mtime ⇒ immediate invalid.
+        Corrupt/non-dict reads are NOT cached (re-read every call, as
+        today). FILEMEM_PERF_CACHE=off bypasses the gate."""
         p = self.storage_dir / "aliases.json"
         if not p.exists():
             return {}
+        key = None
+        if _perf_cache_enabled():
+            try:
+                _st = p.stat()
+                key = (str(p), _st.st_mtime_ns, _st.st_size)
+                cached = getattr(self, "_aliases_cache", None)
+                if cached is not None and cached[0] == key:
+                    return cached[1]
+            except OSError:
+                key = None
         try:
             with open(p, encoding="utf-8") as f:
                 data = json.load(f)
@@ -10615,12 +10702,16 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             logger.warning(
                 f"FileMem: aliases.json unreadable ({e}), treating as empty "
                 f"(fail-soft, native keyword search)")
+            self._aliases_cache = None  # unreadable: keep re-reading (legacy)
             return {}
         if not isinstance(data, dict):
             logger.warning(
                 "FileMem: aliases.json top level is not an object, "
                 f"treating as empty (fail-soft, got {type(data).__name__})")
+            self._aliases_cache = None
             return {}
+        if key is not None:
+            self._aliases_cache = (key, data)
         return data
 
     def _expand_query_with_aliases(self, query: str) -> str:
@@ -10715,8 +10806,34 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         cached = getattr(self, "_corpus_pool_cache", None)
         if cached is not None and getattr(self, "_corpus_pool_sig", None) == sig:
             return list(cached)  # shallow copy: caller filters freely
+        # 2026-11-18 P0-F4 (safe variant): episodic-only delta leg. The
+        # flat pool assembly order is fixed:
+        # [memories items | episodic items | knowledge items]. Per-turn
+        # session appends touch ONLY the episodic shard files, which bust
+        # the whole-corpus signature every turn (the legacy full rebuild
+        # was ~65ms/turn). When the moved parts are episodic-only, rebuild
+        # just that section — byte-identical to a full rebuild (same
+        # section functions, same order, same filters), near-zero cost.
+        # Anything else (memories/knowledge moved, cold cache) falls to the
+        # full rebuild below. FILEMEM_PERF_CACHE=off keeps the legacy
+        # full-rebuild-on-any-change behavior.
+        old_sig = getattr(self, "_corpus_pool_sig", None)
+        secs = getattr(self, "_corpus_pool_sections", None)
+        if (cached is not None and secs is not None and sig is not None
+                and old_sig is not None and sig is not old_sig
+                and _perf_cache_enabled()
+                and _episodic_only_sig_delta(old_sig, sig, self.episodic_dir)):
+            n_mem, _n_epi, _n_know = secs
+            episodic_items = self._load_episodic_pool(include_fixture=False)
+            pool = (list(cached[:n_mem]) + list(episodic_items)
+                    + list(cached[n_mem + _n_epi:]))
+            self._corpus_pool_cache = pool
+            self._corpus_pool_sig = sig
+            self._corpus_pool_sections = (n_mem, len(episodic_items), _n_know)
+            return list(pool)
         # -- rebuild (cold / invalidated) ----------------------------------
         pool: List[Dict] = []
+        memories_items: List[Dict] = []
         for shard_type in MEMORY_TYPES:
             mem_file = self.memories_dir / f"{shard_type}.json"
             if not mem_file.exists():
@@ -10725,17 +10842,24 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             # (identical to the pre-D1 inline scan).
             with self._shard_lock(mem_file):
                 items = self._read_memories_file(mem_file)
-            pool.extend(
+            memories_items.extend(
                 item for item in items
                 if isinstance(item, dict) and not MemoryItem.from_dict(item).is_expired())
+        pool.extend(memories_items)
         # M4 cross-session recall: the episodic layer is in the pool.
-        pool.extend(self._load_episodic_pool(include_fixture=False))
+        episodic_items = self._load_episodic_pool(include_fixture=False)
+        pool.extend(episodic_items)
         # Gold knowledge layer: active entries, tier-boosted.
+        knowledge_items: List[Dict] = []
         for k in self._load_knowledge_pool():
             k["knowledge_tier_boost"] = True
+            knowledge_items.append(k)
             pool.append(k)
         self._corpus_pool_cache = pool
         self._corpus_pool_sig = sig
+        self._corpus_pool_sections = (len(memories_items),
+                                      len(episodic_items),
+                                      len(knowledge_items))
         return list(pool)
 
     def search_memories(self, query: str, limit: int = 5, min_score: float = 0.3,
@@ -11054,29 +11178,43 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 # current graph (fail-soft, zero-blocking).
                 self._graph_pull_if_stale()
                 _graph_obj = self._load_graph()
+                # 2026-11-18 P0-F1/F3: opt into the read-side axis cache
+                # (corpus sig + filtered pool ids + graph file key inside
+                # build_search_axes). Steady corpus + steady pool => the
+                # ~100ms BM25 rebuild collapses to a cache hit; any corpus
+                # change busts the key (byte-identical results either way).
                 fused_scores = build_search_axes(
                     all_memories, query_for_axes, decay=self._decay,
-                    graph=_graph_obj, now=_f2_anchor)
+                    graph=_graph_obj, now=_f2_anchor,
+                    corpus_sig=getattr(self, "_corpus_pool_sig", None),
+                    graph_key=self._graph_file_key())
                 # C1-M2 (owner 2026-11-13): observability-only — measure the
                 # graph axis's MARGINAL contribution (1-hop neighbors a
                 # keyword/BM25 axis alone would not have surfaced). Pure
                 # logger, zero behavior change, fail-soft. Both read-memory
                 # faces (auto _prefetch_body + explicit _recall_and_format)
                 # funnel through here, tagged via obs_face.
-                try:
-                    from search_index import graph_marginal_neighbors
-                    _marg = (graph_marginal_neighbors(
-                        _graph_obj, query_for_axes, all_memories)
-                        if query_for_axes else 0)
-                    logger.info(
-                        "C1-GRAPH-MARGINAL face=%s sid=%s marg=%d "
-                        "graph_edges=%d",
-                        obs_face or "unmarked",
-                        getattr(self, "session_id", "default"), _marg,
-                        len((_graph_obj or {}).get("edges") or []))
-                except Exception as _ge:  # pragma: no cover - observability
-                    logger.debug(f"FileMem: C1-M2 marginal-neighbor "
-                                  f"diagnostic skipped: {_ge}")
+                # 2026-11-18 P0-F3: the pass is GATED ON THE SINK — its
+                # result feeds ONLY the logger.info below, so when the
+                # logger's effective level doesn't emit INFO (the runtime
+                # default: WARNING) the duplicate O(E)+tokenize pass is
+                # skipped entirely. Byte-identical behavior: an INFO-disabled
+                # log line is dropped at the sink anyway.
+                if logger.isEnabledFor(logging.INFO):
+                    try:
+                        from search_index import graph_marginal_neighbors
+                        _marg = (graph_marginal_neighbors(
+                            _graph_obj, query_for_axes, all_memories)
+                            if query_for_axes else 0)
+                        logger.info(
+                            "C1-GRAPH-MARGINAL face=%s sid=%s marg=%d "
+                            "graph_edges=%d",
+                            obs_face or "unmarked",
+                            getattr(self, "session_id", "default"), _marg,
+                            len((_graph_obj or {}).get("edges") or []))
+                    except Exception as _ge:  # pragma: no cover - observability
+                        logger.debug(f"FileMem: C1-M2 marginal-neighbor "
+                                      f"diagnostic skipped: {_ge}")
             except Exception as e:  # pragma: no cover - fail-soft gate
                 logger.warning(f"FileMem: RRF axes failed, legacy keyword scoring: {e}")
                 fused_scores = None
