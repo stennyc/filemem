@@ -5027,6 +5027,54 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     f"FileMem: O1 auto-face fold cut {_o1_folded} item(s) "
                     f"(superseded / validity-lapsed)")
             results = _o1_kept
+        # P3 (S5 host face, reactivation model): the auto-inject face (prefetch)
+        # is where the owner scoped expiry filtering + background auto-reclaim
+        # (owner 2026-11-19 ruling: retrieve = explicit search = full pool
+        # UN-filtered; expiry filtering + background auto-reclaim happen ONLY
+        # on the P2 auto-recall face = this prefetch path). Two steps, both
+        # fail-soft, zero touch to the EXPLICIT search face:
+        #
+        # (1) BACKGROUND AUTO-RECLAIM (S5): any archive-cascade hit that
+        # surfaced into this auto pool (S3 fold stamped reclaimed=True) is a
+        # "expired/archived source row that the background recall just hit" —
+        # write a staging projection (reclaim_reason=auto_retrieve) so the
+        # source floats in the 浮出层 for the TTL window. The data face
+        # (S2) already staged explicit-search hits; this is the background
+        # auto face (owner: 关联自动捞 / 背景 prefetch 自动捞).
+        # (2) AUTO-FACE EXPIRY FILTER: live-pool rows whose expires_at is past
+        # leave the auto-inject face (the source still exists on disk + in the
+        # archive jsonl; the row just stops being AUTO-pumped — it can still be
+        # reached via explicit search or via a staging projection that
+        # surfaced it). reclaimed=True rows are NEVER filtered here: they are
+        # the staging-浮出层 entries, the sole entry point for the
+        # already-expired source (owner §3: 源已过期被滤出活池, 暂存投影是
+        # 唯一入口 -> 天然排前).
+        _p3_staged = 0
+        _p3_expired_cut = 0
+        if results:
+            _arch_hit = [r for r in results if r.get("reclaimed")]
+            if _arch_hit:
+                _p3_staged = self._reclaim_from_archive(
+                    _arch_hit, reason="auto_retrieve")
+            # (2) live-pool expiry filter on the auto face ONLY
+            _now_iso = _utcnow().isoformat()
+            _kept = []
+            for r in results:
+                if r.get("reclaimed"):
+                    _kept.append(r)  # staging 浮出层 row: never filter
+                    continue
+                _exp = (r.get("expires_at") or "").strip()
+                if _exp and _exp < _now_iso:
+                    _p3_expired_cut += 1
+                    continue  # expired live-pool row leaves the auto face
+                _kept.append(r)
+            results = _kept
+            if _p3_staged or _p3_expired_cut:
+                logger.info(
+                    f"FileMem: P3 auto-face reactivation — background "
+                    f"auto-reclaim {_p3_staged} staging projection(s), "
+                    f"expired-live-pool fold {_p3_expired_cut} "
+                    f"(retrieve face stays unfiltered)")
         # SESSION_ISOLATION_V2 A: confirmed-gate on the auto-inject face.
         # Runs UNCONDITIONALLY after the O1 fold (not nested under
         # `if results:`) so it fires even when O1 emptied the pool — an
@@ -11887,12 +11935,17 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         slow_paths = _filter_type(self._list_archive_buckets(0))
         return _score_paths(slow_paths), None, False
 
-    def _reclaim_from_archive(self, rows: List[Dict[str, Any]]) -> int:
+    def _reclaim_from_archive(self, rows: List[Dict[str, Any]],
+                              reason: str = "explicit_search") -> int:
         """S2 hook: write staging projections for the hit archive rows
         (fail-soft inside; returns the number of projections written).
         source_profile is copied from the source row's metadata, with
-        the provider's own source_profile as the fallback — mirroring
-        the Go side exactly."""
+        the provider's own source_profile as the fallback — mirroring the
+        Go side exactly. reason tags the staging projection's
+        reclaim_reason (explicit_search = the EXPLICIT retrieve face;
+        auto_retrieve = the P3 background auto-recall face, owner S5);
+        default explicit_search keeps the data-face call sites
+        byte-stable."""
         n = 0
         for r in rows:
             meta = r.get("metadata") or {}
@@ -11907,7 +11960,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 src_id=str(r.get("id", "")),
                 src_shard=str(r.get("type", "")),
                 content=str(r.get("content", "")),
-                reason="explicit_search",
+                reason=reason,
                 source_profile=src_profile,
                 salience=sal,
             )
