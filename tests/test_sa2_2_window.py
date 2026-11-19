@@ -473,6 +473,9 @@ def test_init_top_level_import_audit():
         "uuid",  # P1-3/P2 audit trace_id + dedup ledger (_audit_explicit_search/_dedup_ledger)
         "subprocess",  # production default reconcile verifiers (git cat-file / rev-parse / pytest runner)
         "dep_bootstrap",  # cross-platform HERMES_HOME resolver (6041faf)
+        "calendar",  # S2/S3 reactivation model (Go commit 648c497): _shift_months
+                     # month-shifts (Go AddDate semantics) for the anchor +
+                     # fast-window label math
     }
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.Import):

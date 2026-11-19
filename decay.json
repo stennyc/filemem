@@ -30,6 +30,8 @@
     "graph_max_node_share": 0.6667
   },
   "memories_rotate_mb": 1,
+  "reclaim_fast_months": 3,
+  "reclaim_ttl_days": 3,
   "consolidation": {
     "max_llm_per_tick": 10,
     "supersede_max_confirms": 5,

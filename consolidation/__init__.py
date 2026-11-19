@@ -118,6 +118,14 @@ DECAY_DEFAULTS = {
     # O7: semantic-layer (memories/*.json) active-file size (MB) at which the
     # 4h sweeper sweeps expired auto-cleanup rows into monthly JSONL archives.
     "memories_rotate_mb": 1,
+    # S2/S3 reactivation model (Go commit 648c497 dual-side knobs):
+    # reclaim_fast_months — the fast-recall window over the archive
+    # buckets <type>_<YYYY-MM>.jsonl (last N months incl. the current
+    # one; 0/negative = fast tier off, slow/full scan only, default 3).
+    # reclaim_ttl_days — the staging projection dwell window for
+    # memories/reclaimed.json rows (clamped to 3..5, default 3).
+    "reclaim_fast_months": 3,
+    "reclaim_ttl_days": 3,
     # D4(a): LLM offline consolidation at the session-boundary hook layer.
     # max_llm_per_tick = burst-bounded cap on how many unscored episodic
     # entries get LLM-rescored per tick; overflow rolls to the next boundary.

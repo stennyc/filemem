@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 import subprocess
 import json
 import math
@@ -10960,6 +10961,21 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 f"invalid mem_type {mem_type!r}: expected None/'all' or one "
                 f"of {MEMORY_TYPES}")
         _type_sliced = mem_type in MEMORY_TYPES
+        # S2/S3 reactivation model (Go commit 648c497 alignment):
+        # the LIVE pool is intentionally UN-filtered — expired rows stay
+        # in (the explicit-search face must be able to recall/reactivate
+        # them; expiry filtering belongs to the auto-recall face only).
+        # After pool assembly (below, post lineage split + window) the
+        # ARCHIVE BUCKETS cascade in: memories/<type>_<YYYY-MM>.jsonl
+        # rows recovered from the archive become result rows of the
+        # SOURCE MEMORY itself with `reclaimed=True` (B口径), and each
+        # hit archive row writes a staging projection into
+        # memories/reclaimed.json (S2 hook, fail-soft; live-pool rows
+        # — including expired ones — are never staged). The fold is a
+        # PURE GROWTH over the archive layer: with zero archive buckets
+        # (no sweep has ever run / fresh scratch root) it is a no-op and
+        # every existing golden byte-identity test stays green.
+        _s3_cascade_fold = bool(query) and not include_fixture
         # D1: pull the raw corpus from the provider-level cache instead of a
         # per-call full re-scan. Two paths:
         #   * _type_sliced  -> a concrete-category slice opens ONLY its own
@@ -11104,6 +11120,13 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             all_memories = filter_pool_by_window(all_memories, window)
             _lineage_superseded = filter_pool_by_window(
                 _lineage_superseded, window)
+            # S2/S3: a BOUNDED window is a deliberate time filter — the
+            # archive cascade must not leak out-of-window rows into the
+            # result (the window IS the decision; the anchor path is the
+            # cascade's own time-filtering for windowless queries).
+            # window=None -> the fold stays armed (the default explicit
+            # face; byte-identical pre-S3 behavior when no bucket exists).
+            _s3_cascade_fold = False
 
         lam = float(self._decay.get("lambda_days", 0.05))
         # F2: pin the decay anchor. `time_anchor` (aware UTC) makes the axis
@@ -11155,6 +11178,17 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         except Exception as e:  # pragma: no cover - fail-soft gate
             logger.warning(f"FileMem: alias expansion failed, native query: {e}")
             query_for_axes = query
+
+        # S3 fold (B口径): the archive-bucket cascade rows enter the pool
+        # BEFORE the gate/RRF — they ride the SAME relevance machinery as
+        # the live rows (no new ranking engine), marked reclaimed=True.
+        # Fail-soft: a cascade hiccup degrades to the live-pool-only
+        # result (the fold itself never raises).
+        if _s3_cascade_fold:
+            self._archive_cascade_fold(
+                query, all_memories,
+                mem_type if _type_sliced else None,
+                query_for_axes)
 
         query_words = set(query_for_axes.lower().split())
 
@@ -11351,6 +11385,574 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
     def _memories_rotate_mb(self) -> float:
         """O7 active-file size (MB) at which expired auto-cleanup rows sweep out."""
         return float(self._decay.get("memories_rotate_mb", 1) or 1)
+
+    # ------------------------------------------------------------------
+    # S2/S3 reactivation model (dual-side alignment with filemem-dsh Go
+    # commit 648c497, REACTIVATION_DESIGN.md §1c): archive-bucket
+    # two-level cascade retrieval + time anchoring + staging projection
+    # (reclaimed.json) fold-in.
+    #
+    # Truth model (owner-verified 2026-11-19, same as the Go side):
+    #   - sweep_memories_expired moves expired auto_cleanup rows OUT of the
+    #     live memories/*.json shards and APPENDS them to
+    #     memories/<type>_<YYYY-MM>.jsonl (append-only, full 15-field row,
+    #     bucketed by the row's created_at month). Those buckets are the
+    #     archive read corpus here.
+    #   - _archive_cascade_recover runs the two-level cascade:
+    #       * time-anchored query -> scan ONLY the target month +/-1
+    #         buckets (union hit), no cascade;
+    #       * pure-entity query -> FAST tier (last fastMonths buckets,
+    #         inclusive of the current month) first; a hit there returns
+    #         immediately; a miss falls to the SLOW tier = FULL scan of
+    #         every bucket ("反复想起的记忆变快").
+    #   - a hit row from an archive bucket gets a READ-ONLY PROJECTION in
+    #     the staging type (memories/reclaimed.json, S1 PutReclaim):
+    #     source_profile + salience copied from the source row,
+    #     reason=explicit_search, ttl=reclaim_ttl_days (default 3, 3-5
+    #     clamp). Same src_id un-expired -> RENEW (refresh expires_at),
+    #     no duplicate row. ARCHIVE JSONL FILES ARE NEVER WRITTEN
+    #     (zero-diff red line), and live-pool rows — including expired
+    #     ones — are NOT staged (暂存门类只为归档行服务).
+    #   - B口径 fold-in: the result row is the SOURCE MEMORY itself
+    #     (same 15-field shape) with `reclaimed=True`; the projection
+    #     id / src_id are never exposed.
+    #
+    # Fail-soft contract (owner red line, mirrors Go): a missing / corrupt
+    # archive bucket, a corrupt staging file, or a staging write failure
+    # NEVER breaks retrieval — the cascade degrades to live-pool-only
+    # results, and the staging miss only logs a warning.
+    # ------------------------------------------------------------------
+
+    _RECLAIM_BUCKET_RE = re.compile(r"^(?P<type>[a-z]+)_(?P<month>\d{4}-\d{2})\.jsonl$")
+    _ANCHOR_YEAR_MONTH_RE = re.compile(r"(\d{4})[-/.年](\d{1,2})")
+    _ANCHOR_MONTHS_AGO_RE = re.compile(r"([0-9]+)\s*个?月?前")
+    _ANCHOR_WEEKS_AGO_RE = re.compile(r"([0-9]+)\s*周前")
+    _ANCHOR_DAYS_AGO_RE = re.compile(r"([0-9]+)\s*天前")
+    # Chinese numerals (digits remain the primary path; 一二三... as option)
+    _ANCHOR_CN_MONTHS_AGO_RE = re.compile(r"([一二两三四五六七八九十]+)\s*个月?前")
+    _ANCHOR_CN_WEEKS_AGO_RE = re.compile(r"([一二两三四五六七八九十]+)\s*周前")
+    _ANCHOR_CN_DAYS_AGO_RE = re.compile(r"([一二两三四五六七八九十]+)\s*天前")
+    _CN_NUMERAL_DIGITS = {
+        "一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5,
+        "六": 6, "七": 7, "八": 8, "九": 9,
+    }
+
+    def _reclaim_fast_months(self) -> int:
+        """S2: fast-recall window (how many back the recent archive
+        buckets reach, including the current month). Decay knob
+        `reclaim_fast_months`, default 3; 0/absent/negative = full-only
+        (the fast tier degenerates to the slow scan)."""
+        v = self._decay.get("reclaim_fast_months", 3)
+        try:
+            return max(0, int(v))
+        except (TypeError, ValueError):
+            return 3
+
+    def _reclaim_ttl_days(self) -> int:
+        """S1: staging dwell window in days. Decay knob
+        `reclaim_ttl_days`, default 3, clamped to [3, 5] (owner ruling:
+        3-5 天最合适, 取 3)."""
+        try:
+            v = int(self._decay.get("reclaim_ttl_days", 3))
+        except (TypeError, ValueError):
+            v = 3
+        return min(5, max(3, v))
+
+    @classmethod
+    def parse_time_anchor(cls, query: str) -> Tuple[Optional[str], bool]:
+        """ParseTimeAnchor (dual-side contract, Go archive.go verbatim).
+
+        Resolves a relative/absolute time reference in the query to the
+        target archive-bucket month `YYYY-MM`:
+          * ABSOLUTE: 4-digit year + 1-2-digit month
+            ('2026-10' / '2026/10' / '2026.10' / '2026年10月') -> that
+            YYYY-MM, directly. Wins over every relative rule.
+          * RELATIVE (now-based, UTC):
+              'N 个月前' / '前 N 个月' / 'N 月前' -> now minus N months
+              'N 周前' -> now minus N*7 days
+              'N 天前' -> now minus N days
+              '上个月'  -> now minus 1 month
+              '去年'    -> now minus 12 months
+            N is parsed from digits [0-9]; Chinese numerals 一二三...
+            are additionally accepted (optional, digits remain primary).
+          * FAIL-SOFT: nothing parseable -> (None, False) — the caller
+            MUST fall back to the two-level cascade (never guess a
+            month).
+
+        The caller matches the target with +/-1-month bucket tolerance
+        (a hit in any of the 3 buckets is a union hit).
+        """
+        now = _utcnow()
+        # 1) ABSOLUTE: explicit 4-digit year + month wins.
+        m = cls._ANCHOR_YEAR_MONTH_RE.search(query or "")
+        if m:
+            month = int(m.group(2))
+            if 1 <= month <= 12:
+                return f"{m.group(1)}-{month:02d}", True
+        # 2) RELATIVE: N 个月 (its own N; bare 上个月 does not match it,
+        #    so N-月 first, then bare 上个月 — same order as the Go side).
+        m = cls._ANCHOR_MONTHS_AGO_RE.search(query)
+        if m:
+            return cls._shift_months(now, -int(m.group(1))).strftime("%Y-%m"), True
+        m = cls._ANCHOR_CN_MONTHS_AGO_RE.search(query)
+        if m:
+            return cls._shift_months(now, -cls._cn_numeral(m.group(1))).strftime("%Y-%m"), True
+        if "上个月" in query:
+            return cls._shift_months(now, -1).strftime("%Y-%m"), True
+        m = cls._ANCHOR_WEEKS_AGO_RE.search(query)
+        if m:
+            t = now - timedelta(weeks=int(m.group(1)))
+            return t.strftime("%Y-%m"), True
+        m = cls._ANCHOR_CN_WEEKS_AGO_RE.search(query)
+        if m:
+            t = now - timedelta(weeks=cls._cn_numeral(m.group(1)))
+            return t.strftime("%Y-%m"), True
+        m = cls._ANCHOR_DAYS_AGO_RE.search(query)
+        if m:
+            t = now - timedelta(days=int(m.group(1)))
+            return t.strftime("%Y-%m"), True
+        m = cls._ANCHOR_CN_DAYS_AGO_RE.search(query)
+        if m:
+            t = now - timedelta(days=cls._cn_numeral(m.group(1)))
+            return t.strftime("%Y-%m"), True
+        if "去年" in query:
+            return cls._shift_months(now, -12).strftime("%Y-%m"), True
+        # 3) FAIL-SOFT: no time reference -> no anchor (never guess).
+        return None, False
+
+    @staticmethod
+    def _shift_months(dt: datetime, months: int) -> datetime:
+        """Add *months* (may be negative) to a datetime, clamping the day
+        to the target month's last day (Go AddDate semantics)."""
+        m = dt.month - 1 + months
+        y, m2 = dt.year + m // 12, m % 12 + 1
+        day = min(dt.day, calendar.monthrange(y, m2)[1])
+        return dt.replace(year=y, month=m2, day=day)
+
+    @classmethod
+    def _cn_numeral(cls, s: str) -> int:
+        """Parse a Chinese numeral 1..99 (一二三...九十九, 十=10, 十五=15,
+        二十=20, 二十一=21). Unknown token -> 0 (the rule simply does
+        not fire; the next pattern / fail-soft path takes over)."""
+        total = 0
+        cur = 0
+        for ch in s:
+            if ch == "十":
+                total += (10 if cur == 0 else cur * 10)
+                cur = 0
+            else:
+                d = cls._CN_NUMERAL_DIGITS.get(ch)
+                if d is None:
+                    return 0
+                cur = d
+        return total + cur
+
+    @classmethod
+    def _month_tolerance(cls, target: str) -> List[str]:
+        """Target month plus its -1/+1 neighbours (the bucket-match union
+        window). Malformed target -> [target] only (fail-soft)."""
+        try:
+            y, mo = target.split("-")
+            y, mo = int(y), int(mo)
+            if not (1 <= mo <= 12):
+                return [target]
+        except (AttributeError, ValueError):
+            return [target]
+        out, seen = [], set()
+        for dm in (-1, 0, 1):
+            m2 = mo + dm
+            y2 = y + (m2 - 1) // 12
+            m2 = (m2 - 1) % 12 + 1
+            label = f"{y2:04d}-{m2:02d}"
+            if label not in seen:
+                seen.add(label)
+                out.append(label)
+        return out
+
+    def _reclaim_path(self) -> Path:
+        """memories/reclaimed.json — the S1 staging projection file
+        (a NEW type, deliberately outside the 6-way MEMORY_TYPES local
+        pool so it never leaks into the main retrieve pool on its own;
+        S3 folds it in explicitly)."""
+        return self.memories_dir / "reclaimed.json"
+
+    def _reclaim_lock_path(self) -> Path:
+        return self._reclaim_path().with_name("reclaimed.json.lock")
+
+    def _read_reclaims(self) -> List[Dict[str, Any]]:
+        """Load all staging projections. Missing file -> [] (fail-soft);
+        corrupt file -> [] + a loud warning (the read face must keep
+        working; the next successful write repairs the file)."""
+        p = self._reclaim_path()
+        if not p.exists():
+            return []
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(
+                f"FileMem: reclaimed.json unreadable ({e}); treating as "
+                f"empty (fail-soft, the read face keeps working)")
+            return []
+        if isinstance(data, dict):
+            data = data.get("rows") or []
+        return [r for r in (data or []) if isinstance(r, dict)]
+
+    def _write_reclaims(self, rows: List[Dict[str, Any]]) -> None:
+        """Atomically replace the projection array (tmp + os.replace under
+        the reclaim shard lock — no torn lines across co-writing
+        profiles)."""
+        p = self._reclaim_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(f".reclaimed.json.tmp.{os.getpid()}")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False)
+        os.replace(tmp, p)
+
+    @staticmethod
+    def _reclaim_ts_ok(ts: str) -> bool:
+        """True when ts (RFC3339) parses; unparseable = treated as LIVE
+        (fail-open: never physically delete a row we cannot date)."""
+        if not ts:
+            return True
+        try:
+            datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            return True
+        except (ValueError, TypeError):
+            return True
+
+    def _reclaim_is_live(self, row: Dict[str, Any]) -> bool:
+        exp = row.get("expires_at") or ""
+        if not exp:
+            return True  # undated projection: keep it (fail-open)
+        try:
+            dt = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return datetime.now(timezone.utc) < dt
+        except (ValueError, TypeError):
+            return True  # undatable: fail-open keep
+
+    def put_reclaim(self, src_id: str, src_shard: str, content: str,
+                    reason: str = "explicit_search",
+                    source_profile: str = "",
+                    salience: float = 0.5) -> Optional[Dict[str, Any]]:
+        """S1 PutReclaim: write (or RENEW) one staging projection for
+        src_id.
+
+          * new src_id -> a fresh projection,
+            id = recl_<srcid>_<UTC ts>, expires_at = now +
+            reclaim_ttl_days.
+          * existing un-expired projection for the same src_id -> RENEW
+            (refresh expires_at from NOW), NOT a duplicate row
+            (idempotent re-reclaim = extension, not a new row).
+          * expired / malformed existing projection -> replaced in place.
+
+        Fail-soft: any I/O hiccup logs a warning and returns None — the
+        retrieval that triggered this must still complete (a staging
+        miss never breaks the recall face).
+        """
+        if not src_id:
+            return None
+        if not reason:
+            reason = "explicit_search"
+        now = datetime.now(timezone.utc)
+        expires = (now + timedelta(days=self._reclaim_ttl_days())).isoformat()
+        reclaimed_at = now.isoformat()
+        try:
+            with self._shard_lock(self._reclaim_lock_path()):
+                rows = self._read_reclaims()
+                new_row: Optional[Dict[str, Any]] = None
+                for i, r in enumerate(rows):
+                    if r.get("src_id") != src_id:
+                        continue
+                    if self._reclaim_is_live(r):
+                        # still live -> renew (extend the dwell window
+                        # from NOW; the row itself stays, no dup).
+                        r["expires_at"] = expires
+                        r["reclaimed_at"] = reclaimed_at
+                        r["reclaim_reason"] = reason
+                        if source_profile:
+                            r["source_profile"] = source_profile
+                        new_row = r
+                    else:
+                        # expired -> replace in place (fresh projection).
+                        new_row = {
+                            "id": f"recl_{src_id}_{now.strftime('%Y%m%d%H%M%S')}",
+                            "src_id": src_id,
+                            "src_shard": src_shard,
+                            "content": content,
+                            "reclaimed_at": reclaimed_at,
+                            "expires_at": expires,
+                            "reclaim_reason": reason,
+                            "source_profile": source_profile,
+                            "salience": salience,
+                        }
+                        rows[i] = new_row
+                    break
+                if new_row is None:
+                    new_row = {
+                        "id": f"recl_{src_id}_{now.strftime('%Y%m%d%H%M%S')}",
+                        "src_id": src_id,
+                        "src_shard": src_shard,
+                        "content": content,
+                        "reclaimed_at": reclaimed_at,
+                        "expires_at": expires,
+                        "reclaim_reason": reason,
+                        "source_profile": source_profile,
+                        "salience": salience,
+                    }
+                    rows.append(new_row)
+                self._write_reclaims(rows)
+            return new_row
+        except Exception as e:  # fail-soft: staging never breaks retrieval
+            logger.warning(f"FileMem: reclaim put {src_id!r} failed: {e}")
+            return None
+
+    def clean_reclaims(self) -> List[str]:
+        """S1 CleanReclaims: physically remove projections whose
+        expires_at < now (safe: the source memory still lives in its
+        shard / archive and can be re-reclaimed). Returns removed ids.
+        Unparseable expiry is kept (fail-open). Fail-soft: a read /
+        write hiccup returns [] (never breaks the caller)."""
+        try:
+            with self._shard_lock(self._reclaim_lock_path()):
+                rows = self._read_reclaims()
+                kept, removed = [], []
+                for r in rows:
+                    if self._reclaim_is_live(r):
+                        kept.append(r)
+                    else:
+                        removed.append(str(r.get("id", "")))
+                if removed:
+                    self._write_reclaims(kept)
+                return removed
+        except Exception as e:
+            logger.warning(f"FileMem: reclaim clean failed: {e}")
+            return []
+
+    def _list_archive_buckets(self, months: int) -> List[Path]:
+        """S2: the archive jsonl bucket paths under
+        memories/<type>_<YYYY-MM>.jsonl. months<=0 => ALL buckets
+        (slow/full scan); months>0 => only the buckets whose month is
+        within the last `months` (including the current month) — the
+        fast-recall window. Dir absent / unreadable -> [] (fail-soft:
+        fresh scratch root has no buckets)."""
+        mem_dir = self.memories_dir
+        try:
+            entries = sorted(mem_dir.iterdir())
+        except (OSError, AttributeError):
+            return []
+        now = _utcnow()
+        want: List[str] = []
+        if months > 0:
+            for i in range(months):
+                want.append(self._shift_months(now, -i).strftime("%Y-%m"))
+        out: List[Path] = []
+        for e in entries:
+            try:
+                if e.is_dir() or not e.name.endswith(".jsonl"):
+                    continue
+                m = self._RECLAIM_BUCKET_RE.match(e.name)
+                if not m:
+                    continue
+                if want and m.group("month") not in want:
+                    continue
+                out.append(e)
+            except OSError:
+                continue  # one unreadable entry never blocks the rest
+        return out
+
+    @classmethod
+    def _bucket_month(cls, path: Path) -> str:
+        m = cls._RECLAIM_BUCKET_RE.match(Path(path).name)
+        return m.group("month") if m else ""
+
+    def _read_archive_bucket(self, path: Path) -> List[Dict[str, Any]]:
+        """One archive bucket: one full 15-field memory row per line
+        (same schema as the live pool). Bad lines are SKIPPED
+        (fail-soft: a corrupt line never blocks the cascade); a
+        missing file -> [] (never an error out of the cascade)."""
+        rows: List[Dict[str, Any]] = []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if isinstance(r, dict) and r.get("id"):
+                        rows.append(r)
+        except OSError:
+            return []
+        return rows
+
+    def _archive_cascade_recover(self, query: str,
+                                 mem_type: Optional[str] = None,
+                                 query_words: Optional[List[str]] = None,
+                                 now: Optional[datetime] = None
+                                 ) -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
+        """S2: two-level archive cascade, best-score-first.
+
+          * time-anchored query (ParseTimeAnchor hit) -> scan ONLY the
+            target month +/-1 buckets (union), no cascade.
+          * pure-entity query -> FAST tier (last fastMonths buckets);
+            a hit there returns immediately; a miss falls to the SLOW
+            tier = FULL scan of every bucket ("反复想起的记忆变快").
+
+        Relevance = the SAME legacy machinery the live pool uses
+        (keyword-overlap gate + decayRank), so no new ranking engine is
+        introduced: an archive row is eligible iff ANY lower-cased query
+        word is a substring of its content; its score is
+        (hits/len(words)) * decayRank.
+        mem_type "" / "all" / None => all sweep types; otherwise only
+        that type's buckets (type-sliced queries see only their own
+        type). query_words (already alias-expanded + lower-cased) feeds
+        the gate; None re-derives them from the raw query.
+
+        Returns (rows, anchor_month, anchor_hit). Rows are FRESH COPIES
+        (callers may stamp `reclaimed` on them without touching the
+        on-disk archive — zero-diff red line).
+        """
+        words = [w for w in (query_words if query_words is not None
+                             else (query or "").lower().split()) if w]
+        if not words:
+            return [], None, False  # no keywords: nothing to recall
+        now = now or _utcnow()
+        lam = float((self._decay or {}).get("lambda_days", 0.05))
+        boost = float((self._decay or {}).get("salience_boost", 1.2))
+
+        def _decay_rank(item: Dict[str, Any]) -> float:
+            sal = float(item.get("salience", 0.5) or 0.0)
+            ref = int(item.get("reference_count", 0) or 0)
+            if ref >= 3:
+                sal = min(1.0, sal * boost)
+            ts = item.get("updated_at") or item.get("created_at") or ""
+            age_days = 0.0
+            if ts:
+                try:
+                    dt = datetime.fromisoformat(str(ts))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    age_days = max(0.0, (now - dt).total_seconds() / 86400.0)
+                except (ValueError, TypeError):
+                    age_days = 0.0
+            return sal * math.exp(-lam * age_days)
+
+        def _score_row(row: Dict[str, Any]) -> Optional[float]:
+            cl = str(row.get("content") or "").lower()
+            if not any(w in cl for w in words):
+                return None  # legacy gate: no query word in content
+            hits = sum(1 for w in words if w in cl)
+            return (hits / len(words)) * _decay_rank(row)
+
+        def _score_paths(paths: List[Path]) -> List[Dict[str, Any]]:
+            hits: List[Tuple[float, Dict[str, Any]]] = []
+            seen: set = set()
+            for p in paths:
+                for row in self._read_archive_bucket(p):
+                    rid = row.get("id")
+                    if not rid or rid in seen:
+                        continue
+                    seen.add(rid)
+                    sc = _score_row(row)
+                    if sc is not None:
+                        hits.append((sc, dict(row)))
+            hits.sort(key=lambda h: h[0], reverse=True)
+            return [r for _s, r in hits]
+
+        target, anchored = self.parse_time_anchor(query or "")
+        if anchored and target:
+            months = self._month_tolerance(target)
+            all_paths = [p for p in self._list_archive_buckets(0)
+                         if self._bucket_month(p) in months]
+            if mem_type and mem_type != "all":
+                all_paths = [p for p in all_paths
+                             if p.name.startswith(f"{mem_type}_")]
+            return _score_paths(all_paths), target, True
+
+        def _filter_type(paths: List[Path]) -> List[Path]:
+            if not mem_type or mem_type == "all":
+                return paths
+            return [p for p in paths if p.name.startswith(f"{mem_type}_")]
+
+        fast_paths = _filter_type(self._list_archive_buckets(
+            self._reclaim_fast_months()))
+        fast_rows = _score_paths(fast_paths)
+        if fast_rows:
+            return fast_rows, None, False  # fast hit: skip the slow sweep
+        slow_paths = _filter_type(self._list_archive_buckets(0))
+        return _score_paths(slow_paths), None, False
+
+    def _reclaim_from_archive(self, rows: List[Dict[str, Any]]) -> int:
+        """S2 hook: write staging projections for the hit archive rows
+        (fail-soft inside; returns the number of projections written).
+        source_profile is copied from the source row's metadata, with
+        the provider's own source_profile as the fallback — mirroring
+        the Go side exactly."""
+        n = 0
+        for r in rows:
+            meta = r.get("metadata") or {}
+            src_profile = meta.get("source_profile") or ""
+            if not src_profile:
+                src_profile = getattr(self, "source_profile", "") or ""
+            try:
+                sal = float(r.get("salience", 0.5) or 0.5)
+            except (TypeError, ValueError):
+                sal = 0.5
+            rr = self.put_reclaim(
+                src_id=str(r.get("id", "")),
+                src_shard=str(r.get("type", "")),
+                content=str(r.get("content", "")),
+                reason="explicit_search",
+                source_profile=src_profile,
+                salience=sal,
+            )
+            if rr is not None:
+                n += 1
+        return n
+
+    def _archive_cascade_fold(self, query: str,
+                              all_memories: List[Dict[str, Any]],
+                              mem_type: Optional[str],
+                              query_for_axes: str) -> None:
+        """S3: fold the archive cascade into the assembled live pool,
+        IN PLACE (all_memories is the fresh copy search_memories owns).
+
+        B口径: a hit archive row enters the pool as the SOURCE MEMORY
+        itself (same 15-field shape, deep copy so the on-disk archive is
+        never mutated) with `reclaimed=True` stamped on it; a row already
+        in the pool is NOT duplicated (dedupe by id — the live copy keeps
+        its reclaimed=False identity). Live-pool rows are never staged:
+        the staging door exists for archive rows only. The S2 hook writes
+        the projections BEFORE the fold; a fold with zero hits is a
+        no-op. Fail-soft end-to-end: any cascade / staging hiccup
+        degrades to the live-pool-only result (never raises).
+        """
+        try:
+            try:
+                words = [w for w in (query_for_axes or "").lower().split()
+                         if w]
+            except Exception:
+                words = None
+            cascade_rows, _anchor, _hit = self._archive_cascade_recover(
+                query, mem_type=mem_type, query_words=words)
+            if not cascade_rows:
+                return
+            self._reclaim_from_archive(cascade_rows)  # S2 hook (fail-soft)
+            live_ids = {it.get("id") for it in all_memories if it.get("id")}
+            for cr in cascade_rows:
+                if cr.get("id") in live_ids:
+                    continue  # already in the live pool: one row, no dup
+                cr["reclaimed"] = True  # B口径 mark (source memory rides on)
+                all_memories.append(cr)
+        except Exception as e:  # fail-soft: the cascade never breaks recall
+            logger.warning(
+                f"FileMem: archive cascade fold failed ({e}); "
+                f"live-pool-only result (fail-soft)")
 
     def sweep_memories_expired(self, log_path: Optional[Path] = None) -> Dict[str, Any]:
         """O7: physical sweep of EXPIRED auto-cleanup rows out of memories/*.json.
