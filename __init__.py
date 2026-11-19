@@ -14268,6 +14268,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 meta = r.setdefault("metadata", {})
                 meta["superseded"] = True
                 meta["superseded_by"] = new_id
+                # D3 (c): third supersede stamp (Go L187-189) — the old row is
+                # the TERMINAL supersession target, so its own supersede_state
+                # is confirmed too (Python previously left it unstamped).
+                meta["supersede_state"] = "confirmed"
                 return
 
     def _unsettle_by_kanban_id(self, tid: str, source_event: str = "kanban") -> int:
@@ -14343,11 +14347,17 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         link (the one delta vs the automatic save-door stamp). It (a) writes a
         new correcting row carrying the explicit `supersedes` link + a (b)
         validity window, and (b) marks the old row superseded so it leaves the
-        auto-inject pool (it stays on disk, I1 无 DELETE). The candidate then
-        confirms through the EXISTING EP-2 flow — O1 feeds that face, it does
-        not re-build it. LLM face = 1 schema + 1 dispatch over the shared host
-        channel: ZERO new provider / model config / API key / task key. This
-        handler is ZERO-LLM pure stdlib + the shared P0-2 origin stamp.
+        auto-inject pool (it stays on disk, I1 无 DELETE). D3 (b) — the
+        explicit face writes the new row as CONFIRMED directly (Go
+        supersede.go L172-173: supersede_state=confirmed +
+        superseded_confirmed=true, no EP-2 confirm chain); the old row is
+        terminal (superseded + superseded_by + supersede_state=confirmed via
+        _o1_mark_old, D3 (c)). The EXISTING EP-2 flow is semantically
+        superseded by this face but the code is kept (candidate rows from
+        other lanes can still confirm through it). LLM face = 1 schema + 1
+        dispatch over the shared host channel: ZERO new provider / model
+        config / API key / task key. This handler is ZERO-LLM pure stdlib +
+        the shared P0-2 origin stamp.
         """
         old_id = str(args.get("old_id") or "").strip()
         new_content = str(args.get("new_content") or "").strip()
@@ -14366,6 +14376,33 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                           f"id reported by filemem_search / filemem_read "
                           f"(a pending draft has no linkable pool id — confirm "
                           f"it first)")})
+        # D3 (a): failure exemption (Go supersede.go L136-138 metaFailureExempt
+        # red line, mirrored here): a row carrying a non-empty
+        # metadata.failure_type is exempt from supersede — a bad turn must not
+        # pollute durable memory. Rejection is BEFORE any write (no marker, no
+        # new row, no audit event), matching Go's 'failure row is exempt from
+        # supersede'. Any present, non-nil, non-empty value trips it (0/"0"
+        # included, distinct from generic truthiness), mirroring Go semantics.
+        _old_meta = old_row.get("metadata")
+        _ft = _old_meta.get("failure_type") if isinstance(_old_meta, dict) else None
+        if _ft is not None:
+            if isinstance(_ft, str):
+                if _ft.strip():
+                    return json.dumps({
+                        "error": (f"memory {old_id!r} is a failure row "
+                                  f"(metadata.failure_type={_ft!r}); failure "
+                                  f"rows are exempt from supersede — they "
+                                  f"record a bad turn and must not pollute "
+                                  f"durable memory"),
+                        "success": False})
+            else:
+                return json.dumps({
+                    "error": (f"memory {old_id!r} is a failure row "
+                              f"(metadata.failure_type={_ft!r}); failure "
+                              f"rows are exempt from supersede — they "
+                              f"record a bad turn and must not pollute "
+                              f"durable memory"),
+                    "success": False})
         # O1 1D cross-profile write-face guard (supersedes 356 裁决 3 "drop the
         # cross-profile guard, exact old_id only"): the supersede MARKS the old
         # row + appends a new stamped row in ITS shard — touching another
@@ -14465,7 +14502,12 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # isolation intact). content_hash reuses the save-door helper (P1-1b).
         new_meta: Dict[str, Any] = {
             "supersedes": [old_id],
-            "supersede_state": "candidate",
+            # D3 (b): the EXPLICIT supersede LLM face writes the correction
+            # row as CONFIRMED directly (Go supersede.go L172-173: no EP-2
+            # confirm chain — the host main-model's authoring intent is the
+            # authoritative lineage link, so no candidate/LLM-verdict step).
+            "supersede_state": "confirmed",
+            "superseded_confirmed": True,
             "supersede_reason": reason,
             "validity_scope": scope,
             # P0-2 hard isolation: stamp the owning profile (the SAME metadata
@@ -14579,11 +14621,11 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             "level": level,
             "validity_scope": scope,
             "valid_until": new_meta.get("valid_until"),
-            "supersede_state": "candidate",
+            "supersede_state": "confirmed",
             "note": ("old row marked superseded (out of the auto-inject pool, "
-                     "kept on disk for audit); new correcting row written. "
-                     "Confirm the candidate via the usual supersession-"
-                     "confirmation flow to finalize."),
+                     "kept on disk for audit); new correcting row written as "
+                     "confirmed (D3 (b): explicit face writes confirmed "
+                     "directly, no EP-2 confirm chain)."),
         })
 
     def _tool_review_drafts(self, args: Dict) -> str:

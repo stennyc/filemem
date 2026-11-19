@@ -219,7 +219,7 @@ def test_c_confirmed_cross_profile_override_succeeds(tmp_path):
         "user_confirmation": "user confirmed: override the orchestrator note"}))
     assert out["success"] is True, out
     new_id = out["new_id"]
-    assert out["supersede_state"] == "candidate"
+    assert out["supersede_state"] == "confirmed"
 
     rows = {r["id"]: r for r in _read_shard(tmp_path)}
     # old row: superseded + back-linked, KEPT ON DISK (I1 无 DELETE)

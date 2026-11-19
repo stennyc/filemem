@@ -200,7 +200,7 @@ def test_docker_counterexample_explicit_supersede(tmp_path=None):
         "old_id": "fact_0", "new_content": new_content,
         "reason": "today we do not use docker", "validity_scope": "day"}))
     assert out["success"] is True, out
-    assert out["old_id"] == "fact_0" and out["supersede_state"] == "candidate"
+    assert out["old_id"] == "fact_0" and out["supersede_state"] == "confirmed"
     new_id = out["new_id"]
     assert new_id != "fact_0"
 
@@ -208,10 +208,11 @@ def test_docker_counterexample_explicit_supersede(tmp_path=None):
     # old row: superseded + back-linked, KEPT ON DISK (I1 无 DELETE)
     assert rows["fact_0"]["metadata"]["superseded"] is True
     assert rows["fact_0"]["metadata"]["superseded_by"] == new_id
-    # new row: explicit lineage link + candidate + P0-2 profile stamp + (b) window
+    # new row: explicit lineage link + D3(b) confirmed + P0-2 profile stamp + (b) window
     nm = rows[new_id]["metadata"]
     assert nm["supersedes"] == ["fact_0"]
-    assert nm["supersede_state"] == "candidate"
+    assert nm["supersede_state"] == "confirmed"
+    assert nm["superseded_confirmed"] is True
     assert nm["source_profile"] == "default"          # P0-2 hard isolation intact
     assert nm["origin"]["trust"] == "high"           # injectable (user/high)
     assert nm["supersede_reason"] == "today we do not use docker"
@@ -258,9 +259,15 @@ def test_supersede_cross_shard_locates_by_id(tmp_path=None):
 # ── 2. EP-2 candidate -> confirmed flow (reuse the existing confirm gate) ──
 
 def test_o1_candidate_confirms_via_ep2_face(tmp_path, monkeypatch):
-    """The O1-stamped candidate flips candidate->confirmed through the EXISTING
-    _supersede_confirm_candidates face (host-LLM confirm gate) — O1 feeds it,
-    does not re-build it; the old row gains superseded_confirmed=True."""
+    """D3 (b): the O1 explicit face writes the new row as CONFIRMED directly
+    (Go alignment: supersede_state=confirmed + superseded_confirmed=true, no
+    EP-2 confirm chain). The old row is terminal (superseded + superseded_by
+    + supersede_state=confirmed via _o1_mark_old, D3 (c)). Running the EP-2
+    confirm face on an already-confirmed row is a no-op (zero candidate
+    rows to flip); the host-LLM gate is NOT called for the O1 row. The
+    old row gains superseded_confirmed=True (from the EP-2 confirm tick's
+    batch pass over its superseded targets — see _supersede_confirm_candidates
+    L16357: every superseded target in the same shard gets the marker)."""
     fake, state = install(monkeypatch,
                           replies=[{"confirmed": True, "reason": "genuine update"}])
     p = _make_provider(tmp_path)
@@ -270,18 +277,28 @@ def test_o1_candidate_confirms_via_ep2_face(tmp_path, monkeypatch):
         "reason": "today we do not use docker"}))
     new_id = out["new_id"]
     rows = {r["id"]: r for r in _read_shard(tmp_path)}
-    assert rows[new_id]["metadata"]["supersede_state"] == "candidate"
-    # now run the EXISTING EP-2 confirm face
+    # D3 (b): new row is confirmed from the start (no EP-2 chain needed)
+    assert rows[new_id]["metadata"]["supersede_state"] == "confirmed"
+    assert rows[new_id]["metadata"]["superseded_confirmed"] is True
+    # D3 (c): old row gets the third stamp (supersede_state=confirmed)
+    assert rows["fact_0"]["metadata"]["supersede_state"] == "confirmed"
+    # Per Go: old row does NOT get superseded_confirmed (that's new-row only)
+    assert "superseded_confirmed" not in rows["fact_0"]["metadata"]
+    # now run the EXISTING EP-2 confirm face — it is a no-op for O1 rows
+    # (they are already confirmed, not candidate), zero writes
     p._supersede_confirm_candidates()
     rows = {r["id"]: r for r in _read_shard(tmp_path)}
     assert rows[new_id]["metadata"]["supersede_state"] == "confirmed"
-    assert rows["fact_0"]["metadata"]["superseded_confirmed"] is True
-    assert state["calls"] == 1  # the host-LLM gate ran exactly once
+    assert "superseded_confirmed" not in rows["fact_0"]["metadata"]
 
 
 def test_o1_candidate_not_confirmed_stays_candidate(tmp_path, monkeypatch):
-    """A confirm verdict of False leaves the O1 candidate unconfirmed (不吞脏):
-    the pair stays candidate, the old row gains no superseded_confirmed."""
+    """D3 (b) + (c): after the O1 explicit face, the new row is confirmed
+    (supersede_state=confirmed + superseded_confirmed=True) and the old row
+    is terminal (superseded + superseded_by + supersede_state=confirmed).
+    Running the EP-2 confirm face on an already-confirmed row is a no-op;
+    the old row keeps superseded_confirmed (set by the O1 RMW, D3 (b)).
+    The EP-2 LLM verdict is irrelevant here — the O1 face is terminal."""
     fake, state = install(monkeypatch,
                           replies=[{"confirmed": False, "reason": "not a real correction"}])
     p = _make_provider(tmp_path)
@@ -292,7 +309,11 @@ def test_o1_candidate_not_confirmed_stays_candidate(tmp_path, monkeypatch):
     new_id = out["new_id"]
     p._supersede_confirm_candidates()
     rows = {r["id"]: r for r in _read_shard(tmp_path)}
-    assert rows[new_id]["metadata"]["supersede_state"] == "candidate"
+    # D3 (b): new row stays confirmed (EP-2 is a no-op for non-candidate rows)
+    assert rows[new_id]["metadata"]["supersede_state"] == "confirmed"
+    assert rows[new_id]["metadata"]["superseded_confirmed"] is True
+    # D3 (c): old row is terminal (per Go, no superseded_confirmed on old row)
+    assert rows["fact_0"]["metadata"]["supersede_state"] == "confirmed"
     assert "superseded_confirmed" not in rows["fact_0"]["metadata"]
 
 
@@ -357,11 +378,13 @@ def test_o1_fold_out_of_auto_predicate(tmp_path=None):
 
 def test_prefetch_fold_superseded_row(tmp_path=None):
     """End-to-end docker 反例 through the AUTO face, under the V2 confirmed
-    gate: after filemem_supersede writes a candidate correction (not yet
-    EP-2 confirmed), BOTH the superseded old row and the unconfirmed
-    candidate new row are folded out of the auto face — the auto face
-    skeleton is confirmed-only. After the EP-2 confirm chain flips the
-    candidate to confirmed, it enters the auto face."""
+    gate: after filemem_supersede writes a confirmed correction (D3 (b):
+    supersede_state=confirmed + superseded_confirmed=True, no EP-2 chain),
+    the superseded old row is folded out of the auto face (O1 fold
+    predicate). The new row, while supersede_state=confirmed, still lacks
+    metadata.confirmed=True (a separate V2 auto-inject gate key), so it is
+    also folded out of the auto face. After metadata.confirmed=True is set
+    (simulating the V2 confirmed-gate flip), it enters the auto face."""
     tmp = pathlib.Path(tempfile.mkdtemp())
     p = _make_provider(tmp, source_profile="default")
     old_content, new_content, query = _docker_overlap_is_below_ep1_gate()
@@ -370,28 +393,29 @@ def test_prefetch_fold_superseded_row(tmp_path=None):
         "old_id": "fact_0", "new_content": new_content,
         "reason": "today we do not use docker"}))
     new_id = out["new_id"]
-    # The candidate new row is NOT yet confirmed (supersede_state=candidate,
-    # metadata.confirmed absent) -> the V2 confirmed gate folds it out of the
-    # auto face along with the superseded old row.
+    # D3 (b): new row is confirmed from the start (supersede_state=confirmed,
+    # superseded_confirmed=True), but metadata.confirmed is ABSENT — the V2
+    # auto-inject gate keys on metadata.confirmed (a separate doctrine from
+    # supersede_state), so the new row is still folded out of the auto face
+    # until that key is set.
     p._set_bringback_choice("s-o1", "clean_start")
     ctx = p.prefetch(query, session_id="s-o1", confidence=0.5)
     assert old_content not in ctx, \
         f"superseded old row must be folded out of the auto face, got: {ctx!r}"
     assert new_content not in ctx, \
-        f"unconfirmed candidate row must NOT inject on the auto face (V2 " \
-        f"confirmed gate), got: {ctx!r}"
-    # After the EP-2 confirm chain flips the candidate to confirmed=True,
-    # it enters the auto face skeleton.
+        f"confirmed-supersede row without metadata.confirmed=True must NOT " \
+        f"inject on the auto face (V2 confirmed gate), got: {ctx!r}"
+    # After metadata.confirmed=True is set (the V2 confirmed-gate flip),
+    # the new row enters the auto face skeleton.
     shard = tmp / "memories" / "fact.json"
     items = json.loads(shard.read_text(encoding="utf-8"))
     for item in items:
         if item.get("id") == new_id:
             item.setdefault("metadata", {})["confirmed"] = True
-            item["metadata"]["supersede_state"] = "confirmed"
     shard.write_text(json.dumps(items, ensure_ascii=False, indent=2))
     ctx2 = p.prefetch(query, session_id="s-o1", confidence=0.5)
     assert new_content in ctx2, \
-        f"confirmed correction row must inject after EP-2 confirm, got: {ctx2!r}"
+        f"confirmed row (metadata.confirmed=True) must inject, got: {ctx2!r}"
     assert old_content not in ctx2
 
 
