@@ -1011,10 +1011,15 @@ def _auto_inject_eligible(row: Any, session_sp: Optional[str],
     """SESSION_ISOLATION_V2: auto-inject 面骨架谓词（owner 2026-10-10 定稿）。
 
     三面共用（prefetch / P3 回放 / egress）：
-      (0) plan 类型恒折（PLAN-type PRD §10）: plan 行（memories/plan.json）
-          永不进入 auto-inject 面——"任务≠上下文"，plan 的唯一召回入口是
-          b 面 filemem_plan(action="list")。判定：row 顶层 type=="plan" 或
-          metadata.plan_id 存在（upsert 行的 plan 身份标记）。
+      # (0) plan 类型恒折（PLAN-type PRD §10）: plan 行（memories/plan.json）
+      # 永不进入 auto-inject 面——"任务≠上下文"，plan 的唯一召回入口是
+      # b 面 filemem_plan(action="list")。判定：row 顶层 type=="plan" 或
+      # metadata.plan_id 存在（upsert 行的 plan 身份标记）。
+      # (0.5) S5 reactivation leg（owner 双管齐下 2026-11-20）: reclaimed
+      # 行（归档桶 cascade 折入的暂存浮出层投影）豁免 confirmed 门——它
+      # 本身就是"值得浮出"的 confirmed-equivalent 信号；但 profile 隔离
+      # 与 O1 折出（superseded/lapsed）仍照常生效（flag 只豁免 confirmed
+      # 腿，不豁免隔离/生命周期腿）。
       (1) profile 隔离   _auto_recall_eligible(row_sp, session_sp)  # P0-2 不变
       (2) O1 折出        not _o1_fold_out_of_auto(row)             # 不变
       (3) confirmed 门（C-b）:
@@ -1039,11 +1044,30 @@ def _auto_inject_eligible(row: Any, session_sp: Optional[str],
         # (0) plan-type fold (PLAN-type PRD §10): plan rows never auto-inject
         if row.get("type") == "plan" or (row.get("metadata") or {}).get("plan_id"):
             return False
+        # S5 reactivation leg (owner 双管齐下 2026-11-20): a row flagged
+        # `reclaimed=True` is a staging-浮出层 projection of an already-
+        # expired source that the archive cascade just pulled back in — its
+        # very presence means "this source is worth surfacing", which is
+        # exactly the confirmed-equivalent signal the gate below asks for.
+        # Without this leg, every reclaimed row (typically an L0 env fact
+        # that was never confirmed) gets folded out by the confirmed leg,
+        # and the archive bucket — the ONLY entry point for an expired
+        # source (owner S5 §3: 暂存投影是唯一入口) — never reaches the
+        # auto-inject face. Placement: AFTER profile isolation + O1 fold
+        # (a cross-profile or superseded/lapsed projection still folds —
+        # the reclaim flag only waives the CONFIRMED leg, not the
+        # isolation / lifecycle legs), BEFORE the confirmed gate. The
+        # EXPLICIT search face does not run this predicate (it keeps its
+        # full unfiltered pool), so this leg is auto-face-only; a row that
+        # later becomes confirmed re-enters the ordinary confirmed leg.
+        # Zero LLM, pure dict read, fail-soft.
         if session_sp is not None:
             if not _auto_recall_eligible(_row_source_profile(row), session_sp):
                 return False
         if _o1_fold_out_of_auto(row):
             return False
+        if row.get("reclaimed"):
+            return True  # S5: staging projection waives the confirmed leg
         # (3) confirmed 门（C-b）：当前 session 行（episodic 带 session_id）
         # 或 confirmed 全局行，二者 OR；memories 旧行（无 session_id）
         # 只认 confirmed。
@@ -1059,7 +1083,7 @@ def _auto_inject_eligible(row: Any, session_sp: Optional[str],
 # 模块常量：topic 重叠自动闸默认关（owner 裁决 3）—— False = 不折任何跨
 # session confirmed 行（现状不变），owner 点头才开（monkeypatch / 宿主 env
 # 无关，测试直接 setattr 模块常量）。
-_TOPIC_OVERLAP_GATE_ENABLED = False
+_TOPIC_OVERLAP_GATE_ENABLED = True
 # 默认 threshold（decay.json 的 topic_guard.threshold 热改优先，未配置回落
 # 0.1；纯 stdlib 数值，无宿主依赖）。
 _TOPIC_GUARD_DEFAULT_THRESHOLD = 0.1
@@ -5457,6 +5481,28 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                                f"({_pre_boost} -> {len(results)})")
         except Exception as _fb_e:
             logger.debug(f"FileMem: failure-boost reorder skipped: {_fb_e}")
+
+        # S5 双管齐下② (owner 2026-11-20): reclaimed rows (staging
+        # projections of expired archive sources) are the SOLE entry point
+        # for an expired source (owner S5 §3: 暂存投影是唯一入口 -> 天然排
+        # 前). Pin them to the TOP of the auto-inject list so the cap below
+        # never slices them off in favor of live-pool confirmed rows. Pure
+        # stable partition (reclaimed first, relative order within each
+        # group unchanged — the failure-boost reorder above still governs
+        # intra-group order); a row with no reclaimed flag is byte-
+        # identical to the pre-S5 position. Zero LLM, zero host dep; a
+        # partition hiccup keeps the pre-partition order (fail-soft).
+        try:
+            _recl = [r for r in results if r.get("reclaimed")]
+            _rest = [r for r in results if not r.get("reclaimed")]
+            if _recl:
+                results = _recl + _rest
+                logger.info(
+                    f"FileMem: S5 auto-face pin {len(_recl)} "
+                    f"reclaimed row(s) to the top of the auto-inject list "
+                    f"(sole-entry-point semantics; cap sees them first)")
+        except Exception as _s5_pin_e:  # pragma: no cover - fail-soft
+            logger.debug(f"FileMem: S5 reclaimed-pin skipped: {_s5_pin_e}")
 
         # P0-2 denoise ①: cap the AUTO-inject row count (top-N by the existing
         # fused rank = `results` order). A wide recall pool is NOT a
@@ -18843,20 +18889,36 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
             return False
 
     def _get_bringback_choice(self, session_id: Optional[str]) -> str:
-        """P4 read: default 'fresh' (owner 2026-11-08: cross-session 串入根治)
-        when the file is absent/unreadable, the session is unresolvable, or the
-        file carries an unrecognized value — a NEW session auto-injects only
-        its OWN rows until the user explicitly records a choice (bring_back /
-        clean_start / topic_mismatch) or says 带回. Unrecognized values still
-        degrade to 'fresh' (fail-soft; never 'clean_start' — that was the
-        default that leaked the 313-row cross-session confirmed pool into
-        every new session after the 2026-11-04 manual-trigger rewrite)."""
+        """P4 read: default 'clean_start' (owner 双管齐下 2026-11-20) when the
+        file is absent/unreadable, the session is unresolvable, or the file
+        carries an unrecognized value — a NEW session auto-injects its OWN
+        rows + the confirmed global skeleton (V2 clean_start behavior) until
+        the user explicitly records a choice (bring_back / fresh /
+        topic_mismatch) or says 带回.
+
+        The default was 'fresh' since owner 2026-11-08 (cross-session
+        串入根治 — the 313-row incident where an unchosen new session
+        auto-pumped the entire cross-session confirmed pool). That fix was
+        correct for the 串入 problem but over-reached: it also blanked the
+        confirmed global skeleton, so a "接着昨天话题" /new session could NOT
+        auto-recall yesterday's confirmed conclusions (the 5a9981 免token
+        incident: the user had to re-state the topic before filemem_search
+        could find it). The correct default is clean_start (keep the
+        confirmed skeleton + this session's own rows; do NOT pin / reorder
+        / carry the previous session's unconfirmed rows). The 串入
+        protection is now carried by the topic-guard
+        (_TOPIC_OVERLAP_GATE_ENABLED, owner 双管齐下 2026-11-20: open by
+        default, threshold from decay.json topic_guard.threshold default
+        0.1) — cross-class cross-session confirmed rows fold out; same-class
+        rows stay. Unrecognized values still degrade to 'clean_start'
+        (fail-soft; never 'fresh' — a typo / corrupt choice file must not
+        blank the auto-inject face)."""
         p = self._bringback_choice_path(session_id or "")
         if p is None:
-            return "fresh"
+            return "clean_start"
         try:
             if not p.exists():
-                return "fresh"
+                return "clean_start"
             data = json.loads(p.read_text(encoding="utf-8"))
             choice = data.get("choice")
             if choice in ("bring_back", "clean_start", "fresh",
@@ -18864,10 +18926,10 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                 return choice
             # Back-compat: pre-3-value files stored boolean bring_back.
             if isinstance(data.get("bring_back"), bool):
-                return "bring_back" if data["bring_back"] else "fresh"
-            return "fresh"
+                return "bring_back" if data["bring_back"] else "clean_start"
+            return "clean_start"
         except Exception:
-            return "fresh"
+            return "clean_start"
 
     def _has_bringback_choice(self, session_id: str) -> bool:
         """P4: True when ANY choice was recorded for this session (the choice
