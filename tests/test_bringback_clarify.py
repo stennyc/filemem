@@ -655,19 +655,23 @@ def test_fresh_end_to_end_prefetch_empties_auto_face_keeps_search(tmp_path):
     / search_memories over the raw pool, which the choice never touches).
     'fresh' = empty auto-inject, never unretrievable (全新 ≠ 失联).
 
-    owner 2026-11-08: the DEFAULT (no recorded choice) is now ALSO 'fresh' —
-    a new session auto-injects only its own rows until the user explicitly
-    records clean_start / bring_back / topic_mismatch."""
+    owner 双管齐下 2026-11-20: the DEFAULT (no recorded choice) is now
+    'clean_start' (confirmed global skeleton + this session's own rows),
+    not 'fresh'. Only an EXPLICIT 'fresh' choice empties the auto face.
+    The topic-guard (_TOPIC_OVERLAP_GATE_ENABLED=True) folds cross-class
+    cross-session confirmed rows; same-class rows (the confirmed skeleton
+    here) stay under clean_start."""
     _write_real_pool_row(tmp_path, "fact", "f_conf", "confirmed core fact",
                           sp="default", confirmed=True)
 
-    # ── C: no recorded choice (control) -> DEFAULT 'fresh': auto face empty ──
+    # ── C: no recorded choice (control) -> DEFAULT 'clean_start':
+    #      the confirmed global skeleton row IS auto-injected ──
     p_ctl = _make_provider_with_pool(tmp_path, sid="s_ctl", profile="default")
     p_ctl.session_id = "s_ctl"
     ctx_ctl = p_ctl.prefetch("confirmed core fact", session_id="s_ctl")
-    assert "confirmed core fact" not in ctx_ctl, (
-        f"control (no choice file): default is now 'fresh' — the confirmed "
-        f"cross-session row must NOT auto-inject; got: {ctx_ctl!r}")
+    assert "confirmed core fact" in ctx_ctl, (
+        f"control (no choice file): default is now 'clean_start' — the "
+        f"confirmed skeleton row MUST auto-inject; got: {ctx_ctl!r}")
 
     # ── B: explicit clean_start -> the confirmed row IS auto-injected ──────
     p_clean = _make_provider_with_pool(tmp_path, sid="s_clean", profile="default")

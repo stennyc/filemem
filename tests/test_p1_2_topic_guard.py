@@ -269,9 +269,9 @@ def test_t5_topic_mismatch_folds_cross_session_confirmed_only(tmp_path):
 def test_t6_topic_mismatch_not_chosen_is_zero_regression(tmp_path):
     """T6: explicit clean_start -> every confirmed row (incl. cross-session
     stamped) stays (the topic-mismatch fold only fires under that specific
-    choice). owner 2026-11-08: the DEFAULT (no choice recorded) is now
-    'fresh' — a new session auto-injects ONLY its own rows until an explicit
-    choice is recorded; the default is no longer the V2 two-leg behavior."""
+    choice). owner 双管齐下 2026-11-20: the DEFAULT (no choice recorded) is
+    now 'clean_start' (confirmed skeleton + own rows), NOT 'fresh' — so a
+    no-choice session auto-injects its confirmed skeleton rows."""
     cross, skeleton, cur = _t5_pool(tmp_path)
     p = _make_provider(tmp_path)
     _choice_set(p, CUR_SID, "clean_start")
@@ -279,19 +279,20 @@ def test_t6_topic_mismatch_not_chosen_is_zero_regression(tmp_path):
     for r in (cross, skeleton, cur):
         assert r["content"] in ctx, (
             f"clean_start must keep ALL confirmed rows: {r['content']!r}")
-    # default (no choice file at all) -> now 'fresh': cross-session confirmed
-    # rows must NOT auto-inject
+    # default (no choice file at all) -> now 'clean_start': the confirmed
+    # skeleton row IS auto-injected (but cross-session stamped rows may be
+    # folded by the topic-guard; a row with no session stamp is the global
+    # skeleton and always stays).
     p2 = _make_provider(tmp_path, sid="s_def")
     _write_pool_rows(tmp_path, [
-        _row("other project confirmed fact", sp="coder", confirmed=True,
-             session_id=OTHER_SID),
+        _row("other project confirmed fact", sp="coder", confirmed=True),
     ])
     ctx2 = p2.prefetch("confirmed fact", session_id="s_def")
-    assert "other project confirmed fact" not in ctx2, \
-        "owner 2026-11-08: no recorded choice -> default 'fresh' -> cross-session confirmed rows NOT auto-injected"
+    assert "other project confirmed fact" in ctx2, \
+        "双管齐下 2026-11-20: no recorded choice -> default 'clean_start' -> confirmed skeleton row auto-injects"
 
 
-# ── T7-T8: topic overlap auto-gate (修复 3, 默认关) ────────────────────
+# ── T7-T8: topic overlap auto-gate (修复 3, 默认开) ────────────────────
 
 def _gate_t8_setup(tmp: pathlib.Path):
     """异类 cross-session confirmed row + 同类 cross-session confirmed row,
@@ -321,22 +322,23 @@ def _gate_t8_setup(tmp: pathlib.Path):
     return cross_row, same_row
 
 
-def test_t7_topic_gate_default_off_changes_nothing(tmp_path):
-    """T7: _TOPIC_OVERLAP_GATE_ENABLED=False (shipped default) -> NO cross-
-    session confirmed row is folded by the gate (behavior == 现状).
-    owner 2026-11-08: an explicit clean_start choice is required for rows to
-    auto-inject; without a choice the default is 'fresh' (empty auto face)."""
+def test_t7_topic_gate_default_on_filters_cross_class_row(tmp_path):
+    """T7: _TOPIC_OVERLAP_GATE_ENABLED=True (shipped default, owner 双管齐下
+    2026-11-20) -> the cross-class session's confirmed row IS folded by the
+    gate; the same-class row stays. owner 双管齐下 2026-11-20: without a
+    choice the default is 'clean_start' (skeleton auto-injects), and the
+    topic-guard is the 串入 protection that replaces the old fresh-default."""
     cross_row, same_row = _gate_t8_setup(tmp_path)
     p = _make_provider(tmp_path)
-    _choice_set(p, CUR_SID, "clean_start")
     ctx = p.prefetch("filemem confirmed 骨架 fact", session_id=CUR_SID)
-    assert cross_row["content"] in ctx, \
-        "gate off + clean_start: cross-class row must stay (现状不变)"
-    assert same_row["content"] in ctx
-    # explicit RED/GREEN switch: the constant must exist and be False now.
+    assert cross_row["content"] not in ctx, \
+        "gate ON + clean_start default: cross-class row must fold out"
+    assert same_row["content"] in ctx, \
+        "gate ON: same-class row must stay"
+    # explicit RED/GREEN switch: the constant must exist and be True now.
     assert hasattr(_fm_pkg, "_TOPIC_OVERLAP_GATE_ENABLED"), \
         "RED: _TOPIC_OVERLAP_GATE_ENABLED constant not defined yet"
-    assert _fm_pkg._TOPIC_OVERLAP_GATE_ENABLED is False
+    assert _fm_pkg._TOPIC_OVERLAP_GATE_ENABLED is True
 
 
 def test_t8_topic_gate_on_filters_cross_class_row(tmp_path, monkeypatch):
@@ -345,8 +347,9 @@ def test_t8_topic_gate_on_filters_cross_class_row(tmp_path, monkeypatch):
     score filter). The P3 replay round-trip keeps the POST-gate snapshot
     (a cold-start replay cannot resurrect the folded row — proven by the
     frozen-snapshot bytes carrying no cross-class line).
-    owner 2026-11-08: explicit clean_start choice required (default is now
-    'fresh' — empty auto face without an explicit choice)."""
+    owner 双管齐下 2026-11-20: the gate is ON by default; this test
+    monkeypatches it explicitly to pin the ON behavior regardless of the
+    shipped default."""
     cross_row, same_row = _gate_t8_setup(tmp_path)
     monkeypatch.setattr(_fm_pkg, "_TOPIC_OVERLAP_GATE_ENABLED", True)
     p = _make_provider(tmp_path)
