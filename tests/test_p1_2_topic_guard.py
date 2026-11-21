@@ -82,7 +82,12 @@ def _make_provider(tmp: pathlib.Path, sid: str = CUR_SID,
     p.sessions_dir = tmp / "sessions"
     p.sessions_dir.mkdir(parents=True, exist_ok=True)
     p.auto_extract = False
-    p._decay = {}
+    # owner 2026-11-21 rebaseline (Go/Python 两侧同步): the auto bringback
+    # clarify footer is OFF BY DEFAULT; this suite pins the LEGACY auto-
+    # footer legs, so the rollback switch is ON here (absent the knob the
+    # fire legs would read '' on the new baseline). Knob ON is
+    # byte-identical to the pre-rebaseline behavior.
+    p._decay = {"bringback_clarify": {"enable": True}}
     p.min_search_score = 0.3
     p._pending_drafts_notified = {}
     p._pending_confirm = {}

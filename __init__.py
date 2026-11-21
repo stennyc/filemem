@@ -299,7 +299,7 @@ _MEMORY_TYPE_REGEX = {
         r"|fix\s+sequence|repair\s+plan|action\s+plan|execution\s+plan|multi-step"
         r"|\bprds?\b",
         r"步骤\s*\d|第\s*\d+\s*(步|阶段|点|条)|实施计划|修复步骤|执行计划"
-        r"|多步|落地方案|PRD|路线图|分\s*\d+\s*(步|阶段)",
+        r"|多步|落地方案|PRD|路线图|分\s*\d+\s*(步|阶段)|计划",  # owner 2026-11-21 信号词扩容（R2 审计漏检修复，Go/Python 两侧同步）：裸 "计划" 单形（"修复计划"/"先出一份计划" 此前全词表零命中；预筛只是成本门，LLM+confirm 双门兜底）
     ],
 }
 
@@ -343,6 +343,10 @@ _PLAN_LAND_SIGNALS = (
     "TDD RED 锚", "TDD RED", "RED 锚", "TDD",
     # generic plan-report openers (English, mirror of the Chinese set):
     "spec landed", "PRD landed", "spec file",
+    # owner 2026-11-21 信号词扩容 (Go/Python 两侧同步): the PLAN-* doc-naming
+    # prefix (the owner's plan-doc convention, e.g. PLAN-kbs-dsh-R2.md);
+    # hits layer A through the lowercased "[file: path]" slice-6 tag.
+    "plan-",
 )
 
 # scheduled 门 (owner 2026-11-12): WIDE due-signal markers — layer A (strong) of
@@ -12360,7 +12364,7 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             },
             {
                 "name": "filemem_write",
-                "description": "Write a new memory entry. Use ONLY for genuinely NEW facts. Supersession/correction hint: if this new entry corrects / denies / temporarily overrides a row you already know (e.g. 'deployment uses docker' -> 'today we do NOT use docker'), do NOT just write the new fact — invalidate the stale row with filemem_supersede(old_id, new_content, reason, validity_scope='day'|'session') so the old row stops being auto-recalled instead of the two conflicting rows coexisting." + _FILEMEM_ROUTING_POINTER,
+                "description": "Write a new memory entry. Use ONLY for genuinely NEW facts. Supersession/correction hint: if this new entry corrects / denies / temporarily overrides a row you already know (e.g. 'deployment uses docker' -> 'today we do NOT use docker'), do NOT just write the new fact — invalidate the stale row with filemem_supersede(old_id, new_content, reason, validity_scope='day'|'session') so the old row stops being auto-recalled instead of the two conflicting rows coexisting. ROUTING (the 2026-11-21 dual-language guidance ruling): when the owner states a concrete fact / makes an explicit decision / updates a prior record, write it IN THE SAME TURN without waiting to be asked — the auto-catch fallback only catches trigger words and misses most of what is worth saving. Pick the narrowest type, one claim per memory, self-contained wording (never a raw transcript echo, never 'the user said X')." + _FILEMEM_ROUTING_POINTER,
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -14304,8 +14308,14 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         topic = (args.get("topic") or "").strip()
         since = (args.get("since") or "").strip()
         until = (args.get("until") or "").strip()
-        if not any([mem_type, session_id, topic, since, until]):
-            return json.dumps({"error": "scoped delete requires at least one scoping field (mem_type / session_id / topic / since / until); a bare delete-all is the wipe red line (owner-level, manual)"})
+        # the wipe red line (the 2026-11-21 dual-language alignment
+        # ruling): mem_type (any value, "all" included) is a SHARD
+        # NARROWER, not a scoping field — a predicate needs at least
+        # one of session_id / topic / since / until (a shard-wide or
+        # all-shard delete through the tool face = the owner-level
+        # manual leg; both language sides agree on this posture)
+        if not any([session_id, topic, since, until]):
+            return json.dumps({"error": "scoped delete requires at least one scoping field (session_id / topic / since / until — mem_type narrows the shards but is not a scope); a bare delete-all is the wipe red line (owner-level, manual)"})
         dry_run = True  # the safe default: the execute leg is opt-in
         if "dry_run" in args:
             dry_run = bool(args.get("dry_run"))
@@ -19563,6 +19573,21 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
                 "show bare-id placeholders)" % e)
             return []
 
+    def _bringback_clarify_enabled(self) -> bool:
+        """owner 2026-11-21 rebaseline (Go/Python 两侧同步): the auto
+        bringback clarify footer is OFF BY DEFAULT (new sessions never
+        auto-inject the 带回 hint; bringback is explicit-only via the
+        filemem_set_bringback tool face). The decay block
+        {"bringback_clarify": {"enable": true}} restores the legacy
+        auto-inject (the rollback switch — the Go bringbackClarifyEnabled
+        twin, with the default FLIPPED from the probeKnob posture:
+        absent/invalid = OFF, the 2026-11-21 baseline). No DECAY_DEFAULTS
+        entry is materialized: an absent block IS the off state (the
+        byte-stable posture; the S2 parity files keep their drift-free
+        shape)."""
+        blk = ((getattr(self, "_decay", None) or {}).get("bringback_clarify")) or {}
+        return bool(blk.get("enable"))
+
     def _bringback_clarify_footer(self, session_id: str,
                                    user_query: Optional[str] = None) -> str:
         """Return the one-shot bring-back footer for THIS session's first
@@ -19571,6 +19596,14 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         never re-ask), or the P1-3 subagent gate suppressed it (the neutral
         hint now fires even when no per-profile last_closed target exists —
         manual trigger, owner 2026-11-04).
+
+        owner 2026-11-21 rebaseline (Go/Python 两侧同步): the auto footer is
+        OFF BY DEFAULT — a new session's first touch yields '' (no auto
+        bringback; bringback is explicit-only via the tool face). The decay
+        bringback_clarify.enable=true rollback switch restores the legacy
+        auto-inject. The C-gate pending-pin bridge (the user's OWN message
+        names a known closed session) stays UNCONDITIONAL: naming a session
+        is the explicit invocation, not an auto fire.
 
         owner 2026-11-04 (manual trigger) rewrite: the footer no longer lists
         the 3-or-4 clarify choices, no longer hard-directs the model to emit
@@ -19603,6 +19636,7 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         sid = session_id or getattr(self, "session_id", None)
         if not sid:
             return ""
+        enabled = self._bringback_clarify_enabled()
         # P1-3 subagent gate (owner 2026-10-14): delegate_task sub-agent
         # sessions (platform == "subagent") NEVER get a bring-back footer —
         # no clarify, no pin, no bring-back (sub-agents are one-shot leaves;
@@ -19610,22 +19644,29 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         # the sub-agent's prompt, anchoring the sub-agent back to the parent's
         # earliest task). Main-session behavior is unchanged.
         if self._is_subagent_session():
-            logger.info(
-                "FileMem: P1-3 subagent gate: bring-back footer suppressed "
-                "for platform=subagent session %s (no bring-back, no clarify)"
-                % sid)
-            st = self._bringback_footer_state()
-            st[sid] = True  # one-shot held: 子进程不再重弹
-            # A-fix (owner 2026-10-16, reviewer major): persist the subagent
-            # suppress mark too — a REBUILT subagent provider whose
-            # _last_platform is not yet re-established would fall through to
-            # the ordinary main-session path; without the ledger mark it would
-            # re-fire the footer (the original bug, re-exposed on
-            # subagent+rebuild). A redundant subagent mark in the shared
-            # ledger is harmless: the subagent gate re-checks first and still
-            # suppresses, and the ordinary path's 'already asked' read just
-            # stays silent for a sid that was never meant to ask anyway.
-            self._persist_bringback_asked(sid)
+            if enabled:
+                logger.info(
+                    "FileMem: P1-3 subagent gate: bring-back footer suppressed "
+                    "for platform=subagent session %s (no bring-back, no clarify)"
+                    % sid)
+                st = self._bringback_footer_state()
+                st[sid] = True  # one-shot held: 子进程不再重弹
+                # A-fix (owner 2026-10-16, reviewer major): persist the
+                # subagent suppress mark too — a REBUILT subagent provider
+                # whose _last_platform is not yet re-established would fall
+                # through to the ordinary main-session path; without the
+                # ledger mark it would re-fire the footer (the original
+                # bug, re-exposed on subagent+rebuild).
+                self._persist_bringback_asked(sid)
+            else:
+                # owner 2026-11-21 baseline (auto footer off by default):
+                # the off path persists NO mark (the auto path writes no
+                # state; the subagent gate alone still suppresses).
+                logger.info(
+                    "FileMem: P1-3 subagent gate: bring-back footer "
+                    "suppressed for platform=subagent session %s "
+                    "(auto footer off by default: no mark persisted)"
+                    % sid)
             return ""
         st = self._bringback_footer_state()
         if st.get(sid, False):
@@ -19646,14 +19687,32 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
         if user_query is not None:
             named_sid = self._extract_user_named_sid(user_query)
             if named_sid:
+                # the explicit-invocation bridge (owner 2026-11-21): naming a
+                # known closed session in the user's OWN message IS the
+                # explicit bringback invocation — the pending pin is recorded
+                # unconditionally (auto footer on or off), so the follow-up
+                # filemem_set_bringback call always has the pin to consume;
+                # the legacy one-shot mark persist holds only on the enabled
+                # (legacy) path.
                 self._record_pending_user_pin(sid, named_sid)
-                st[sid] = True  # one-shot held: the card is intentionally NOT asked
-                self._persist_bringback_asked(sid)
+                if enabled:
+                    st[sid] = True  # one-shot held: the card is intentionally NOT asked
+                    self._persist_bringback_asked(sid)
                 logger.info(
                     "FileMem: HANDOFF C-gate — user named closed session "
                     f"{named_sid} in their message; clarify footer "
                     f"suppressed for {sid} (pin intent recorded)")
                 return ""
+        # owner 2026-11-21 rebaseline (Go/Python 两侧同步, owner「保留
+        # bringback 功能，新 session 去掉自动执行 bringback，以后只由用户
+        # 显式调用」): the auto clarify footer is OFF BY DEFAULT (new
+        # sessions never auto-inject the 带回 hint; bringback is explicit-
+        # only via the filemem_set_bringback tool face). The decay
+        # bringback_clarify.enable=true rollback switch restores the legacy
+        # auto-inject below (hot read per call — no restart needed, the
+        # Go twin's posture).
+        if not enabled:
+            return ""
         st[sid] = True  # mark asked NOW so a re-fetch this turn does not re-fire
         # A-fix (owner 2026-10-16): persist the mark so a REBUILT provider
         # (preflight compression / gateway cold-start) sees it via the

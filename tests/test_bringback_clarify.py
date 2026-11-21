@@ -112,7 +112,17 @@ def _row(content: str, *, sp: Optional[str] = None,
 
 
 def _make_provider(tmp: Path, sid: str = "s_cur",
-                   profile: Optional[str] = "default") -> FileMemProvider:
+                   profile: Optional[str] = "default",
+                   bringback_footer: bool = True) -> FileMemProvider:
+    """Fixture provider shell.
+
+    owner 2026-11-21 rebaseline (Go/Python 两侧同步): the auto bringback
+    clarify footer is OFF BY DEFAULT (the decay bringback_clarify block is
+    the rollback switch). The pre-rebaseline test legs pin the LEGACY
+    auto-footer behavior, so the fixture defaults bringback_footer=True
+    (knob ON — every legacy leg stays valid through the switch); the new
+    default-off legs construct with bringback_footer=False.
+    """
     p = FileMemProvider.__new__(FileMemProvider)
     p._lock = threading.Lock()
     p.session_id = sid
@@ -128,7 +138,10 @@ def _make_provider(tmp: Path, sid: str = "s_cur",
     p.sessions_dir = tmp / "sessions"
     p.sessions_dir.mkdir(parents=True, exist_ok=True)
     p.auto_extract = False
-    p._decay = {}
+    p._decay = (
+        {"bringback_clarify": {"enable": True}}
+        if bringback_footer else {}
+    )
     p.min_search_score = 0.3
     p._last_save_time = time.time()
     p._save_interval = 30
@@ -1209,3 +1222,49 @@ def test_p4_tool_session_id_override_beats_pin_session_id(tmp_path):
     # The override (s_typed) is the recorded pin, not the legacy param:
     assert out["pin_requested"] == "s_typed"
     assert p._get_bringback_pin_sid("s_cur") == "s_typed"
+
+# ── owner 2026-11-21 rebaseline (Go/Python 两侧同步): the auto bringback
+# clarify footer is OFF BY DEFAULT (new sessions never auto-inject the
+# 带回 hint; bringback is explicit-only via the filemem_set_bringback
+# tool face). The decay bringback_clarify.enable=true rollback switch
+# restores the legacy auto-inject; the C-gate pin bridge is unconditional.
+
+def test_p3b_footer_off_by_default_new_session(tmp_path):
+    """With NO knob the auto footer is OFF: a new session's first touch
+    yields '' (no auto bringback in new sessions), the second stays '',
+    and NO ledger mark is written on the off baseline (the auto path
+    writes no state)."""
+    p = _make_provider(tmp_path, bringback_footer=False)
+    assert p._bringback_clarify_footer("s_cur") == ""
+    assert p._bringback_clarify_footer("s_cur") == ""
+    ledger = p._bringback_persisted_gate_path()
+    assert ledger is None or not ledger.exists()
+
+
+def test_p3b_footer_off_rollback_switch_refires(tmp_path):
+    """The decay bringback_clarify.enable=true rollback switch restores the
+    legacy auto-footer (hot read per call, no restart needed — the Go
+    twin's posture): a fresh session's first touch re-fires it, and the
+    one-shot holds on the second call."""
+    p = _make_provider(tmp_path, bringback_footer=False)
+    p._decay = {"bringback_clarify": {"enable": True}}
+    foot = p._bringback_clarify_footer("s_cur")
+    assert "如需带回旧 session 自动注入面" in foot
+    assert p._bringback_clarify_footer("s_cur") == ""
+
+
+def test_p3b_footer_off_c_gate_pin_still_recorded(tmp_path):
+    """The C-gate explicit-invocation bridge is UNCONDITIONAL: naming a
+    known closed session in the user's OWN message records the pending pin
+    even with the auto footer off (the follow-up filemem_set_bringback
+    call consumes it); the footer itself stays silent."""
+    closed_sid = "20261121_090000_abc123"
+    p = _make_provider(tmp_path, sid="s_cur", profile="default",
+                       bringback_footer=False)
+    p_prev = _make_provider(tmp_path, sid=closed_sid, profile="default")
+    p_prev.session_id = closed_sid
+    p_prev._record_last_closed_session(closed_sid)
+    foot = p._bringback_clarify_footer(
+        "s_cur", user_query="mcache 重回 " + closed_sid + " 继续")
+    assert foot == ""
+    assert p._get_pending_user_pin("s_cur") == closed_sid
