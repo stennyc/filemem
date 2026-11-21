@@ -13504,6 +13504,21 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
     def _tool_plan(self, args: Dict) -> str:
         """PLAN-type PRD §6: filemem_plan tool — list / create / advance.
 
+        Progress discipline (owner 2026-11-22, the stale-in_progress
+        finding: the pre-fix description taught the OPS but never the
+        WHEN — an in-progress row is a same-turn obligation):
+          - a step just finished (exit criteria / anchor met) ->
+            advance(op=continue, step_done=N, anchor=…) IN THE SAME TURN;
+          - done_when fully satisfied -> advance(op=complete_all) in the
+            same turn as the last step;
+          - superseded / blocked / dead -> abandon / block WITH a reason
+            (never leave a dead plan in_progress);
+          - at create time, attach a step anchor wherever the step has a
+            verifiable artifact (test_pass / git_hash / file_path) —
+            anchors feed the reconcile op's on-disk verification.
+        A STALE row is a handoff blind spot (bringback / a new session
+        reads the row as the progress record).
+
         Returns a JSON string (the host's tool-result contract). Fail-soft:
         any unexpected error is caught and returned as {"error": ...} so the
         host turn never crashes (same posture as the other filemem tools).
