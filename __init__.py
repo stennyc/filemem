@@ -12460,6 +12460,33 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 }
             },
             {
+                "name": "filemem_scoped_delete",
+                "description": "Scoped / predicate memory delete. Scoping fields (give at least one): mem_type / session_id / topic / since / until. SAFETY POSTURE: without an explicit dry_run=false the call is a DRY RUN — it returns the hit list + count and removes NOTHING; report that list to the owner, then re-call with dry_run=false to execute the SAME predicate. A bare scope-less call is REFUSED (delete-all is the wipe red line: the owner does that by hand on the store dir, never through a tool). Prefer filemem_supersede (soft, reversible, lineage kept) over hard delete for stale / corrected rows." + _FILEMEM_ROUTING_POINTER,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "mem_type": {"type": "string", "enum": ["all"] + MEMORY_TYPES, "description": "Shard filter (omit for all shards)"},
+                        "session_id": {"type": "string", "description": "The owning session id (rows stamped with it)"},
+                        "topic": {"type": "string", "description": "The topic stamp exact match"},
+                        "since": {"type": "string", "description": "Only rows created AFTER this ISO/RFC3339 stamp (string order; missing stamps pass)"},
+                        "until": {"type": "string", "description": "Only rows created BEFORE this ISO/RFC3339 stamp (string order; missing stamps pass)"},
+                        "dry_run": {"type": "boolean", "description": "Omitted/true = the dry run (the list, nothing removed); false = EXECUTE the predicate (spelling false is the owner-confirmed execute leg)"}
+                    }
+                }
+            },
+            {
+                "name": "filemem_export",
+                "description": "Export / portability face (pure read; the pre-delete backup, the cross-machine migration, and the live-storage-diff input). kind=bundle (default): one JSONL document stream of every shard row + every session draft + the audit log (each line source-tagged). kind=files: the on-disk store files copied verbatim under <dest>. The path MUST be OUTSIDE the store root (an in-store target is refused — the pool would loop / pollute). Run it BEFORE any scoped delete as the backup step." + _FILEMEM_ROUTING_POINTER,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "The export destination (MUST be outside the store root)"},
+                        "kind": {"type": "string", "enum": ["bundle", "files"], "default": "bundle"}
+                    },
+                    "required": ["path"]
+                }
+            },
+            {
                 "name": "filemem_supersede",
                 "description": "Explicitly supersede (invalidate) one stored memory row by replacing it with a newer correcting row. Use when a fact/preference/decision you recalled or know is OUTDATED and a newer value should take its place (e.g. 'deployment uses docker' -> 'today we do NOT use docker'). Unlike the automatic save-door lineage stamp, this bypasses the content-overlap threshold: your explicit authoring intent is the authoritative link. Effect: the old row is marked superseded (leaves the auto-inject pool; it stays on disk for audit) and a new row is written carrying the lineage link + an optional validity window. The pair then confirms through the usual supersession-confirmation flow. Pass only a row id that ACTUALLY EXISTS in the store. The validity_scope parameter sets how long the NEW row's authority lasts before it too is treated as lapsed." + _FILEMEM_ROUTING_POINTER,
                 "parameters": {
@@ -13947,6 +13974,10 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 return self._tool_shared_take(args)
             elif tool_name == "filemem_delete":
                 return self._tool_delete(args)
+            elif tool_name == "filemem_scoped_delete":
+                return self._tool_scoped_delete(args)
+            elif tool_name == "filemem_export":
+                return self._tool_export(args)
             elif tool_name == "filemem_supersede":
                 return self._tool_supersede(args)
             elif tool_name == "filemem_review_drafts":
@@ -14252,6 +14283,188 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
 
         return json.dumps({"error": "Memory not found"})
 
+
+    def _tool_scoped_delete(self, args: Dict) -> str:
+        """Scoped / predicate delete (owner 2026-11-21 deletion-tool
+        ruling — the DSH Go `delete` scoped leg's reference twin; the
+        blast-radius posture is the same on both sides).
+
+        Scoping fields (at least one required): mem_type / session_id /
+        topic / since / until (ISO/RFC3339, string-compare order; a
+        row with a missing stamp is NOT cut by a time bound — the
+        fail-open leg). POSTURE: a call WITHOUT an explicit
+        dry_run=false is a DRY RUN (the hit list + count, nothing
+        removed — the caller reports the list to the owner and
+        re-calls with dry_run=false to execute). A bare scope-less
+        call is REFUSED (delete-all = the wipe red line, the owner
+        does it by hand on the store dir, never through a tool).
+        """
+        mem_type = (args.get("mem_type") or "").strip()
+        session_id = (args.get("session_id") or "").strip()
+        topic = (args.get("topic") or "").strip()
+        since = (args.get("since") or "").strip()
+        until = (args.get("until") or "").strip()
+        if not any([mem_type, session_id, topic, since, until]):
+            return json.dumps({"error": "scoped delete requires at least one scoping field (mem_type / session_id / topic / since / until); a bare delete-all is the wipe red line (owner-level, manual)"})
+        dry_run = True  # the safe default: the execute leg is opt-in
+        if "dry_run" in args:
+            dry_run = bool(args.get("dry_run"))
+
+        def _hit(item):
+            if mem_type and mem_type != "all" and item.get("type") != mem_type:
+                return False
+            if session_id:
+                extra_sid = str((item.get("metadata") or {}).get("session_id") or item.get("session_id") or "")
+                if extra_sid != session_id:
+                    return False
+            if topic:
+                if str((item.get("metadata") or {}).get("topic") or item.get("topic") or "") != topic:
+                    return False
+            created = str(item.get("created_at") or "")
+            if since and created and created < since:
+                return False
+            if until and created and created > until:
+                return False
+            return True
+
+        hits = []
+        touched = []
+        for mem_type_scan in MEMORY_TYPES:
+            if mem_type and mem_type != "all" and mem_type_scan != mem_type:
+                continue
+            mem_file = self.memories_dir / f"{mem_type_scan}.json"
+            if not mem_file.exists():
+                continue
+            with self._shard_lock(mem_file):
+                with open(mem_file, "r", encoding="utf-8") as f:
+                    items = json.load(f)
+                hit_rows = [it for it in items if _hit(it)]
+                if not hit_rows:
+                    continue
+                for it in hit_rows:
+                    hits.append({"id": it.get("id"), "mem_type": mem_type_scan,
+                                 "content": str(it.get("content") or "")[:200],
+                                 "created_at": it.get("created_at")})
+                if dry_run:
+                    continue
+                new_items = [it for it in items if not _hit(it)]
+                if len(new_items) == len(items):
+                    continue
+                with open(mem_file, "w", encoding="utf-8") as f:
+                    json.dump(new_items, f, ensure_ascii=False, indent=2)
+                touched.append(mem_type_scan)
+                try:
+                    self._append_consolidation_event({
+                        "ts": _utcnow().isoformat(),
+                        "action": "memory_scoped_delete",
+                        "dry_run": False,
+                        "predicate": {"mem_type": mem_type or None, "session_id": session_id or None,
+                                      "topic": topic or None, "since": since or None, "until": until or None},
+                        "removed": [it.get("id") for it in hit_rows],
+                        "shard": mem_type_scan,
+                        "source_profile": getattr(self, "source_profile", None),
+                    })
+                except Exception:
+                    pass  # the audit is fire-and-forget (the verdict stands)
+        out = {"dry_run": dry_run, "hits": hits, "count": len(hits)}
+        if dry_run:
+            out["note"] = "dry run: nothing deleted. Report this list to the owner, then re-call with dry_run=false to execute the same predicate."
+        else:
+            out["executed"] = True
+            out["shards_touched"] = touched
+            out["note"] = "predicate executed; the hits above are the removed rows."
+        return json.dumps(out, ensure_ascii=False)
+
+    def _tool_export(self, args: Dict) -> str:
+        """The export / portability face (owner 2026-11-21 deletion-tool
+        ruling — the DSH Go `export` cmd's reference twin): a PURE READ
+        over the store (the append-only plane is export-friendly; no
+        write locks, no mutation).
+
+        kind=bundle (default): one JSONL document stream — every row of
+        every active shard + every session draft + the audit log,
+        source-tagged — the portable migration / pre-delete backup /
+        live-storage-diff shape. kind=files: the on-disk store files
+        copied verbatim under <dest>.
+
+        The target MUST be outside the store root (writing INTO the
+        store would loop the next export / pollute the pool —
+        refused, the fail-safe leg).
+        """
+        import os as _os
+        dest = str(args.get("path") or "").strip()
+        if not dest:
+            return json.dumps({"error": "path is required (the export destination)"})
+        kind = str(args.get("kind") or "bundle")
+        dest_abs = _os.path.abspath(dest)
+        root_abs = _os.path.abspath(str(self.storage_dir))
+        if dest_abs == root_abs or dest_abs.startswith(root_abs + _os.path.sep):
+            return json.dumps({"error": "export target must be OUTSIDE the store root (refused: the pool would loop / pollute)"})
+        if kind == "files":
+            _os.makedirs(dest_abs, exist_ok=True)  # the dest IS a directory
+            copied = []
+            for rel in ["decay.json", "consolidation_log.jsonl", "failure_repeats.json",
+                        "memories/preference.json", "memories/fact.json",
+                        "memories/decision.json", "memories/task.json"]:
+                src_path = self.storage_dir / rel
+                if not src_path.exists():
+                    continue
+                try:
+                    import shutil as _shutil
+                    dst = _os.path.join(dest_abs, _os.path.basename(rel))
+                    _shutil.copyfile(str(src_path), dst)
+                    copied.append(_os.path.basename(rel))
+                except Exception:
+                    continue  # a hiccup skips the file, never fails the face
+            return json.dumps({"ok": True, "kind": "files", "path": dest_abs, "copied": copied})
+        # the bundle stream (default)
+        lines = []
+        for mem_type_scan in MEMORY_TYPES:
+            mem_file = self.memories_dir / f"{mem_type_scan}.json"
+            if not mem_file.exists():
+                continue
+            try:
+                with open(mem_file, "r", encoding="utf-8") as f:
+                    items = json.load(f)
+            except Exception:
+                continue
+            for it in items:
+                entry = {"source": f"memories/{mem_type_scan}", "mem_type": mem_type_scan,
+                         "id": it.get("id"), "content": it.get("content"),
+                         "level": it.get("level"), "created_at": it.get("created_at"),
+                         "metadata": it.get("metadata")}
+                for k in ("session_id", "topic", "source_profile", "workspace",
+                          "salience", "ttl_days", "source"):
+                    if it.get(k) not in (None, ""):
+                        entry[k] = it.get(k)
+                lines.append(json.dumps(entry, ensure_ascii=False))
+        sess_dir = self.storage_dir / "sessions"
+        if sess_dir.exists():
+            for fn in sorted(sess_dir.iterdir()):
+                if fn.is_dir() or not fn.name.endswith(".jsonl"):
+                    continue
+                try:
+                    for line in open(fn, "r", encoding="utf-8"):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        probe = json.loads(line)
+                        if isinstance(probe, dict):
+                            probe["source"] = f"sessions/{fn.name}"
+                            lines.append(json.dumps(probe, ensure_ascii=False))
+                except Exception:
+                    continue  # a torn draft file never fails the export
+        audit = self.storage_dir / "consolidation_log.jsonl"
+        if audit.exists():
+            _audit_text = open(audit, "r", encoding="utf-8").read().strip()
+            if _audit_text:
+                lines.append(_audit_text)
+        lines.append(json.dumps({"ts": _utcnow().isoformat(), "kind": "filemem-export",
+                                 "root": str(self.storage_dir)}, ensure_ascii=False))
+        _os.makedirs(_os.path.dirname(dest_abs) or ".", exist_ok=True)
+        with open(dest_abs, "w", encoding="utf-8") as f:
+            f.write("\n".join(l for l in lines if l) + "\n")
+        return json.dumps({"ok": True, "kind": "bundle", "path": dest_abs, "rows": max(0, len([l for l in lines if l]) - 1)})
     def _pool_rows_all(self) -> List[Dict[str, Any]]:
         """Option C (t_de0df8b7): a READ-ONLY flat snapshot of every semantic
         shard's pool rows (memories/*.json). The O1-scope clarify lane calls
