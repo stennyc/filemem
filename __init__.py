@@ -3428,6 +3428,18 @@ class FileMemProvider(MemoryProvider):
         #  每个 turn 末 O(1) 触发，此处保留为收账边界面的备份入口。)
         self._spawn_llm_consolidation()
 
+        # HANDOFF STUB (owner 2026-11-24): land a lightweight handoff stub for
+        # THIS session (user intents + last-assistant progress, deterministic,
+        # zero LLM) so a LATER session's handoff_extract has a task-state floor
+        # even when supercompress isn't installed / hasn't compacted. Runs on
+        # the session-end boundary, fail-soft, NEVER raises into the host hook.
+        try:
+            self._write_handoff_stub(session_id, messages)
+        except Exception as e:
+            logger.warning(
+                f"FileMem: handoff stub write failed for {session_id} ({e}); "
+                f"non-fatal (rows floor still covers handoff)")
+
         # BRINGBACK P1: record this session as closed for the current profile,
         # UNCONDITIONALLY (zero-draft sessions are the common production case
         # and still close — a later session's bring-back leg points at this id).
@@ -3482,6 +3494,73 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         # zero-draft session still fires it. Only ONE spawn call remains in
         # on_session_end — the pre-gate one above.
         return prompt
+
+    def _handoff_stub_path(self, sid: str) -> Optional[Path]:
+        """<filemem storage>/handoff_stubs/<sid>.handoff_stub.json (owner
+        2026-11-24: a LITE handoff stub the provider lands per session so a
+        later session's handoff_extract works even when supercompress isn't
+        installed — NOT under supercompress_store, it's filemem's own floor).
+        None when storage_dir is unset (fixture shell keeps it resolvable)."""
+        sd = getattr(self, "storage_dir", None)
+        if sd is None:
+            return None
+        return Path(sd) / "handoff_stubs" / f"{sid}.handoff_stub.json"
+
+    def _write_handoff_stub(self, sid: str, messages) -> Optional[Path]:
+        """Land the per-session handoff stub from a session's messages (owner
+        2026-11-24: deterministic grab, ZERO LLM, zero supercompress).
+        user_msgs = EVERY role=='user' message's text (the task intent /
+        instructions — full, per owner 全量 ruling); last_assistant = the FINAL
+        role=='assistant' text (current progress). The intermediate tool /
+        assistant noise is intentionally skipped (a handoff needs 'what was
+        asked + how far it got', not the execution stream). Returns the written
+        path, None when there's nothing useful (all-tool session) or the store
+        is unset. Fail-soft: never raises into the session-end hook."""
+        if not isinstance(messages, list):
+            return None
+        user_msgs: list = []
+        last_assistant = ""
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            role = str(m.get("role", "")).lower()
+            content = m.get("content")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                # OpenAI-style list-of-blocks: pull the text blocks only.
+                text = " ".join(
+                    str(p.get("text", "")) for p in content
+                    if isinstance(p, dict) and p.get("text")
+                )
+            else:
+                text = ""
+            text = (text or "").strip()
+            if not text:
+                continue
+            if role == "user":
+                user_msgs.append(text)          # 全量 user 消息 (owner 拍板)
+            elif role == "assistant":
+                last_assistant = text           # last-wins = current progress
+        if not user_msgs and not last_assistant:
+            return None   # nothing useful; caller degrades to the rows floor
+        sp = _normalize_profile_stamp(getattr(self, "source_profile", None))
+        stub = {
+            "session_id": sid,
+            "ts": _utcnow().isoformat(),
+            "user_msgs": user_msgs,
+            "last_assistant": last_assistant,
+            "source_profile": sp or "",
+        }
+        p = self._handoff_stub_path(sid)
+        if p is None:
+            return None
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(stub, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            return None
+        return p
 
     def _on_turn_close_check(self, session_id: str) -> None:
         """P3-1: turn-level B4 fallback for _write_episodic_entry.
@@ -16972,23 +17051,69 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             return None
         return sd / "handoffs"
 
-    def _handoff_compact_ledger_path(self, source_sid: str) -> Optional[Path]:
-        """The source session's supercompress compact ledger:
-        <home>/supercompress_store/<sid>.compact.json (hermetis_home is the
-        per-profile home the provider was initialized with; the live layout
-        keeps one supercompress_store per home, e.g.
-        ~/.hermes/profiles/coder/supercompress_store/ for the coder profile).
-        None when hermetis_home is unset (the fixture shell keeps this path
-        resolvable by pointing hermetis_home at the tmp root, which is what
-        the H-series tests do — same deterministic posture as storage_dir)."""
+    def _handoff_compact_ledger_candidates(self, source_sid: str) -> list:
+        """Auto-detect the source session's supercompress compact ledger across
+        candidate roots (owner 2026-11-24: NO hardcoded supercompress path —
+        probe candidates, first hit wins; a host that keeps supercompress
+        out-of-tree / per-profile / under a neutral root all resolve without
+        filemem knowing the literal layout).
+
+        Candidates derive from the host contract, not literals:
+          1. HERMES_SUPERCOMPRESS_ROOT override (explicit host override, if set)
+          2. <hermetis_home>/supercompress_store/<sid>.compact.json   (host primary)
+          3. <hermetis_home>/profiles/<source_profile>/supercompress_store/<sid>.compact.json
+                                                     (per-profile, Hermes truth)
+          4. ~/.hermes/supercompress_store/<sid>.compact.json        (neutral root floor)
+        Returns an ordered de-duped list (candidate order == priority). An empty
+        list (hermetis_home unset AND no override AND no home) means "no
+        candidate to probe" — the caller degrades to the handoff-stub leg."""
+        import os as _os
+        out: list = []
+        ov = _os.environ.get("HERMES_SUPERCOMPRESS_ROOT", "").strip()
+        if ov:
+            out.append(Path(ov) / f"{source_sid}.compact.json")
         home = getattr(self, "hermetis_home", None)
-        if home is None:
-            return None
+        if home is not None:
+            try:
+                home = Path(home)
+            except Exception:
+                home = None
+            if home is not None:
+                out.append(home / "supercompress_store" / f"{source_sid}.compact.json")
+                sp = _normalize_profile_stamp(getattr(self, "source_profile", None))
+                if sp:
+                    out.append(home / "profiles" / sp / "supercompress_store" / f"{source_sid}.compact.json")
         try:
-            home = Path(home)
+            hh = Path.home()
         except Exception:
-            return None
-        return home / "supercompress_store" / f"{source_sid}.compact.json"
+            hh = None
+        if hh is not None:
+            out.append(hh / ".hermes" / "supercompress_store" / f"{source_sid}.compact.json")
+        seen, ded = set(), []
+        for p in out:
+            try:
+                rp = p.resolve()
+            except Exception:
+                continue
+            if rp not in seen:
+                seen.add(rp)
+                ded.append(p)
+        return ded
+
+    def _handoff_compact_ledger_path(self, source_sid: str) -> Optional[Path]:
+        """First auto-detected candidate root that actually holds
+        <sid>.compact.json (owner 2026-11-24: probes _handoff_compact_ledger_
+        candidates, returns the first that exists; None when none does). Kept
+        as the single-path accessor so _handoff_compact_watermark stays
+        byte-stable against the prior single-root posture; the gather face uses
+        the candidate list directly."""
+        for cand in self._handoff_compact_ledger_candidates(source_sid):
+            try:
+                if cand.exists():
+                    return cand
+            except Exception:
+                continue
+        return None
 
     _COMPACT_PAGE_SEQ_RE = re.compile(r"(?m)^#\d+ \w+ prov=\S+ seq=(\d+)")
 
@@ -17082,10 +17207,13 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             "compact_segments": [], "filemem_rows": [],
             "trace_transcript": [], "raw_lines": [],
             "focus": (focus or "").strip(),
+            "stub_used": False,
         }
-        # (1) compact ledger
+        # (1) compact ledger — auto-detect across candidate roots (owner
+        #     2026-11-24: NO hardcoded supercompress path). First candidate
+        #     that actually exists wins; none does -> the handoff-stub leg.
         lp = self._handoff_compact_ledger_path(source_sid)
-        if lp is not None and lp.exists():
+        if lp is not None:
             try:
                 ledger = json.loads(lp.read_text(encoding="utf-8"))
                 segs = ledger.get("entries") or []
@@ -17096,7 +17224,34 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             except Exception as e:
                 logger.warning(
                     f"FileMem: handoff compact ledger unreadable for "
-                    f"{source_sid} ({e}); degrading to rows-only")
+                    f"{source_sid} ({e}); degrading to stub/rows")
+                lp = None
+        # (1b) HANDOFF STUB fallback (owner 2026-11-24): when the compact
+        #      ledger isn't found at ANY auto-detected candidate root
+        #      (supercompress not installed / not compacted this session),
+        #      the on_session_end stub is the task-state floor — full user
+        #      intents + last-assistant progress. Fills compact_segments
+        #      (so the LLM/fallback summary gets it) + trace_transcript.
+        if not materials["compact_segments"]:
+            sp = self._handoff_stub_path(source_sid)
+            if sp is not None and sp.exists():
+                try:
+                    stub = json.loads(sp.read_text(encoding="utf-8"))
+                    um = [u for u in (stub.get("user_msgs") or []) if isinstance(u, str) and u.strip()]
+                    la = (stub.get("last_assistant") or "").strip()
+                    if um:
+                        materials["compact_segments"].append(
+                            "## user intent / instructions\n" + "\n---\n".join(um))
+                    if la:
+                        materials["compact_segments"].append(
+                            "## last progress (assistant)\n" + la)
+                    # trace_transcript: the stub's user intents double as the
+                    # settling-gap segments (no compact baseline -> all are
+                    # 'unsettled'), so the fallback summary doesn't drop them.
+                    materials["trace_transcript"].extend(um)
+                    materials["stub_used"] = bool(um or la)
+                except Exception:
+                    pass  # corrupt stub: keep empty, degrade to the rows floor
         # (2) filemem rows for the source session (this profile's rows only)
         rp = getattr(self, "sessions_dir", None)
         cur_sp = _normalize_profile_stamp(getattr(self, "source_profile", None))
@@ -17117,30 +17272,47 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                     if row_sp != cur_sp:
                         continue  # foreign-profile row: 不串 profile
                     materials["filemem_rows"].append(row)
-        # (2b) compact 结算空窗追平：实时 trace（.jsonl user 源 + .model.jsonl
-        #      model 源合流）里 seq > compact 水位 的段——compact.json 是
-        #      compress 事件里 lazy append 的结算快照，两次 compress 之间又
-        #      推进的轮次不在里面（owner 2026-11-13 抓到的"接手不完整"根因）。
-        #      水位 = compact.json 页内解析出的最大全局 seq（_COMPACT_PAGE_SEQ_RE
-        #      同款判定式，NOT 顶层 seq 字段——那个是页代际号，拿错会重复喂）；
-        #      水位之上才是"compact 没追上的空窗段"，只喂这部分，不重复喂
-        #      compact 已覆盖的段（省 LLM budget + 避免同信息多份存根）。
-        materials["trace_transcript"] = self._handoff_trace_transcript(
-            source_sid, self._handoff_compact_watermark(source_sid))
-        # (3) focus-matched raw lines ONLY when focus is set
+        # (2b) compact 结算空窗追平：ONLY when the compact ledger actually
+        #      resolved (lp not None). The stub path already filled
+        #      trace_transcript from the stub's user intents; don't double-fill.
+        if lp is not None:
+            materials["trace_transcript"] = self._handoff_trace_transcript(
+                source_sid, self._handoff_compact_watermark(source_sid))
+        # (3) focus-matched raw lines ONLY when focus is set. Probe the
+        #      auto-detected candidate roots for a raw trace first (a host
+        #      that keeps supercompress out-of-tree resolves via the same
+        #      candidates); fall back to the stub's user intents when no raw
+        #      trace exists at any candidate (owner 2026-11-24: no hardcoded
+        #      raw trace path).
         if materials["focus"]:
-            home = getattr(self, "hermetis_home", None)
-            if home is not None:
-                raw = Path(home) / "supercompress_store" / f"{source_sid}.jsonl"
-                if raw.exists():
-                    needle = materials["focus"].lower()
-                    for line in raw.read_text(encoding="utf-8").splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        low = line.lower()
-                        if needle in low:
-                            materials["raw_lines"].append(line)
+            raw = None
+            for cand in self._handoff_compact_ledger_candidates(source_sid):
+                r = Path(cand).parent / f"{source_sid}.jsonl"
+                if r.exists():
+                    raw = r
+                    break
+            if raw is not None:
+                needle = materials["focus"].lower()
+                for line in raw.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    low = line.lower()
+                    if needle in low:
+                        materials["raw_lines"].append(line)
+            else:
+                # No raw trace at any candidate root: grep the stub's user
+                # intents (the floor still yields focus-matched lines).
+                needle = materials["focus"].lower()
+                sp = self._handoff_stub_path(source_sid)
+                if sp is not None and sp.exists():
+                    try:
+                        stub = json.loads(sp.read_text(encoding="utf-8"))
+                        for um in (stub.get("user_msgs") or []):
+                            if isinstance(um, str) and needle in um.lower():
+                                materials["raw_lines"].append(um)
+                    except Exception:
+                        pass
         return materials
 
     def _handoff_fallback_summary(self, materials: Dict[str, Any],
