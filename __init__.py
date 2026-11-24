@@ -3922,7 +3922,18 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         跨机把活交给另一台 agent -> 门 3. 交棒/取棒 handler 薄封装调
         shared_memory 模块层 handoff/take_handoff (中央 6 参函数, token 硬
         约束在中央 SQL 层). plan_id 可选, 交棒时带上"属于哪条 plan"的指针
-        (不传 PRD 正文, 接手方按 plan_id 调 filemem_plan 还原上下文)."""
+        (不传 PRD 正文, 接手方按 plan_id 调 filemem_plan 还原上下文).
+
+        逻辑对齐注 (中央共享层, 非物种差异): 本侧中央层其实有【两种语义】:
+        (a) 门 3 任务棒 (handoff/take_handoff, 中央 handoffs 表, pending→taken
+        原子翻转) —— 跨机工作项移交; (b) 记忆行同步 (shared_memory.sync_on_write
+        + upsert_memory_row, 中央 memories 表, token 门 + 原设备幂等覆盖 +
+        启动对账自愈) —— 本机新落盘行推中央 + 跨设备拒写。两者并存, 本侧是
+        超集。其中 (b) 记忆行同步与参考实现的中央 sm_handoff/sm_take (同走
+        中央 memories 表 upsert_memory_row, 同 token 门 + 幂等覆盖语义) 是
+        同物种已对齐; (a) 任务棒是本侧独有 (参考侧无对应物)。所以'中央
+        共享记忆已对齐'在 (b) 记忆行同步这条线成立, 表述时别把 (a) 任务棒
+        混进记忆行同步的口径."""
         cfg = getattr(self, "_shared_mem_cfg", None)
         if cfg is None:
             return json.dumps({"success": False,
@@ -14500,7 +14511,19 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
     def _tool_associate(self, args: Dict) -> str:
         """The associate face: candidates (Jaccard pre-screen) + verdicts
         (LLM-judged edges -> durable ledger). See the schema in
-        get_tool_schemas for the action/verdicts shape."""
+        get_tool_schemas for the action/verdicts shape.
+
+        ARCHITECTURE NOTE (logical parity with the reference, not a missing
+        field): the reference verdict row carries a `model_used` boolean in
+        the ledger/audit line. THIS face is candidates-only: the LLM verdict
+        + application run through the HOST's LLM application legs (the
+        supersede / dream / reclass apply faces), and those legs already
+        stamp `model_used` on their own audit rows (the host LLM face owns
+        the telemetry). So `model_used` is not dropped — it lives on the
+        host LLM application leg, not inside this candidate face. The ledger
+        line here records the EDGE (the durable source of truth), not the
+        LLM-call telemetry.
+        """
         action = args.get("action", "candidates")
         if action == "candidates":
             return json.dumps(
@@ -15150,7 +15173,22 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
     # ==================================================================
     def _tool_reclass_candidates(self, args: Dict) -> str:
         """The reclass candidate gate (FR-1): the low-confidence
-        regex-typed rows for the LLM reclass leg."""
+        regex-typed rows for the LLM reclass leg.
+
+        ARCHITECTURE NOTE (logical parity with the reference DSH write_reclass
+        L2 leg, not a missing feature): the reference leg MOVES a row across
+        shards after it has landed (removeRowFromShard + AppendRow), so it
+        stamps a `reclass_from_shard` source-shard trail for the L2 inverse
+        rollback. THIS side reclassifies at WRITE time: the LLM verdict lands
+        the row DIRECTLY in the judged shard (the auto-save door, the
+        'RMW, no cross-shard move' posture — the row never sits in a
+        wrong-typed shard), so there is no cross-shard move and therefore NO
+        rollback source-shard to stamp. The FR-1 idempotence gate is still
+        closed the same way: the judged row carries type_source='llm' and so
+        leaves the regex-typed candidate pool (it never earns a second
+        verdict). The two are architecturally different, semantically the
+        same (LLM corrects a regex mis-typing + the idempotent pool-exit).
+        """
         cap_n = 3
         dry_run = False
         cons = self._assoc_cons_cfg()
