@@ -85,6 +85,16 @@ _GRAPH_NEIGHBOR_KIND_COEF = {
     "semantic": 1.0,            # 0.55/0.55
     "temporal": 0.23 / 0.55,    # 0.418181...
     "co-occurrence": 0.22 / 0.55,  # 0.4
+    # P8: the C6④ association edge (the LLM-judged RELATES-TO edge folded into
+    # graph.json by tools/build_graph._build_association). Mid-strength: the
+    # reference C6① neighbor coefficient is 0.5 (associate.go `hscore * 0.5`),
+    # deliberately WEAKER than a semantic edge (the LLM soft-link is lower
+    # confidence than BM25-judged semantic similarity) but stronger than
+    # co-occurrence. 0.5 keeps it in the semantic/temporal band, above the
+    # deterministic co-occurrence tail. Without this entry association edges
+    # would fall through to _GRAPH_NEIGHBOR_DEFAULT_COEF (1.0) and be treated
+    # as the STRONGEST kind — the opposite of the intended 软边 semantics.
+    "association": 0.5,
 }
 _GRAPH_NEIGHBOR_DEFAULT_COEF = 1.0  # unknown/absent kind keeps the base 0.5
 
