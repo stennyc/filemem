@@ -12541,6 +12541,20 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 }
             },
             {
+                "name": "filemem_reclass_candidates",
+                "description": "reclass candidate gate (DREAM V2 Stage 1 FR-1 backport): the deterministic pre-screen for the LLM reclass leg — the pool's LOW-CONFIDENCE typing. Only the regex-detector-stamped rows (metadata.type_source == 'regex') are candidates; LLM-reclassified rows (type_source == 'llm') are OUT (the gate's idempotence — a reclassified row never earns a second verdict), and pre-gate legacy rows without the type_source stamp are NOT candidates (the v1 tight gate; the legacy backfill is an owner decision). Candidates are ordered reference_count DESC (the mis-typed row that is ACTUALLY referenced hurts the most — the MRR acceptance gate measures exactly these rows), id ASC tie-break, N-capped by consolidation.reclass_max_per_tick (default 3; 0 = the leg off, empty list). The dry_run flag (consolidation.reclass_dry_run, default False = direct apply; flip True to shadow-log) is surfaced in the response so the host leg can take the shadow branch without re-reading the store." + _FILEMEM_ROUTING_POINTER,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "description": "Explicit N-cap override; omitted = the hot-read consolidation.reclass_max_per_tick knob (default 3, 0 = leg off)."
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
                 "name": "filemem_delete",
                 "description": "Delete a memory by ID" + _FILEMEM_ROUTING_POINTER,
                 "parameters": {
@@ -14082,6 +14096,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 return self._tool_dream_pairs(args)
             elif tool_name == "filemem_combine_candidates":
                 return self._tool_combine_candidates(args)
+            elif tool_name == "filemem_reclass_candidates":
+                return self._tool_reclass_candidates(args)
             elif tool_name == "shared_memory_search":
                 return self._tool_shared_search(args)
             elif tool_name == "shared_memory_handoff":
@@ -15112,6 +15128,103 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         return json.dumps({"ok": True, "action": "candidates",
                             "candidates": out, "count": len(out), "total": total,
                             "cap": cap_n, "overlap": overlap},
+                           ensure_ascii=False, indent=2)
+
+    # ==================================================================
+    # DREAM V2 Stage 1 (FR-1) backport: the reclass_candidates face.
+    # The deterministic candidate gate for the LLM reclass leg: the
+    # pool's LOW-CONFIDENCE typing — the write gate's regex detector
+    # stamps metadata.type_source == "regex" on every auto-typed row;
+    # rows the LLM has already reclassified carry type_source == "llm"
+    # and are OUT of the pool (the gate's idempotence: a reclassified
+    # row never earns a second verdict). A row without the type_source
+    # stamp (pre-gate legacy residue) is NOT a candidate (the v1 tight
+    # gate; the legacy backfill is an owner decision, not the leg's).
+    # Ordering is reference_count DESC (the mis-typed row that is
+    # ACTUALLY referenced hurts the most — the MRR acceptance gate
+    # measures exactly these rows), id ASC tie-break; the N-cap is
+    # consolidation.reclass_max_per_tick (default 3, 0 = leg off).
+    # The dry_run flag (reclass_dry_run, default False = direct apply;
+    # flip True to shadow-log) is surfaced so the host leg can take
+    # the shadow branch without re-reading the store.
+    # ==================================================================
+    def _tool_reclass_candidates(self, args: Dict) -> str:
+        """The reclass candidate gate (FR-1): the low-confidence
+        regex-typed rows for the LLM reclass leg."""
+        cap_n = 3
+        dry_run = False
+        cons = self._assoc_cons_cfg()
+        try:
+            v = cons.get("reclass_max_per_tick")
+            if v is not None:
+                # 0 = the leg off (the schema contract); >0 = the N-cap.
+                cap_n = int(v)
+            dr = cons.get("reclass_dry_run")
+            if dr is not None:
+                dry_run = bool(dr)
+        except Exception:
+            pass
+        # The explicit `limit` override wins over the hot-read knob
+        # (0 = the leg off, empty candidate list).
+        try:
+            lim = args.get("limit")
+            if lim is not None:
+                cap_n = int(lim)
+        except Exception:
+            pass
+        if cap_n <= 0:
+            return json.dumps({"ok": True, "action": "candidates",
+                               "candidates": [], "count": 0, "cap": 0,
+                               "dry_run": dry_run},
+                              ensure_ascii=False, indent=2)
+        # The live pool: the 4 active shards, folded rows OUT, the
+        # FR-1 v1 gate = the type_source == "regex" rows ONLY.
+        cands: List[Dict[str, Any]] = []
+        for mem_type in self._ASSOC_ACTIVE_SHARDS:
+            mem_file = self.memories_dir / f"{mem_type}.json"
+            if not mem_file.exists():
+                continue
+            try:
+                with self._shard_lock(mem_file):
+                    rows = self._read_memories_file(mem_file)
+            except Exception:
+                continue
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                meta = r.get("metadata") or {}
+                if meta.get("superseded") or meta.get("stale") or meta.get("self_test"):
+                    continue
+                rid = r.get("id")
+                if not rid:
+                    continue
+                # the FR-1 v1 gate: the regex-typed rows ONLY. A row
+                # without the type_source stamp is NOT a candidate
+                # (the v1 tight gate; the legacy residue is the owner's
+                # backfill decision, not the leg's business). An
+                # LLM-typed row (type_source == "llm") is OUT (the
+                # idempotence: a reclassified row earns no second
+                # verdict).
+                if meta.get("type_source") != "regex":
+                    continue
+                try:
+                    ref = int(r.get("reference_count") or 0)
+                except Exception:
+                    ref = 0
+                cands.append({"id": rid, "mt": mem_type,
+                              "content": r.get("content") or "",
+                              "ref": ref})
+        # reference_count DESC (the mis-typed row that is ACTUALLY
+        # referenced hurts the most), id ASC tie-break.
+        cands.sort(key=lambda c: (-c["ref"], c["id"]))
+        total = len(cands)
+        cands = cands[:cap_n]
+        out = [{"id": c["id"], "type": c["mt"],
+                "content": c["content"], "reference_count": c["ref"]}
+               for c in cands]
+        return json.dumps({"ok": True, "action": "candidates",
+                            "candidates": out, "count": len(out), "total": total,
+                            "cap": cap_n, "dry_run": dry_run},
                            ensure_ascii=False, indent=2)
 
     def _tool_delete(self, args: Dict) -> str:
