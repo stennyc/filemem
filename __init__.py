@@ -12485,6 +12485,48 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 }
             },
             {
+                "name": "filemem_dream_pairs",
+                "description": "dream_pairs face (DREAM V2 C5 backport, S3①/②): the LLM judges HIGH-overlap row pairs for consolidation. Two actions: action='candidates' returns the live-pool Jaccard coarse-filter pairs (4 active shards, superseded/stale/self-test rows OUT, the directive-due pair exclusion via the SAME injection.directive_patterns the auto face stamps) sorted by (-overlap, idA, idB), lane-capped by consolidation.semantic_merge_max_per_tick / contradiction_max_per_tick (default 4 each) — the cost control that keeps the LLM off the full pool. action='verdicts' takes verdicts=[{face:'merge'|'contradiction', a_id, b_id, keep_id?, stale_id?, reason}] and applies them under the per-shard lock: merge -> the LOSER row gets the soft superseded flag + superseded_by=winner (reversible, no DELETE); contradiction -> the STALE row gets stale=true + stale_reason (the read-side O1 fold). Out-of-pair ids are REFUSED (a hallucinated winner/stale id would dangle the lineage); a self-pair (a_id==b_id) is refused + audited. Both reuse the Python-native metadata.superseded / metadata.stale primitives." + _FILEMEM_ROUTING_POINTER,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["candidates", "verdicts"],
+                            "default": "candidates",
+                            "description": "candidates = the Jaccard coarse-filter pairs to judge; verdicts = commit LLM merge/contradiction verdicts."
+                        },
+                        "face": {
+                            "type": "string",
+                            "enum": ["merge", "contradiction"],
+                            "default": "merge",
+                            "description": "candidates lane: which N-cap knob to use (semantic merge or contradiction)."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Explicit N-cap override for candidates; omitted = the hot-read lane knob."
+                        },
+                        "verdicts": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "face": {"type": "string", "enum": ["merge", "contradiction"]},
+                                    "a_id": {"type": "string"},
+                                    "b_id": {"type": "string"},
+                                    "keep_id": {"type": "string", "description": "merge only: the survivor (bounded to the pair)."},
+                                    "stale_id": {"type": "string", "description": "contradiction only: the row to stamp stale (bounded to the pair)."},
+                                    "reason": {"type": "string"}
+                                },
+                                "required": ["face", "a_id", "b_id"]
+                            },
+                            "description": "action='verdicts' only: the LLM's merge/contradiction verdicts to apply."
+                        }
+                    },
+                    "required": ["action"]
+                }
+            },
+            {
                 "name": "filemem_delete",
                 "description": "Delete a memory by ID" + _FILEMEM_ROUTING_POINTER,
                 "parameters": {
@@ -14022,6 +14064,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 return self._tool_search(args)
             elif tool_name == "filemem_associate":
                 return self._tool_associate(args)
+            elif tool_name == "filemem_dream_pairs":
+                return self._tool_dream_pairs(args)
             elif tool_name == "shared_memory_search":
                 return self._tool_shared_search(args)
             elif tool_name == "shared_memory_handoff":
@@ -14617,6 +14661,294 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         except Exception as _e:
             logger.warning(f"FileMem: association expansion hiccup ({_e}); "
                            "response unchanged (fail-soft)")
+
+    # ==================================================================
+    # DREAM V2 C5 backport (S3①/②): the dream_pairs face.
+    # The LLM judges HIGH-overlap row pairs for merge-fold /
+    # contradiction-stale verdicts. candidates = the live-pool Jaccard
+    # coarse filter (the 4 active shards, superseded/stale/self-test
+    # rows OUT, the directive-due pair exclusion via the SAME
+    # injection.directive_patterns the auto face stamps) — the cost
+    # control that keeps the LLM off the full pool. verdicts = apply
+    # the LLM verdicts: merge -> the LOSER row gets the soft
+    # superseded flag + superseded_by=winner (the EP-2 reversible
+    # fold, no DELETE); contradiction -> the STALE row gets stale=true
+    # + stale_reason (the read-side O1 fold consumes it). Out-of-pair
+    # ids are REFUSED (a hallucinated winner/stale id would break the
+    # lineage). Both reuse the Python-native metadata.superseded /
+    # metadata.stale / injection.directive_patterns primitives.
+    # ==================================================================
+    def _dream_duck_live_pool(self) -> List[Dict[str, Any]]:
+        """The dream candidate pool: the 4 active shards, folded rows
+        OUT, per-row content + created_at + token set for the Jaccard
+        coarse filter + the deterministic winner ordering."""
+        out: List[Dict[str, Any]] = []
+        try:
+            from search_index import tokenize
+        except Exception:
+            tokenize = None
+        for mem_type in self._ASSOC_ACTIVE_SHARDS:
+            mem_file = self.memories_dir / f"{mem_type}.json"
+            if not mem_file.exists():
+                continue
+            try:
+                with self._shard_lock(mem_file):
+                    rows = self._read_memories_file(mem_file)
+            except Exception:
+                continue
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                meta = r.get("metadata") or {}
+                if meta.get("superseded") or meta.get("stale") or meta.get("self_test"):
+                    continue
+                rid = r.get("id")
+                if not rid:
+                    continue
+                content = r.get("content") or ""
+                toks = set(tokenize(content)) if tokenize else set()
+                out.append({"id": rid, "mt": mem_type, "content": content,
+                            "created": str(r.get("created_at") or r.get("occurred_at") or ""),
+                            "toks": toks, "meta": meta})
+        return out
+
+    def _dream_directive_patterns(self) -> List:
+        """The P1-5 directive-pair exclusion patterns (the SAME
+        injection.directive_patterns table the auto face stamps with;
+        multilingual 改表不改码). Returns compiled regex list; empty =
+        no exclusion (the leg degrades to the pure semantic lane)."""
+        try:
+            inj = (self._decay.get("injection") or {})
+            pats = inj.get("directive_patterns") or []
+            compiled = []
+            for p in pats:
+                try:
+                    compiled.append(re.compile(p, re.I))
+                except Exception:
+                    continue
+            return compiled
+        except Exception:
+            return []
+
+    def _tool_dream_pairs(self, args: Dict) -> str:
+        """The dream_pairs face: candidates (Jaccard coarse filter) +
+        verdicts (LLM merge-fold / contradiction-stale application)."""
+        action = args.get("action", "candidates")
+        if action == "candidates":
+            return json.dumps(self._dream_candidates(args),
+                             ensure_ascii=False, indent=2)
+        elif action == "verdicts":
+            return json.dumps(self._dream_verdicts(args),
+                              ensure_ascii=False, indent=2)
+        else:
+            return json.dumps({
+                "error": (f"unknown dream_pairs action {action!r}; "
+                          "expected candidates/verdicts")})
+
+    def _dream_candidates(self, args: Dict) -> Dict[str, Any]:
+        # The overlap floor (the search.supersede_min_overlap knob,
+        # default 0.5 — the same knob the deterministic supersede gate
+        # uses).
+        min_overlap = 0.5
+        try:
+            srch = (self._decay.get("search") or {})
+            v = srch.get("supersede_min_overlap")
+            if v is not None and float(v) > 0:
+                min_overlap = float(v)
+        except Exception:
+            pass
+        live = self._dream_duck_live_pool()
+        if len(live) < 2:
+            return {"ok": True, "pairs": [], "count": 0, "dup_skipped": 0}
+        directive = self._dream_directive_patterns()
+        cands: List[Dict[str, Any]] = []
+        dup_skipped = 0
+        for i in range(len(live)):
+            for j in range(i + 1, len(live)):
+                ri, rj = live[i], live[j]
+                if ri["id"] == rj["id"]:
+                    dup_skipped += 1
+                    continue  # FR-0.2 dup-id guard: same-id is NOT a pair
+                ov = self._assoc_jaccard(ri["toks"], rj["toks"])
+                if ov < min_overlap:
+                    continue
+                # P1-5 directive-pair exclusion: a pair where BOTH rows
+                # carry the directive signal rides the recurring lane,
+                # not the semantic lane.
+                if directive:
+                    a_dir = any(c.search(ri["content"]) for c in directive)
+                    b_dir = any(c.search(rj["content"]) for c in directive)
+                    if a_dir and b_dir:
+                        continue
+                cands.append({"a": ri, "b": rj, "ov": ov})
+        cands.sort(key=lambda c: (-c["ov"], c["a"]["id"], c["b"]["id"]))
+        # Per-lane N-cap: explicit limit wins, else the hot-read knob
+        # (consolidation.semantic_merge_max_per_tick /
+        # contradiction_max_per_tick, default 4 each).
+        limit = 0.0
+        try:
+            limit = float(args.get("limit") or 0)
+        except Exception:
+            limit = 0.0
+        if limit <= 0:
+            lane = args.get("face", "merge")
+            key = ("contradiction_max_per_tick" if lane == "contradiction"
+                   else "semantic_merge_max_per_tick")
+            limit = 4.0
+            try:
+                con = (self._decay.get("consolidation") or {})
+                v = con.get(key)
+                if v is not None and float(v) > 0:
+                    limit = float(v)
+            except Exception:
+                pass
+        if limit > 0 and len(cands) > int(limit):
+            cands = cands[:int(limit)]
+        out = [{
+            "a": {"id": c["a"]["id"], "type": c["a"]["mt"],
+                  "content": c["a"]["content"], "created_at": c["a"]["created"]},
+            "b": {"id": c["b"]["id"], "type": c["b"]["mt"],
+                  "content": c["b"]["content"], "created_at": c["b"]["created"]},
+            "overlap": round(c["ov"], 4),
+        } for c in cands]
+        res = {"ok": True, "pairs": out, "count": len(out),
+               "dup_skipped": dup_skipped}
+        if dup_skipped > 0:
+            try:
+                self._append_consolidation_event({
+                    "ts": _utcnow().isoformat(),
+                    "action": "dup_pair_skipped",
+                    "skipped": dup_skipped,
+                    "note": ("same-id live pairs skipped (the dup-id residue; "
+                             "the housekeeping sweep owns it)"),
+                })
+            except Exception:
+                pass
+        return res
+
+    def _dream_stamp_row(self, rid: str, patch: Dict[str, Any]) -> None:
+        """Apply a metadata patch to the row's SHARD (the RMW write-back
+        under the per-shard lock). The row's mem_type is looked up
+        across the 4 active shards; the patch merges into
+        row['metadata']."""
+        for mem_type in self._ASSOC_ACTIVE_SHARDS:
+            mem_file = self.memories_dir / f"{mem_type}.json"
+            if not mem_file.exists():
+                continue
+            with self._shard_lock(mem_file):
+                rows = self._read_memories_file(mem_file)
+                hit = 0
+                for r in rows:
+                    if isinstance(r, dict) and r.get("id") == rid:
+                        meta = r.setdefault("metadata", {})
+                        meta.update(patch)
+                        hit += 1
+                if hit:
+                    with open(mem_file, "w", encoding="utf-8") as f:
+                        json.dump(rows, f, ensure_ascii=False, indent=2)
+                    return
+
+    def _dream_verdicts(self, args: Dict) -> Dict[str, Any]:
+        raw = args.get("verdicts") or []
+        merged: List[str] = []
+        staled: List[str] = []
+        refused: List[str] = []
+        live = self._dream_duck_live_pool()
+        pool = {r["id"] for r in live}
+        created = {r["id"]: r["created"] for r in live}
+        for v in raw:
+            if not isinstance(v, dict):
+                continue
+            face = str(v.get("face") or "")
+            a_id = str(v.get("a_id") or "").strip()
+            b_id = str(v.get("b_id") or "").strip()
+            reason = str(v.get("reason") or "")
+            if not a_id or not b_id:
+                continue
+            # FR-0.2 self-pair refusal: a keep/stale verdict naming ONE
+            # id twice would self-fold a live row (refuse + audit,
+            # never apply).
+            if a_id == b_id:
+                refused.append(a_id)
+                try:
+                    self._append_consolidation_event({
+                        "ts": _utcnow().isoformat(),
+                        "action": "dream_verdict_refused",
+                        "face": face, "pair": [a_id, b_id],
+                        "reason": "self_pair (the FR-0.2 dup-id guard)"})
+                except Exception:
+                    pass
+                continue
+            # pair-boundary guard on the pair ENDS themselves: either
+            # endpoint outside the live pool = a hallucinated id (the
+            # fold/stamp would point lineage at a non-existent row).
+            if a_id not in pool or b_id not in pool:
+                bad = b_id if a_id in pool else a_id
+                refused.append(bad)
+                try:
+                    self._append_consolidation_event({
+                        "ts": _utcnow().isoformat(),
+                        "action": "dream_verdict_refused",
+                        "face": face, "pair": [a_id, b_id],
+                        "reason": "out-of-pool endpoint (the C8 pair-boundary guard; the hallucinated id would dangle the lineage)"})
+                except Exception:
+                    pass
+                continue
+            if face == "merge":
+                keep = str(v.get("keep_id") or "")
+                winner, loser = a_id, b_id
+                if keep:
+                    if keep not in (a_id, b_id):
+                        # pair-boundary guard: a keep OUTSIDE the pair
+                        # is REFUSED (the fold would dangle the lineage).
+                        refused.append(keep)
+                        continue
+                    winner, loser = keep, (b_id if keep == a_id else a_id)
+                # else: deterministic survivor ordering — the newer
+                # created_at wins (same-second tie -> higher id), so
+                # the LLM's keep is bounded to the pair.
+                else:
+                    ca, cb = created.get(a_id, ""), created.get(b_id, "")
+                    if (cb > ca) or (cb == ca and b_id > a_id):
+                        winner, loser = b_id, a_id
+                if loser not in pool:
+                    refused.append(loser)
+                    continue
+                # merge fold = the soft superseded flag only (the loser is
+                # RETIRED, not stale — do NOT co-stamp stale_reason; that
+                # would dangle a stale hint on a retired row). Reversible
+                # via clearing metadata.superseded.
+                self._dream_stamp_row(loser, {
+                    "superseded": True,
+                    "superseded_by": winner,
+                })
+                merged.append(f"{winner}<-{loser}")
+            elif face == "contradiction":
+                stale_id = str(v.get("stale_id") or "")
+                target = stale_id or b_id
+                if stale_id and stale_id not in (a_id, b_id):
+                    # pair-boundary guard: a stale OUTSIDE the pair is
+                    # REFUSED.
+                    refused.append(stale_id)
+                    continue
+                if target not in pool:
+                    refused.append(target)
+                    continue
+                self._dream_stamp_row(target, {
+                    "stale": True,
+                    "stale_reason": "contradiction verdict: " + reason,
+                })
+                staled.append(target)
+            else:
+                return {"ok": False,
+                        "error": f"unknown dream face {face!r}; "
+                                 "expected merge/contradiction"}
+        return {"ok": True, "merged": merged, "staled": staled,
+                "refused": refused,
+                "note": ("merge folds are the soft superseded flag "
+                         "(reversible, no DELETE); a stale verdict "
+                         "stamps the read-side O1 fold. Both reuse the "
+                         "Python-native metadata.superseded/stale.")}
 
     def _tool_delete(self, args: Dict) -> str:
         """Delete a memory."""
