@@ -243,6 +243,48 @@ def test_bringback_no_new_rows_vs_v2_confirmed_leg():
     assert _auto_inject_eligible(prev_dirty, "default", "s_cur") is False
 
 
+def test_bringback_pin_leg_waives_confirmed_gate(tmp_path):
+    """2026-11-24 decoupling ruling: when a bringback pin is active, the
+    pin session's UNCONFIRMED cross-session row surfaces into the result set
+    (the 4th arg bringback_session_id waives the confirmed gate), while the
+    profile-isolation leg and the O1 lifecycle fold leg STILL cut — the pin
+    leg waives ONLY the confirmed gate, never isolation / lifecycle.
+
+    (1) no pin (4th arg None) -> V2 two-leg unchanged: unconfirmed cut.
+    (2) pin active + unconfirmed pin row -> SURFACES (the new pin leg).
+    (3) pin active + cross-PROFILE pin row -> still CUT (isolation leg).
+    (4) pin active + superseded pin row -> still CUT (O1 lifecycle leg).
+    (5) pin active + a NON-pin unconfirmed cross-session row -> still CUT
+        (the pin leg waives only the pin session's own rows, not every
+        unconfirmed row — the confirmed gate stays in force for the rest)."""
+    pin_unconf = _row("pin dirty", sp="default", confirmed=False,
+                      session_id="s_prev", mem_type="episodic")
+    pin_conf = _row("pin conf", sp="default", confirmed=True,
+                    session_id="s_prev", mem_type="episodic")
+    # (1) no pin -> unconfirmed cut (zero-regression sentinel)
+    assert _auto_inject_eligible(pin_unconf, "default", "s_cur", None) is False
+    assert _auto_inject_eligible(pin_conf, "default", "s_cur", None) is True
+    # (2) pin active -> unconfirmed pin row surfaces
+    assert _auto_inject_eligible(pin_unconf, "default", "s_cur", "s_prev") is True
+    assert _auto_inject_eligible(pin_conf, "default", "s_cur", "s_prev") is True
+    # (3) pin active but cross-PROFILE pin row -> isolation leg still cuts
+    pin_xprofile = _row("pin xprofile", sp="other", confirmed=False,
+                        session_id="s_prev", mem_type="episodic")
+    assert _auto_inject_eligible(
+        pin_xprofile, "default", "s_cur", "s_prev") is False
+    # (4) pin active but superseded pin row -> O1 lifecycle leg still cuts
+    pin_sup = _row("pin sup", sp="default", confirmed=True,
+                   session_id="s_prev", mem_type="episodic")
+    pin_sup["metadata"]["superseded"] = True
+    assert _auto_inject_eligible(pin_sup, "default", "s_cur", "s_prev") is False
+    # (5) pin active, a DIFFERENT (non-pin) unconfirmed cross-session row
+    # -> confirmed gate still in force for it (waived only for the pin)
+    other_unconf = _row("other dirty", sp="default", confirmed=False,
+                        session_id="s_other", mem_type="episodic")
+    assert _auto_inject_eligible(
+        other_unconf, "default", "s_cur", "s_prev") is False
+
+
 # ── (2) P1 last-closed-session stamp ───────────────────────────────────────────
 
 

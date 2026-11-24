@@ -1011,7 +1011,8 @@ def _auto_recall_filter(pool: List[Dict[str, Any]], session_sp: Optional[str]) -
 
 
 def _auto_inject_eligible(row: Any, session_sp: Optional[str],
-                          cur_session_id: Optional[str]) -> bool:
+                          cur_session_id: Optional[str],
+                          bringback_session_id: Optional[str] = None) -> bool:
     """SESSION_ISOLATION_V2: auto-inject 面骨架谓词（owner 2026-10-10 定稿）。
 
     三面共用（prefetch / P3 回放 / egress）：
@@ -1026,6 +1027,14 @@ def _auto_inject_eligible(row: Any, session_sp: Optional[str],
       # 腿，不豁免隔离/生命周期腿）。
       (1) profile 隔离   _auto_recall_eligible(row_sp, session_sp)  # P0-2 不变
       (2) O1 折出        not _o1_fold_out_of_auto(row)             # 不变
+      (2.5) BRINGBACK pin 腿（owner 2026-11-24 脱离裁定）: 第 4 参
+          bringback_session_id 非 None 时，row.session_id == 该 pin 的跨
+          session 行直接收——**绕过 confirmed 门**（pin 行的 surface 是
+          bringback 排序面的本意，不依赖行是否 confirmed），但 profile
+          隔离腿 (1) 与 O1 折出腿 (2) 仍照常生效（pin 腿只豁免 confirmed
+          门，不豁免隔离/生命周期腿，与 S5 reclaimed 腿同姿势）。
+          bringback_session_id=None（默认，非 bringback）→ 此腿恒 False，
+          行为字节等价现状（零回归不变量）。
       (3) confirmed 门（C-b）:
             row 带 session_id == cur_session_id   -> 收（当前 session 全收，
                 仅 episodic 池行有 session_id；memories 池行无此字段）
@@ -1035,47 +1044,52 @@ def _auto_inject_eligible(row: Any, session_sp: Optional[str],
       cur_session_id=None → (3) 只剩 confirmed 腿。
     纯 dict 读、fail-soft，永不 raise。
 
-    BRINGBACK 注（owner 2026-10-10 复盘）：此谓词曾有过第 4 参 bringback_session_id
-    （"带回腿"），被证伪为 0 边际死代码后删除（B2 路 A）——"上一 session 的
-    confirmed 行"已被 confirmed 全局腿（L526）无条件覆盖，再叠一条"上 session +
-    confirmed"腿不新增任何行（no-margin，实证 no-margin across all row shapes）。
-    "带回"的真实价值因此改落在【排序】而非【收行谓词】：P4 选 bring_back 时，
-    prefetch 把"上一 session 的 confirmed 行"在 auto 面结果里【置顶】（见
-    _bringback_reorder_key），而不是新增一条收行腿。收行语义不变（V2 两腿）。"""
+    历史注（owner 2026-10-10 复盘 B2 路 A）：此谓词曾有第 4 参
+    bringback_session_id（"带回腿"），被证伪为 0 边际死代码删除——当时
+    "上一 session 的 confirmed 行"已被 confirmed 全局腿无条件覆盖。
+    2026-11-24 脱离裁定（owner）把 bringback 定义为纯 surface 面：pin
+    session 的**未 confirmed 行也要 surface**（新 session 接手旧 session
+    上下文，不依赖行是否 confirmed），所以第 4 参按【豁免 confirmed 门
+    的 pin 腿】加回——收行谓词带 pin session 戳的精准豁免，非全废
+    confirmed 门。非 bringback（第 4 参 None）时本腿恒 False，收行语义
+    回到 V2 两腿（零回归）。"""
     try:
         if not isinstance(row, dict):
             return False
         # (0) plan-type fold (PLAN-type PRD §10): plan rows never auto-inject
         if row.get("type") == "plan" or (row.get("metadata") or {}).get("plan_id"):
             return False
-        # S5 reactivation leg (owner 双管齐下 2026-11-20): a row flagged
-        # `reclaimed=True` is a staging-浮出层 projection of an already-
-        # expired source that the archive cascade just pulled back in — its
-        # very presence means "this source is worth surfacing", which is
-        # exactly the confirmed-equivalent signal the gate below asks for.
-        # Without this leg, every reclaimed row (typically an L0 env fact
-        # that was never confirmed) gets folded out by the confirmed leg,
-        # and the archive bucket — the ONLY entry point for an expired
-        # source (owner S5 §3: 暂存投影是唯一入口) — never reaches the
-        # auto-inject face. Placement: AFTER profile isolation + O1 fold
-        # (a cross-profile or superseded/lapsed projection still folds —
-        # the reclaim flag only waives the CONFIRMED leg, not the
-        # isolation / lifecycle legs), BEFORE the confirmed gate. The
-        # EXPLICIT search face does not run this predicate (it keeps its
-        # full unfiltered pool), so this leg is auto-face-only; a row that
-        # later becomes confirmed re-enters the ordinary confirmed leg.
-        # Zero LLM, pure dict read, fail-soft.
+        # (1) profile isolation (P0-2, unchanged; runs before any exemption
+        # leg — a cross-profile pin row still folds; bringback does not waive
+        # profile isolation, only the confirmed gate below).
         if session_sp is not None:
             if not _auto_recall_eligible(_row_source_profile(row), session_sp):
                 return False
+        # (2) O1 fold-out (superseded / lapsed — lifecycle leg, unchanged;
+        # runs before any exemption leg — a superseded/lapsed pin row still
+        # folds; bringback does not waive the lifecycle leg).
         if _o1_fold_out_of_auto(row):
             return False
+        # S5: staging projection waives the confirmed leg
         if row.get("reclaimed"):
             return True  # S5: staging projection waives the confirmed leg
+        # (2.5) BRINGBACK pin leg (owner 2026-11-24 decoupling ruling): when a
+        # bringback pin session is active, a cross-session row stamped with
+        # that pin's session_id surfaces EVEN IF unconfirmed — bringback is a
+        # pure surfacing face (a new session taking over an older one's
+        # continuity context, independent of whether those rows are
+        # confirmed). The pin leg waives ONLY the confirmed gate; the profile
+        # isolation leg (1) and the O1 lifecycle fold leg (2) above already
+        # ran and can still reject the row. bringback_session_id=None
+        # (default, non-bringback) -> this leg is inert (byte-identical to
+        # the V2 two-leg collection: no pin, no exemption).
+        sid = row.get("session_id")
+        if bringback_session_id is not None \
+                and sid is not None and sid == bringback_session_id:
+            return True
         # (3) confirmed 门（C-b）：当前 session 行（episodic 带 session_id）
         # 或 confirmed 全局行，二者 OR；memories 旧行（无 session_id）
         # 只认 confirmed。
-        sid = row.get("session_id")
         if sid is not None and sid == cur_session_id and cur_session_id:
             return True
         return bool(((row.get("metadata") or {}).get("confirmed")))
@@ -5169,9 +5183,31 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             _c_pre = len(results)
             _cur_sid_full = getattr(self, "_turn_active_sid", None) \
                 or getattr(self, "session_id", None) or session_id
+            # BRINGBACK pin leg (owner 2026-11-24 decoupling ruling): when a
+            # bringback pin is active (choice == 'bring_back' or an explicit
+            # named pin carried by the 'fresh' default), resolve the pin
+            # session id HERE (before the confirmed gate) so the confirmed
+            # gate's collection predicate can waive it — the pin session's
+            # UNCONFIRMED cross-session rows surface into the result set
+            # (bringback is a pure surfacing face, independent of confirmed;
+            # the pin leg waives only the confirmed gate, not profile
+            # isolation / O1 lifecycle fold). Non-bringback -> pin_sid is
+            # None -> the predicate's 4th arg is inert -> byte-identical to
+            # the V2 two-leg collection (zero-regression invariant).
+            _pin_sid = None
+            if _bb_choice in ("bring_back", "fresh"):
+                _pin_sid = self._get_bringback_pin_sid(
+                    _cur_sid_full)
+                if _pin_sid is None:
+                    # fall back to the last_closed resolution the post-gate
+                    # reorder leg uses (the bring_back default target)
+                    _pin_sid = self._resolve_bringback_session_id(
+                        _cur_sid_full)
             results = [
                 r for r in results
-                if _auto_inject_eligible(r, _session_sp, _cur_sid_full)
+                if _auto_inject_eligible(
+                    r, _session_sp, _cur_sid_full,
+                    bringback_session_id=_pin_sid)
             ]
             _c_folded = _c_pre - len(results)
             # P1 relay-block read-side fold (owner 裁决①, 2026-10-13):
