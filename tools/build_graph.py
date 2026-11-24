@@ -351,11 +351,59 @@ def _build_cooccurrence(items) -> list:
 
 # ── assembly + determinism gates ───────────────────────────────────────────
 
+def _build_association(node_ids, storage_root: Path):
+    """P8 对齐 Go: C6④ ledger fold — 把 associate 台账 (association_edges.jsonl)
+    的 LLM 关联边折进 graph (kind=association, w=0.5, 对齐 Go 读侧 0.5 系数)。
+
+    独立 CLI 纯文件读 (不依赖 provider): 台账行 {a, b, relation, ...}, 端点
+    对取 (lo,hi) 排序。两端都在 node set 的才加边 (端点已退出 node set 的
+    skip, 对齐 Go "台账在则边在 / 端点离池则边按设计落, 不静默丢"); 同 pair
+    去重; 坏行/缺台账 fail-soft (缺台账 = 空 digest, 无边姿态)。
+    返回 (assoc_edges, ledger_hash, notes)。"""
+    ledger = storage_root / "association_edges.jsonl"
+    raw = b""
+    try:
+        raw = ledger.read_bytes()
+    except Exception:
+        raw = b""
+    import hashlib
+    ledger_hash = hashlib.sha256(raw).hexdigest()
+    node_set = set(node_ids)
+    out = []
+    seen = set()
+    notes = []
+    for line in raw.decode("utf-8", "replace").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue  # a corrupt line is skipped (fail-soft; append-only ledger)
+        if not isinstance(e, dict):
+            continue
+        a, b = e.get("a"), e.get("b")
+        if not a or not b:
+            continue
+        lo, hi = (a, b) if a <= b else (b, a)
+        if lo not in node_set or hi not in node_set:
+            notes.append(f"association edge {lo}->{hi} skipped (a ledger endpoint left the node set)")
+            continue
+        key = lo + "\u0000" + hi
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"src": lo, "dst": hi, "kind": "association", "w": 0.5})
+    return out, ledger_hash, notes
+
+
 def build_graph(storage_root: Path) -> dict:
     """Deterministic full build. Same corpus -> same file, byte for byte
     (see module docstring): sorted adjacency, sort_keys serialization, and
-    a fingerprint over nodes+edges only (a field of the file, never an
-    input to it — idempotency by construction)."""
+    a fingerprint over nodes+edges+the C6④ association-ledger digest
+    (a field of the file, never an input to it — idempotency by
+    construction; P8: the ledger digest is a fingerprint INPUT so a ledger
+    change re-runs the fold, matching the reference graph_build)."""
     cfg = load_search_config(storage_root)
     items, ids = collect_corpus(storage_root)
     # SA2-6 (owner 2026-11-12): per-kind bucket quotas replace the pre-SA2-6
@@ -436,29 +484,62 @@ def build_graph(storage_root: Path) -> dict:
             degree[e["dst"]] = degree.get(e["dst"], 0) + 1
             kept.append(e)
             kept_count += 1
+    # P8 对齐 Go: C6④ ledger fold — the LLM association edges (from the
+    # durable association_edges.jsonl ledger) are folded in AFTER the three
+    # deterministic kinds: they sit LAST in the cap order so the deterministic
+    # kinds keep their cap priority (the ledger owns persistence, not quota).
+    # Constrained only by the _TOTAL_CAP + _DEG_CAP + same-pair dedup.
+    assoc_edges, ledger_hash, assoc_notes = _build_association(ids, storage_root)
+    seen_all = {(e["src"], e["dst"], e["kind"]) for e in kept}
+    for e in assoc_edges:
+        if len(kept) >= _TOTAL_CAP:
+            break
+        key = (e["src"], e["dst"], e["kind"])
+        if key in seen_all:
+            continue
+        if degree.get(e["src"], 0) >= _DEG_CAP or degree.get(e["dst"], 0) >= _DEG_CAP:
+            continue
+        seen_all.add(key)
+        degree[e["src"]] = degree.get(e["src"], 0) + 1
+        degree[e["dst"]] = degree.get(e["dst"], 0) + 1
+        kept.append(e)
     node_list = sorted(ids)
-    fp_src = json.dumps([{"n": node_list},
+    # P8: the ledger digest joins the fingerprint INPUT (the reference recipe:
+    # nodes + minimal edges + the C6④ ledger digest — a ledger change ALWAYS
+    # changes the fingerprint, so the fold re-runs; a deleted ledger drops the
+    # LLM edges by design, never a silent loss). The digest is also persisted
+    # on the doc so graph_fingerprint (the re-run drift check) uses the SAME
+    # recipe — otherwise a build that folds the ledger would never match its
+    # own re-run fingerprint.
+    fp_src = json.dumps([{"n": node_list, "ledger": ledger_hash},
                          [{"src": e["src"], "dst": e["dst"], "kind": e["kind"],
                            "w": e["w"]} for e in kept]],
                         ensure_ascii=False, sort_keys=True)
-    return {
+    doc = {
         "version": 1,
         "fingerprint": hashlib.sha256(fp_src.encode("utf-8")).hexdigest(),
+        "ledger_digest": ledger_hash,
         "node_count": len(node_list),
         "edge_count": len(kept),
         "nodes": [{"id": i} for i in node_list],
         "edges": kept,
     }
+    if assoc_notes:
+        doc["association_notes"] = assoc_notes
+    return doc
 
 
 def graph_fingerprint(graph: dict) -> str:
-    """Fingerprint of a BUILT graph (nodes+edges only, same recipe as the
-    build) — used to detect corpus drift on re-run: if the recomputed
-    fingerprint equals the stored one, the file is already current and the
-    write is skipped (idempotent second run)."""
+    """Fingerprint of a BUILT graph (nodes+edges+the C6④ ledger digest, same
+    recipe as the build) — used to detect corpus drift on re-run: if the
+    recomputed fingerprint equals the stored one, the file is already current
+    and the write is skipped (idempotent second run). P8: the ledger digest
+    (persisted as graph['ledger_digest']) joins the input so a ledger change
+    re-runs the fold, matching the build's recipe."""
     edges_min = [{"src": e["src"], "dst": e["dst"], "kind": e["kind"], "w": e["w"]}
                  for e in graph.get("edges", [])]
-    fp_src = json.dumps([{"n": [n.get("id") for n in graph.get("nodes", [])]},
+    fp_src = json.dumps([{"n": [n.get("id") for n in graph.get("nodes", [])],
+                          "ledger": graph.get("ledger_digest", "")},
                          [e for e in edges_min]],
                         ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(fp_src.encode("utf-8")).hexdigest()
