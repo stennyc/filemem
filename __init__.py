@@ -12450,6 +12450,41 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 }
             },
             {
+                "name": "filemem_associate",
+                "description": "Associate face (DREAM V2 FR-3 + C6④ backport): the LLM judges RELATES-TO edges between the pool's live rows that deterministic co-occurrence under-connects; the edges land in a durable append-only ledger (storage/association_edges.jsonl, the source of truth). Two actions: action='candidates' returns the same-shard Jaccard pre-screen pairs (overlap >= consolidation.associate_overlap, default 0.5; N-capped by consolidation.associate_max_per_tick, default 4) the LLM should judge next tick; action='verdicts' takes verdicts=[{a_id,b_id,relation,reason}] and writes the accepted edges to the ledger (an out-of-pool endpoint is REFUSED + audited, a re-run of a judged edge is idempotent dedup). Read-side expansion is opt-in (consolidation.association_expand, default False: filemem_search responses add NO keys; when True each hit carries its ledger-backed 1-hop neighbors at a 0.5 score coefficient, live-gate-excluded, 4-per-hit cap)." + _FILEMEM_ROUTING_POINTER,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["candidates", "verdicts"],
+                            "default": "candidates",
+                            "description": "candidates = the same-shard Jaccard pre-screen pairs to judge; verdicts = commit LLM-judged edges to the durable ledger."
+                        },
+                        "verdicts": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "a_id": {"type": "string"},
+                                    "b_id": {"type": "string"},
+                                    "relation": {"type": "string"},
+                                    "reason": {"type": "string", "description": "why these two rows relate (audit trail)"},
+                                    "model_used": {"type": "boolean"}
+                                },
+                                "required": ["a_id", "b_id"]
+                            },
+                            "description": "action='verdicts' only: the LLM's judged RELATES-TO edges to commit."
+                        },
+                        "tick_id": {
+                            "type": "string",
+                            "description": "Optional provenance stamp for the verdict batch (audit)."
+                        }
+                    },
+                    "required": ["action"]
+                }
+            },
+            {
                 "name": "filemem_delete",
                 "description": "Delete a memory by ID" + _FILEMEM_ROUTING_POINTER,
                 "parameters": {
@@ -13985,6 +14020,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 return self._tool_write(args)
             elif tool_name == "filemem_search":
                 return self._tool_search(args)
+            elif tool_name == "filemem_associate":
+                return self._tool_associate(args)
             elif tool_name == "shared_memory_search":
                 return self._tool_shared_search(args)
             elif tool_name == "shared_memory_handoff":
@@ -14246,10 +14283,340 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                          + " — rebuild it with tools/build_graph.py "
                          "(read-only ops call, no LLM)."),
             }
+        _assoc_envelope = {
+            "recall_scope": recall_scope, "graph": _graph_field,
+            "results": results,
+        }
+        # C6① read-side association expansion: OFF = byte-stable (zero
+        # added keys); ON = additive keys only. Fail-soft: a hiccup
+        # never changes the search outcome.
+        self._apply_association_expansion(_assoc_envelope)
         return json.dumps(
-            {"recall_scope": recall_scope, "graph": _graph_field,
-             "results": results},
+            _assoc_envelope,
             ensure_ascii=False, indent=2)
+
+    # ==================================================================
+    # DREAM V2 backport (FR-3 + C6④): the associate face.
+    # The LLM judges RELATES-TO edges between the pool's live rows that
+    # the deterministic co-occurrence under-connects; the edges land in
+    # a DURABLE append-only LEDGER (storage/association_edges.jsonl) —
+    # the C6④ ruling: the ledger is the source of truth. Read-side
+    # expansion is opt-in (consolidation.association_expand, default
+    # False = byte-stable red line, zero response keys added when off).
+    # ==================================================================
+    _ASSOC_ACTIVE_SHARDS = _SETTLED_SCAN_SHARDS  # fact/task/decision/preference
+
+    def _assoc_ledger_path(self) -> Path:
+        return self.storage_dir / "association_edges.jsonl"
+
+    def _assoc_read_ledger(self) -> Tuple[set, str]:
+        """Return (normalized {lo\\x00hi} pair set, sha256 of file bytes).
+
+        A missing ledger = an EMPTY set + the empty-content digest
+        (the 无边 posture). Corrupt lines are skipped (fail-soft; the
+        ledger is append-only — a bad line is an audit matter, never a
+        rebuild blocker).
+        """
+        seen: set = set()
+        raw = b""
+        p = self._assoc_ledger_path()
+        try:
+            raw = p.read_bytes()
+        except Exception:
+            raw = b""
+        digest = hashlib.sha256(raw).hexdigest()
+        for line in raw.decode("utf-8", "replace").split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            a = e.get("a") if isinstance(e, dict) else None
+            b = e.get("b") if isinstance(e, dict) else None
+            if not a or not b:
+                continue
+            lo, hi = (a, b) if a <= b else (b, a)
+            seen.add(lo + "\u0000" + hi)
+        return seen, digest
+
+    def _assoc_ledger_pairs(self) -> List[Tuple[str, str]]:
+        """The ledger's normalized (lo,hi) pair list in line order."""
+        out: List[Tuple[str, str]] = []
+        p = self._assoc_ledger_path()
+        try:
+            raw = p.read_bytes().decode("utf-8", "replace")
+        except Exception:
+            return out
+        for line in raw.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            a = e.get("a") if isinstance(e, dict) else None
+            b = e.get("b") if isinstance(e, dict) else None
+            if not a or not b:
+                continue
+            lo, hi = (a, b) if a <= b else (b, a)
+            out.append((lo, hi))
+        return out
+
+    def _assoc_append_ledger_line(self, lo: str, hi: str, relation: str,
+                                  reason: str, tick_id: str = "") -> None:
+        """Append ONE normalized edge line under the shard lock."""
+        line = json.dumps({
+            "ts": _utcnow().isoformat(),
+            "a": lo, "b": hi,
+            "relation": relation,
+            "reason": reason,
+            "source": "llm",
+            "tick_id": tick_id,
+        }, ensure_ascii=False, sort_keys=True)
+        p = self._assoc_ledger_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with self._shard_lock(p):
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    def _assoc_live_pool(self) -> List[Dict[str, Any]]:
+        """The candidate gate's pool: the 4 active shards, folded/stale/
+        self-test rows OUT, per-row content for the Jaccard pre-screen."""
+        out: List[Dict[str, Any]] = []
+        try:
+            from search_index import tokenize
+        except Exception:
+            tokenize = None
+        for mem_type in self._ASSOC_ACTIVE_SHARDS:
+            mem_file = self.memories_dir / f"{mem_type}.json"
+            if not mem_file.exists():
+                continue
+            try:
+                with self._shard_lock(mem_file):
+                    rows = self._read_memories_file(mem_file)
+            except Exception:
+                continue
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                meta = r.get("metadata") or {}
+                if meta.get("superseded") or meta.get("stale") or meta.get("self_test"):
+                    continue
+                rid = r.get("id")
+                if not rid:
+                    continue
+                toks = set(tokenize(r.get("content") or "")) if tokenize else set()
+                out.append({"id": rid, "mt": mem_type,
+                            "content": r.get("content") or "", "toks": toks})
+        return out
+
+    @staticmethod
+    def _assoc_jaccard(a: set, b: set) -> float:
+        if not a or not b:
+            return 0.0
+        inter = len(a & b)
+        union = len(a | b)
+        return inter / union if union else 0.0
+
+    def _tool_associate(self, args: Dict) -> str:
+        """The associate face: candidates (Jaccard pre-screen) + verdicts
+        (LLM-judged edges -> durable ledger). See the schema in
+        get_tool_schemas for the action/verdicts shape."""
+        action = args.get("action", "candidates")
+        if action == "candidates":
+            return json.dumps(
+                self._assoc_candidates(args), ensure_ascii=False, indent=2)
+        elif action == "verdicts":
+            return json.dumps(
+                self._assoc_verdicts(args), ensure_ascii=False, indent=2)
+        else:
+            return json.dumps({
+                "error": (f"unknown associate action {action!r}; "
+                          "expected candidates/verdicts")})
+
+    def _assoc_cons_cfg(self) -> Dict[str, Any]:
+        try:
+            return (self._decay.get("consolidation") or {})
+        except Exception:
+            return {}
+
+    def _assoc_candidates(self, args: Dict) -> Dict[str, Any]:
+        cons = self._assoc_cons_cfg()
+        overlap = 0.5
+        cap_n = 4
+        try:
+            ov = cons.get("associate_overlap")
+            if ov is not None and float(ov) > 0:
+                overlap = float(ov)
+            cm = cons.get("associate_max_per_tick")
+            if cm is not None:
+                cap_n = int(cm)
+        except Exception:
+            pass
+        if cap_n <= 0:
+            return {"ok": True, "action": "candidates", "pairs": [],
+                    "count": 0, "cap": 0, "overlap": overlap}
+        live = self._assoc_live_pool()
+        if len(live) < 2:
+            return {"ok": True, "action": "candidates", "pairs": [],
+                    "count": 0, "cap": cap_n, "overlap": overlap}
+        # Per-shard bucket cap (the O(n^2) control; deterministic order).
+        bucket_cap = 200
+        per_shard: Dict[str, int] = {}
+        kept: List[int] = []
+        for i, r in enumerate(live):
+            if per_shard.get(r["mt"], 0) >= bucket_cap:
+                continue
+            per_shard[r["mt"]] = per_shard.get(r["mt"], 0) + 1
+            kept.append(i)
+        ledger, _ = self._assoc_read_ledger()
+        pairs: List[Dict[str, Any]] = []
+        for i in range(len(kept)):
+            for j in range(i + 1, len(kept)):
+                ri, rj = live[kept[i]], live[kept[j]]
+                if ri["mt"] != rj["mt"]:
+                    continue  # same-shard gate
+                if ri["id"] == rj["id"]:
+                    continue  # FR-0.2 dup-id guard
+                ov = self._assoc_jaccard(ri["toks"], rj["toks"])
+                if ov < overlap:
+                    continue
+                lo, hi = (ri["id"], rj["id"]) if ri["id"] <= rj["id"] else (rj["id"], ri["id"])
+                if (lo + "\u0000" + hi) in ledger:
+                    continue  # C6④ idempotency: ledger already has this edge
+                pairs.append({"a": ri, "b": rj, "ov": ov})
+        pairs.sort(key=lambda p: (-p["ov"], p["a"]["id"], p["b"]["id"]))
+        total = len(pairs)
+        pairs = pairs[:cap_n]
+        out = [{
+            "a": {"id": p["a"]["id"], "type": p["a"]["mt"], "content": p["a"]["content"]},
+            "b": {"id": p["b"]["id"], "type": p["b"]["mt"], "content": p["b"]["content"]},
+            "overlap": round(p["ov"], 4),
+        } for p in pairs]
+        return {"ok": True, "action": "candidates", "pairs": out,
+                "count": len(out), "total": total, "cap": cap_n,
+                "overlap": overlap}
+
+    def _assoc_verdicts(self, args: Dict) -> Dict[str, Any]:
+        raw = args.get("verdicts") or []
+        tick_id = args.get("tick_id", "")
+        live = self._assoc_live_pool()
+        pool = {r["id"] for r in live}
+        ledger, _ = self._assoc_read_ledger()
+        applied = 0
+        deduped = 0
+        refused: List[str] = []
+        added: set = set()  # batch-internal dedup
+        for v in raw:
+            if not isinstance(v, dict):
+                continue
+            a_id = str(v.get("a_id") or "").strip()
+            b_id = str(v.get("b_id") or "").strip()
+            relation = str(v.get("relation") or "")
+            reason = str(v.get("reason") or "")
+            if not a_id or not b_id:
+                continue
+            # C8 pair-boundary guard: an out-of-pool endpoint is a
+            # hallucinated id -> REFUSED + audited.
+            if a_id not in pool or b_id not in pool:
+                bad = b_id if a_id in pool else a_id
+                refused.append(bad)
+                try:
+                    self._append_consolidation_event({
+                        "ts": _utcnow().isoformat(),
+                        "action": "associate_refused",
+                        "pair": [a_id, b_id],
+                        "reason": ("out-of-pool endpoint (the C8 pair-boundary "
+                                   "guard; the hallucinated id would dangle an edge)"),
+                    })
+                except Exception:
+                    pass
+                continue
+            lo, hi = (a_id, b_id) if a_id <= b_id else (b_id, a_id)
+            key = lo + "\u0000" + hi
+            if key in ledger or key in added:
+                deduped += 1
+                continue
+            self._assoc_append_ledger_line(lo, hi, relation, reason, tick_id)
+            added.add(key)
+            applied += 1
+            try:
+                self._append_consolidation_event({
+                    "ts": _utcnow().isoformat(),
+                    "action": "associate_edge",
+                    "pair": [lo, hi],
+                    "relation": relation,
+                    "reason": reason,
+                })
+            except Exception:
+                pass
+        return {"ok": True, "applied": applied, "deduped": deduped,
+                "refused": refused,
+                "note": ("the ledger is the source of truth (the C6④ ruling): "
+                         "a deleted ledger line drops its edge BY DESIGN; "
+                         "re-running a verdict is a no-op (idempotent)")}
+
+    def _assoc_expand_on(self) -> bool:
+        return bool(self._assoc_cons_cfg().get("association_expand"))
+
+    def _assoc_expansion(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """C6① read-side 1-hop extension: each hit's ledger-backed
+        association neighbors (0.5 hit-score coefficient, the live-gate
+        exclusion of folded/deleted neighbors, the 4-per-hit cap, the
+        hit-self + cross-hit de-dup)."""
+        if not results:
+            return []
+        live = {r["id"]: r for r in self._assoc_live_pool()}
+        pairs = self._assoc_ledger_pairs()
+        seen: set = set()
+        out: List[Dict[str, Any]] = []
+        for h in results:
+            hid = h.get("id")
+            if not hid:
+                continue
+            hscore = float(h.get("score") or 0.0)
+            n = 0
+            for lo, hi in pairs:
+                if n >= 4:
+                    break
+                if lo == hid:
+                    neighbor = hi
+                elif hi == hid:
+                    neighbor = lo
+                else:
+                    continue
+                if neighbor == hid or neighbor in seen:
+                    continue
+                nr = live.get(neighbor)
+                if nr is None:
+                    continue  # the C6① live-gate exclusion
+                seen.add(neighbor)
+                n += 1
+                out.append({
+                    "id": neighbor,
+                    "type": nr["mt"],
+                    "score": round(hscore * 0.5, 4),
+                    "via": hid,
+                })
+        return out
+
+    def _apply_association_expansion(self, envelope: Dict[str, Any]) -> None:
+        """Post-pass on a search-style envelope: OFF leaves it UNTOUCHED
+        (the byte-stable red line — zero keys added); ON adds the two
+        ADDITIVE keys. Fail-soft: an expansion hiccup never changes the
+        search outcome."""
+        if not self._assoc_expand_on():
+            return
+        try:
+            envelope["association_expanded"] = self._assoc_expansion(
+                envelope.get("results") or [])
+            envelope["association_expand"] = True
+        except Exception as _e:
+            logger.warning(f"FileMem: association expansion hiccup ({_e}); "
+                           "response unchanged (fail-soft)")
 
     def _tool_delete(self, args: Dict) -> str:
         """Delete a memory."""
