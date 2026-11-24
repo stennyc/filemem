@@ -12527,6 +12527,20 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 }
             },
             {
+                "name": "filemem_combine_candidates",
+                "description": "combine candidate gate (DREAM V2 Stage 2 FR-2 backport): the deterministic pre-screen for the combine leg — the pool's high-reference, high-overlap row clusters. The FR-2 floor is reference_count >= 1 (an un-referenced row earns no combine budget), then a pairwise Jaccard pre-screen under the INDEPENDENT knob consolidation.cluster_overlap (default 0.4, looser than dream's 0.5 supersede floor), then the connected components = the candidate clusters (each >= 2 members, ref-DESC ordered, 5-member sanity cap; clusters ordered by strongest edge DESC). N-capped by consolidation.cluster_max_per_tick (default 3; 0 = the leg off, empty candidate list). This is the candidates-only face: the LLM consolidation itself runs through the pre-existing llm_result op=cluster idempotent-sediment face (a re-run REPLACES, never duplicates), not inside the gate." + _FILEMEM_ROUTING_POINTER,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "description": "Explicit N-cap override; omitted = the hot-read consolidation.cluster_max_per_tick knob (default 3, 0 = leg off)."
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
                 "name": "filemem_delete",
                 "description": "Delete a memory by ID" + _FILEMEM_ROUTING_POINTER,
                 "parameters": {
@@ -14066,6 +14080,8 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 return self._tool_associate(args)
             elif tool_name == "filemem_dream_pairs":
                 return self._tool_dream_pairs(args)
+            elif tool_name == "filemem_combine_candidates":
+                return self._tool_combine_candidates(args)
             elif tool_name == "shared_memory_search":
                 return self._tool_shared_search(args)
             elif tool_name == "shared_memory_handoff":
@@ -14949,6 +14965,154 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                          "(reversible, no DELETE); a stale verdict "
                          "stamps the read-side O1 fold. Both reuse the "
                          "Python-native metadata.superseded/stale.")}
+
+    # ==================================================================
+    # DREAM V2 Stage 2 (FR-2) backport: the combine_candidates face.
+    # The deterministic candidate gate for the combine leg: the pool's
+    # high-reference, high-overlap row clusters. The FR-2 floor is the
+    # reference_count >= 1 gate (an un-referenced row earns no combine
+    # budget — the 防空值坑), then a pairwise Jaccard pre-screen under
+    # the INDEPENDENT knob consolidation.cluster_overlap (default 0.4,
+    # looser than dream's 0.5 supersede floor: combine wants the loose
+    # same-topic clusters, supersede wants the tight folds), then the
+    # connected components = the candidate clusters. This is the
+    # candidates-only face: the LLM consolidation itself runs through
+    # the pre-existing llm_result op=cluster idempotent-sediment face
+    # (re-run REPLACES, never duplicates), not inside the gate.
+    # ==================================================================
+    def _combine_live_pool(self) -> List[Dict[str, Any]]:
+        """The combine candidate pool: the 4 active shards, folded
+        rows OUT, the reference_count >= 1 FR-2 floor, per-row token
+        set + reference_count for the Jaccard + the member ordering."""
+        out: List[Dict[str, Any]] = []
+        try:
+            from search_index import tokenize
+        except Exception:
+            tokenize = None
+        for mem_type in self._ASSOC_ACTIVE_SHARDS:
+            mem_file = self.memories_dir / f"{mem_type}.json"
+            if not mem_file.exists():
+                continue
+            try:
+                with self._shard_lock(mem_file):
+                    rows = self._read_memories_file(mem_file)
+            except Exception:
+                continue
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                meta = r.get("metadata") or {}
+                if meta.get("superseded") or meta.get("stale") or meta.get("self_test"):
+                    continue
+                rid = r.get("id")
+                if not rid:
+                    continue
+                try:
+                    ref = int(r.get("reference_count") or 0)
+                except Exception:
+                    ref = 0
+                if ref < 1:
+                    continue  # the FR-2 floor: un-referenced rows earn no budget
+                toks = set(tokenize(r.get("content") or "")) if tokenize else set()
+                out.append({"id": rid, "mt": mem_type,
+                            "content": r.get("content") or "",
+                            "ref": ref, "toks": toks})
+        return out
+
+    def _tool_combine_candidates(self, args: Dict) -> str:
+        """The combine candidate gate (FR-2): the high-reference,
+        high-overlap row clusters for the LLM consolidation leg."""
+        cons = self._assoc_cons_cfg()
+        overlap = 0.4
+        cap_n = 3
+        try:
+            ov = cons.get("cluster_overlap")
+            if ov is not None:
+                ovf = float(ov)
+                if ovf > 0:
+                    overlap = min(ovf, 1.0)  # clamp the legal (0,1] range
+            cm = cons.get("cluster_max_per_tick")
+            if cm is not None:
+                cap_n = int(cm)
+        except Exception:
+            pass
+        # The explicit `limit` override wins over the hot-read knob
+        # (the schema documents it; 0 = the leg off, empty list).
+        try:
+            lim = args.get("limit")
+            if lim is not None:
+                cap_n = int(lim)
+        except Exception:
+            pass
+        if cap_n <= 0:
+            return json.dumps({"ok": True, "action": "candidates",
+                               "candidates": [], "count": 0, "cap": 0,
+                               "overlap": overlap}, ensure_ascii=False, indent=2)
+        live = self._combine_live_pool()
+        if len(live) < 2:
+            return json.dumps({"ok": True, "action": "candidates",
+                               "candidates": [], "count": 0, "cap": cap_n,
+                               "overlap": overlap}, ensure_ascii=False, indent=2)
+        # Union-Find over the qualifying Jaccard edges (the dream
+        # coarse-filter reuse, the FR-0.2 self-pair guard).
+        n = len(live)
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]  # path halving
+                x = parent[x]
+            return x
+        best = {}  # per-component root: the strongest intra-cluster edge
+        for i in range(n):
+            for j in range(i + 1, n):
+                ri, rj = live[i], live[j]
+                if ri["id"] == rj["id"]:
+                    continue  # FR-0.2 self-pair guard
+                ov = self._assoc_jaccard(ri["toks"], rj["toks"])
+                if ov < overlap:
+                    continue
+                ra, rb = find(i), find(j)
+                if ra != rb:
+                    parent[rb if ra < rb else ra] = ra if ra < rb else rb
+                root = find(i)
+                if ov > best.get(root, 0.0):
+                    best[root] = ov
+        # Collect the components (a cluster needs >= 2 members AND a
+        # qualifying edge — a singleton is not a cluster).
+        by_root: Dict[int, List[int]] = {}
+        for i in range(n):
+            r = find(i)
+            by_root.setdefault(r, []).append(i)
+        clusters = []
+        for root, mems in by_root.items():
+            if len(mems) < 2 or best.get(root, 0.0) <= 0:
+                continue  # no qualifying edge touched this component
+            # member order: reference-count DESC (the strongest row
+            # leads the LLM material), 5-member sanity cap.
+            mems.sort(key=lambda ix: (-live[ix]["ref"], live[ix]["id"]))
+            if len(mems) > 5:
+                mems = mems[:5]
+            clusters.append({"members": mems, "score": best[root]})
+        # cluster order: strongest edge DESC, first member's id ASC tie
+        # (the deterministic byte-stable order).
+        clusters.sort(key=lambda c: (-c["score"], live[c["members"][0]]["id"]))
+        total = len(clusters)
+        clusters = clusters[:cap_n]
+        out = []
+        for c in clusters:
+            members = [{"id": live[ix]["id"], "type": live[ix]["mt"],
+                        "content": live[ix]["content"],
+                        "reference_count": live[ix]["ref"]} for ix in c["members"]]
+            out.append({
+                "members": members,
+                "max_ov": round(c["score"], 4),
+                "ref_sum": sum(live[ix]["ref"] for ix in c["members"]),
+            })
+        return json.dumps({"ok": True, "action": "candidates",
+                            "candidates": out, "count": len(out), "total": total,
+                            "cap": cap_n, "overlap": overlap},
+                           ensure_ascii=False, indent=2)
 
     def _tool_delete(self, args: Dict) -> str:
         """Delete a memory."""
