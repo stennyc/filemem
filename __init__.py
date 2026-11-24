@@ -3952,6 +3952,18 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         branch = (str(args.get("branch") or "").strip() or None)
         commit = (str(args.get("commit") or "").strip() or None)
         setup = (str(args.get("setup") or "").strip() or None)
+        # P6 参数分流: 传 id (本地记忆行) -> 走单行推中央 (对齐参考 sm_handoff
+        # 记忆行同步语义, 不涉任务棒); 传 task_ref -> 走原门3 任务棒。
+        rid = (str(args.get("id") or "").strip() or None)
+        if rid:
+            out = sm_mod.push_row_to_central(self, cfg, rid)
+            st = out.get("status")
+            if st == "ok":
+                return json.dumps({"success": True, "id": rid,
+                                   "mem_type": out.get("mem_type"),
+                                   "version": out.get("version")})
+            return json.dumps({"success": False, "id": rid, "status": st,
+                               "error": out.get("error")})
         if not task_ref or not to_agent or not summary:
             return json.dumps({"success": False,
                                "error": "task_ref / to / summary 均必填"})
@@ -3980,6 +3992,16 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         if sm_mod is None:
             return json.dumps({"success": False, "error": "shared_memory 模块不可用"})
         task_ref = str(args.get("task_ref") or "").strip()
+        # P6 参数分流 (Y 口径): 传 id (中央记忆行) -> 按 id 只读取中央一行
+        # 内容返回模型参考, 绝不落本地 shard (Python 中央层定稿: 中央行不进
+        # 本地); 传 task_ref -> 走原门3 任务棒取棒。
+        rid = (str(args.get("id") or "").strip() or None)
+        if rid:
+            crow = sm_mod.fetch_central_by_id(cfg, rid)
+            if crow is None:
+                return json.dumps({"success": False, "id": rid,
+                                   "error": "中央无此记忆行 (未推过 / id 错 / 中央不可达 fail-soft)"})
+            return json.dumps({"success": True, "id": rid, "row": crow})
         if not task_ref:
             return json.dumps({"success": False, "error": "task_ref 必填"})
         row = sm_mod.take_handoff(cfg, task_ref)
@@ -12943,32 +12965,46 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
             },
             {
                 "name": "shared_memory_handoff",
-                "description": "Hand off a memory row from this agent to the central shared pool, making it visible to other agents/devices via shared_memory_search. Requires shared_memory.enabled=true. Fail-soft: PG hiccup returns an error string, not an exception."
-                ,
+                "description": "Hand off to the central shared pool. TWO semantics by which field you pass: (a) pass 'id' = push ONE local memory row to central (idempotent upsert; failure-type rows are refused — they are device-specific). (b) pass task_ref/to/summary = 门3 cross-device task handoff (the task-stick pending→taken flow). Requires shared_memory.enabled=true. Fail-soft: PG hiccup returns an error string, not an exception.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "id": {
                             "type": "string",
-                            "description": "The memory ID to hand off (e.g. 'fact_502_1794098451')."
+                            "description": "Local memory row ID to push to central (e.g. 'fact_502_1794098451'). Use this for single-row memory sync; do NOT also pass task_ref."
+                        },
+                        "task_ref": {
+                            "type": "string",
+                            "description": "门3 task-stick: the work-item reference to hand off (use with to/summary; do NOT use with id)."
+                        },
+                        "to": {
+                            "type": "string",
+                            "description": "门3 task-stick: target agent_id to hand off to."
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "门3 task-stick: one-line handoff summary."
                         }
                     },
-                    "required": ["id"]
+                    "required": []
                 }
             },
             {
                 "name": "shared_memory_take",
-                "description": "Take ownership of a central shared memory row, landing it into this agent's local shard for auto-inject/recall. Requires shared_memory.enabled=true. Fail-soft: PG hiccup returns an error string, not an exception."
-                ,
+                "description": "Fetch from the central shared pool. TWO semantics by which field you pass: (a) pass 'id' = read ONE central memory row back by exact ID (read-only reference for the model; it is NOT written into the local shard — central rows do not auto-inject here). (b) pass task_ref = 门3 task-stick take (atomically flip pending→taken). Requires shared_memory.enabled=true. Fail-soft: PG hiccup returns an error string, not an exception.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "id": {
                             "type": "string",
-                            "description": "The central memory ID to take."
+                            "description": "Central memory row ID to read back (read-only, not landed locally). Use this to fetch a specific row for reference; do NOT also pass task_ref."
+                        },
+                        "task_ref": {
+                            "type": "string",
+                            "description": "门3 task-stick: the work-item reference to take (flip pending→taken); do NOT use with id."
                         }
                     },
-                    "required": ["id"]
+                    "required": []
                 }
             },
             {
@@ -14522,7 +14558,11 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
         the telemetry). So `model_used` is not dropped — it lives on the
         host LLM application leg, not inside this candidate face. The ledger
         line here records the EDGE (the durable source of truth), not the
-        LLM-call telemetry.
+        LLM-call telemetry. CONSEQUENCE: the two sides' ledger/audit line
+        field SETS are deliberately asymmetric — the reference ledger line
+        carries `model_used` (no `reason`); THIS line carries `reason` (no
+        `model_used`). Not a missing field: each side keeps telemetry where
+        its architecture puts it (reference = in-face; here = host LLM legs).
         """
         action = args.get("action", "candidates")
         if action == "candidates":
@@ -14980,12 +15020,18 @@ Call `file_memory_review_drafts(action="confirm")` to save these memories perman
                 merged.append(f"{winner}<-{loser}")
             elif face == "contradiction":
                 stale_id = str(v.get("stale_id") or "")
-                target = stale_id or b_id
                 if stale_id and stale_id not in (a_id, b_id):
                     # pair-boundary guard: a stale OUTSIDE the pair is
                     # REFUSED.
                     refused.append(stale_id)
                     continue
+                # P4 对齐 Go olderOf: older = aID if (a.created < b.created) or a.created==""
+                # else bID。Go 同秒 tie 实际取 bID (a.CreatedAt < b 不成立时 return bID,
+                # 仅 a.created 为空串时取 a)。created dict (L14949) 值为 ISO 串, 字典序=时间序。
+                if not stale_id:
+                    ca, cb = created.get(a_id, ""), created.get(b_id, "")
+                    stale_id = a_id if (ca < cb) or (ca == "") else b_id
+                target = stale_id
                 if target not in pool:
                     refused.append(target)
                     continue

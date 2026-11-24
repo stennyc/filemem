@@ -103,6 +103,29 @@ def test_dream_contradiction_verdict_stale_stamp():
         print("PASS dream contradiction verdict -> stale stamp")
 
 
+def test_dream_contradiction_default_stale_older_of():
+    """P4: 缺省 stale 目标 = olderOf 语义 (a 较旧 -> 不传 stale_id 时标 a)."""
+    with tempfile.TemporaryDirectory() as td:
+        root = pathlib.Path(td)
+        p = _make_provider(root)
+        # o_a 较旧 (01-01), o_b 较新 (03-01): 矛盾时缺省应标较旧的 o_a stale.
+        _write_rows(p, {"fact": [
+            {"id": "o_a", "content": "the service binds to port 8080", "created_at": "2026-01-01T00:00:00"},
+            {"id": "o_b", "content": "the service binds to port 3000", "created_at": "2026-03-01T00:00:00"},
+        ]})
+        # NO stale_id: default target must be the OLDER row (o_a), not fixed b_id.
+        r = json.loads(p._tool_dream_pairs({"action": "verdicts", "verdicts": [
+            {"face": "contradiction", "a_id": "o_a", "b_id": "o_b",
+             "reason": "o_b is the current truth"}]}))
+        assert r["staled"] == ["o_a"], f"olderOf default must stamp the older row o_a, got {r}"
+        rows = json.loads((p.memories_dir / "fact.json").read_text())
+        by_id = {x["id"]: x for x in rows}
+        assert by_id["o_a"]["metadata"]["stale"] is True, by_id["o_a"]["metadata"]
+        # o_b (the newer, current truth) must NOT be staled.
+        assert by_id["o_b"]["metadata"].get("stale") is not True, by_id["o_b"]["metadata"]
+        print("PASS dream contradiction default -> olderOf (stamps the older row)")
+
+
 def test_dream_out_of_pair_and_self_pair_refused():
     with tempfile.TemporaryDirectory() as td:
         root = pathlib.Path(td)
@@ -158,6 +181,7 @@ def main():
         test_dream_candidates_jaccard,
         test_dream_merge_verdict_soft_supersede,
         test_dream_contradiction_verdict_stale_stamp,
+        test_dream_contradiction_default_stale_older_of,
         test_dream_out_of_pair_and_self_pair_refused,
         test_dream_directive_pair_exclusion,
     ]

@@ -818,6 +818,99 @@ def backfill_versions(memories_dir: Path) -> int:
 
 # ── 检索面: 查中央 (只读, 结果不落本地) ─────────────────────────────────
 
+def push_row_to_central(provider, cfg: Dict[str, Any], rid: str) -> Dict[str, Any]:
+    """按【单个】本地记忆行 id 推中央 (sm_handoff 单行推入口, 对齐参考实现)。
+
+    与 _push_locked (写钩批量推) 的区别: 这里由宿主工具显式指定一个 id,
+    读本地行 -> failure 行拒推 (对齐参考红线: failure_type 行设备相关, 不进
+    中央) -> upsert_memory_row 推中央。返回 {status: ok|refused|not_found|error}。
+    只推不拉 (Python 中央层定稿)。
+    """
+    rid = (rid or "").strip()
+    if not rid:
+        return {"status": "error", "error": "id 必填"}
+    rowmap = _read_local_row(provider.memories_dir, rid)
+    if rowmap is None:
+        return {"status": "not_found", "id": rid,
+                "error": "本地无此记忆行 (未落盘或 id 错)"}
+    meta = rowmap.get("metadata") or {}
+    ft = meta.get("failure_type")
+    if ft not in (None, ""):
+        # 对齐参考红线: failure 行设备相关, 拒推中央 (拒, 非 fail-soft 连不上).
+        return {"status": "refused", "id": rid,
+                "error": "failure 行设备相关, 不推中央池 (failure_type=%s)" % ft}
+    d = _row_to_rowdict(rowmap)
+    conn = _PgConn(cfg["pg"])
+    try:
+        _central_auth(conn, cfg["agent_id"], cfg.get("token", ""))
+        cur = conn.cur()
+        import hashlib
+        token_hash = hashlib.sha256((cfg.get("token") or "").encode("utf-8")).hexdigest()
+        cur.execute(
+            "SELECT upsert_memory_row(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (d["id"], d["mem_type"], d["content"], d["level"], d["confirmed"],
+             d["source_profile"] or getattr(provider, "source_profile", None),
+             cfg["agent_id"], d["version"], _js(d["updated_at"]), _js(d["created_at"]),
+             json.dumps(d["metadata"], ensure_ascii=False,
+                        default=lambda o: o.isoformat() if hasattr(o, "isoformat") else str(o)),
+             token_hash),
+        )
+        conn.commit()
+        return {"status": "ok", "id": rid, "mem_type": d["mem_type"],
+                "version": d["version"]}
+    except _TokenRejected as e:
+        return {"status": "error", "id": rid, "error": "token 拒: %s" % e}
+    except Exception as e:
+        return {"status": "error", "id": rid,
+                "error": "PG 不可达/失败 (fail-soft): %s" % e}
+    finally:
+        conn.close()
+
+
+def fetch_central_by_id(
+    cfg: Dict[str, Any], rid: str,
+) -> Optional[Dict[str, Any]]:
+    """按精确 id 取中央 memories 的【一行】(Y 口径: 只读, 不落本地 shard)。
+
+    与 search_central (ILIKE 检索) 的区别: 这里 id 精确命中, 返回 0 或 1 行
+    dict (字段集与 search_central 相同)。None = 中央无此行 (真 miss, 区分于
+    fail-soft 连不上 —— 连不上同样返回 None, 调用方无法区分, 但 Y 口径下
+    这只喂给模型参考, 区分与否不影响落盘, 故统一 None)。
+    绝不写本地数据源 (Python 中央层定稿: 中央行不进本地 shard, L23)。
+    """
+    rid = (rid or "").strip()
+    if not rid:
+        return None
+    conn = _PgConn(cfg["pg"])
+    try:
+        _central_auth(conn, cfg["agent_id"], cfg.get("token", ""))
+        cur = conn.cur()
+        cur.execute(
+            "SELECT id, mem_type, content, level, confirmed, source_profile, "
+            "agent_id, version, updated_at, metadata FROM memories "
+            "WHERE id = %s LIMIT 1", (rid,))
+        r = cur.fetchone()
+        if r is None:
+            return None
+        def _ts(v):
+            if v is None:
+                return None
+            if hasattr(v, "isoformat"):
+                return v.isoformat()
+            return v
+        return dict(zip(
+            ["id", "mem_type", "content", "level", "confirmed",
+             "source_profile", "agent_id", "version", "updated_at", "metadata"],
+            [r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], _ts(r[8]), r[9]]))
+    except _TokenRejected:
+        return None
+    except Exception as e:
+        logger.warning(f"shared_memory fetch_central_by_id no-op (fail-soft): {e}")
+        return None
+    finally:
+        conn.close()
+
+
 def search_central(
     cfg: Dict[str, Any], query: str, confirmed_only: bool = True,
     limit: int = 50,
