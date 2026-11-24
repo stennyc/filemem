@@ -20255,18 +20255,29 @@ Call `filemem_review_drafts(action="confirm")` to save these memories permanentl
     def _bringback_reorder_key(self, row: Any,
                                pin_session_id: Optional[str]) -> int:
         """B2-A: when the user chose 'bring_back', pin the previous session's
-        confirmed rows to the TOP of the auto-inject result (sort key 0), all
-        other surviving rows below (sort key 1). This is a REORDERING, not a
-        collection predicate — the row set is unchanged from V2 (a confirmed
-        previous-session row is already kept by the confirmed-global leg, so
-        this adds no rows and removes none; it only surfaces the continuity
-        context first). pin_session_id=None -> every row keys to 1 (no
-        reorder, == clean_start ordering)."""
+        rows to the TOP of the auto-inject result (sort key 0), all other
+        surviving rows below (sort key 1). This is a PURE REORDERING, not a
+        collection predicate — the row set is whatever the upstream
+        collection leg(s) already produced; this key only re-surfaces the
+        pin session's rows ahead of the rest (continuity context first).
+        pin_session_id=None -> every row keys to 1 (no reorder, ==
+        clean_start ordering).
+
+        2026-11-24 decoupling ruling (aligns Go bringbackReorderKey, owner):
+        bringback is a SORTING face, not a confirmation gate — the pin row's
+        key is keyed ONLY on session_id == pin, NOT on metadata.confirmed.
+        The confirmed-global leg (upstream) governs WHICH rows are in the
+        result set; this key governs WHERE the pin session's rows sit within
+        that set. Keying on confirmed here was an implementation coupling
+        to the upstream leg, not a bringback semantic (bringback does not
+        care about confirmed / session / profile / workspace isolation in
+        Hermes). Go's 11-24 rebaseline already decoupled this (the reorder
+        key is unconditional on the confirmed gate); this aligns Python.
+        """
         try:
             if pin_session_id is not None \
                     and isinstance(row, dict) \
-                    and row.get("session_id") == pin_session_id \
-                    and ((row.get("metadata") or {}).get("confirmed")):
+                    and row.get("session_id") == pin_session_id:
                 return 0
         except Exception:
             pass

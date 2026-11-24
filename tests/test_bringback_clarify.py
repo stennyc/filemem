@@ -175,9 +175,15 @@ def _provider_with_prev_closed(tmp_path, profile="default", cur="s_cur",
 
 
 def test_bringback_reorder_key_pins_prev_confirmed_to_front():
-    """The pin key returns 0 ONLY for the previous session's CONFIRMED rows;
-    everything else (current-session, unconfirmed prev, other sessions,
-    superseded) keys to 1."""
+    """2026-11-24 decoupling ruling (aligns Go bringbackReorderKey): the pin
+    key returns 0 for ALL of the previous session's rows (keyed ONLY on
+    session_id == pin, NOT on confirmed), and 1 for every other session's
+    row. The confirmed gate is an upstream collection leg (it decides WHICH
+    rows are in the auto-inject result set); this key is a pure SORTING face
+    (it decides WHERE the pin session's rows sit within that set) and must
+    not re-gate on confirmed. Unconfirmed prev-session rows that survive
+    into the result set now pin to the front too — bringback surfaces
+    continuity, it is not a confirmation filter."""
     p = _make_provider(Path(tempfile.mkdtemp()))
     prev_confirmed = _row("prev fact", sp="default", confirmed=True,
                           session_id="s_prev", mem_type="episodic")
@@ -187,8 +193,10 @@ def test_bringback_reorder_key_pins_prev_confirmed_to_front():
                    session_id="s_cur", mem_type="episodic")
     other_confirmed = _row("other fact", sp="default", confirmed=True,
                            session_id="s_other", mem_type="episodic")
+    # BOTH prev-session rows key 0 (the pin session, regardless of confirmed)
     assert p._bringback_reorder_key(prev_confirmed, "s_prev") == 0
-    assert p._bringback_reorder_key(prev_unconfirmed, "s_prev") == 1
+    assert p._bringback_reorder_key(prev_unconfirmed, "s_prev") == 0
+    # non-pin sessions key 1
     assert p._bringback_reorder_key(cur_row, "s_prev") == 1
     assert p._bringback_reorder_key(other_confirmed, "s_prev") == 1
     # pin=None (not chosen / no target) -> no pin (every row keys to 1)
@@ -196,10 +204,11 @@ def test_bringback_reorder_key_pins_prev_confirmed_to_front():
 
 
 def test_bringback_reorder_is_set_identical_to_v2():
-    """B2-A invariant: a stable sort by the pin key REORDERS but never adds
-    or drops a row. Given a surviving pool, sorting by the pin key yields the
-    SAME multiset of ids as the unsorted pool (only the order moves the
-    prev-confirmed rows to the front)."""
+    """B2-A invariant (2026-11-24 decoupling): a stable sort by the pin key
+    REORDERS but never adds or drops a row. Both prev-session rows (confirmed
+    AND unconfirmed) now pin to the front (the key is unconditional on
+    confirmed); the stable sort preserves the pool's original order within
+    the key-0 group, so the FIRST prev row in the pool stays first."""
     p = _make_provider(Path(tempfile.mkdtemp()))
     prev_conf = _row("prev conf", sp="default", confirmed=True,
                      session_id="s_prev", mem_type="episodic")
@@ -211,8 +220,13 @@ def test_bringback_reorder_is_set_identical_to_v2():
     pool = [cur_row, prev_conf, prev_dirty, conf_global]
     ordered = sorted(pool, key=lambda r: p._bringback_reorder_key(r, "s_prev"))
     assert sorted(r["id"] for r in ordered) == sorted(r["id"] for r in pool)
-    # prev-confirmed must now be FIRST:
+    # both prev rows key 0 -> pin to the front; the stable sort keeps the pool
+    # order WITHIN the key-0 group, so prev_conf (first prev in pool) is FIRST
     assert ordered[0]["id"] == prev_conf["id"]
+    assert ordered[1]["id"] == prev_dirty["id"]
+    # the two key-1 rows follow, pool order preserved
+    assert ordered[2]["id"] == cur_row["id"]
+    assert ordered[3]["id"] == conf_global["id"]
 
 
 def test_bringback_no_new_rows_vs_v2_confirmed_leg():
